@@ -218,7 +218,7 @@ def run():
     deterministic.fill_uninitialized_memory = True
     try:
         for mode in (False, True):
-            config = EPConfig(size * 3, 3, 65 if mode else 33, 5)
+            config = EPConfig(size * 3, 3, 512 if mode else 256, 5)
             with CudaBuffer(
                 dist.group.WORLD, config, allow_multiple_reduction=mode
             ) as buffer:

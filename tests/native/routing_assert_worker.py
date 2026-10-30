@@ -12,10 +12,10 @@ from nano_ep.testing.native_dispatch import prepare_dispatch_metadata
 def run(stage, kind):
     torch.cuda.set_device(0)
     native = load_extension()
-    x = torch.ones((2, 4), dtype=torch.bfloat16, device="cuda")
+    x = torch.ones((2, 256), dtype=torch.bfloat16, device="cuda")
     valid = torch.tensor([[0, 1, -1], [2, -1, 0]], device="cuda")
     if stage != "route_counts":
-        layout = native.window_layout(1, 2, 4, 3, 3)
+        layout = native.window_layout(1, 2, 256, 3, 3)
         runtime = native.PeerRuntime(0, 1, layout[-1])
         window = runtime.local_window()
         window[layout[1] : layout[1] + 32].view(torch.int64).fill_(-1)

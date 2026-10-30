@@ -15,6 +15,8 @@ namespace nano_ep {
 
 namespace {
 
+static_assert(WindowLayout::kHiddenAlignment == 32 * sizeof(int4) / sizeof(at::BFloat16));
+
 void check_payload_inputs(const torch::Tensor& window,
                           const torch::Tensor& x,
                           const torch::Tensor& indices,
@@ -25,6 +27,7 @@ void check_payload_inputs(const torch::Tensor& window,
     TORCH_CHECK(x.device() == window.device() && x.dim() == 2 && x.is_contiguous(),
                 "x must be contiguous CUDA [T,H] on the runtime device");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "dispatch x must be bfloat16");
+    TORCH_CHECK(x.size(1) > 0 && x.size(1) % WindowLayout::kHiddenAlignment == 0, "dispatch hidden must be a positive multiple of 256");
     TORCH_CHECK(indices.device() == x.device() && indices.scalar_type() == torch::kInt64 && indices.dim() == 2 &&
                     indices.size(0) == x.size(0) && indices.is_contiguous(),
                 "indices must be contiguous CUDA int64 [T,K] on the x device");
@@ -304,207 +307,6 @@ __global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,    //
             recv_x[row * hidden + h] = x[h];
         }
     }
-}
-
-template <int kNumPartitionsInLayout, typename FetchPartition>
-__device__ __forceinline__ void compute_partition_slots(int (&partition_slot_idx)[kNumPartitionsInLayout],
-                                                        unsigned representatives,
-                                                        const FetchPartition& fetch_partition) {
-    // all lanes scan set bits in ascending order and fetch each partition
-    // once. Compact valid partitions to the front and fill remaining entries
-    // with -1. fetch_partition may contain a full-warp shuffle.
-#pragma unroll
-    for (int i = 0; i < kNumPartitionsInLayout; ++i)
-        if (representatives != 0) {
-            const int representative = __ffs(representatives) - 1;
-            partition_slot_idx[i] = fetch_partition(representative);
-            representatives &= representatives - 1;  // clear the first representative
-
-        } else {
-            partition_slot_idx[i] = -1;
-        }
-}
-
-__device__ __forceinline__ void restore_weights(const uint8_t* stage_buffer,  // [P,Tmax,row_bytes]
-                                                float* combined_weights,      // [T,K], including masked zeros
-                                                int lane,
-                                                int partition,  // this lane's return partition, or -1
-                                                int64_t row,
-                                                int64_t hidden,
-                                                int64_t num_topk,
-                                                int64_t max_tokens,
-                                                int64_t return_row_bytes) {
-    // Each top-k lane reads its weight from the selected partition; masked
-    // lanes write zero without accessing the return buffer.
-    if (lane < num_topk) {
-        float weight = 0.0f;
-        if (partition >= 0) {
-            const auto* return_row = stage_buffer + (partition * max_tokens + row) * return_row_bytes;
-            const auto* weights = reinterpret_cast<const float*>(return_row + WindowLayout::return_weights_offset(hidden));
-            weight = weights[lane];
-        }
-        combined_weights[row * num_topk + lane] = weight;
-    }
-}
-
-template <typename output_t, bool kExpand, bool kAllowMultipleReduction, bool kWithWeights, int kNumPartitionsInLayout>
-__global__ void combine_reduce_epilogue_kernel(const uint8_t* stage_buffer,  // [P,Tmax,row_bytes], BF16 x[H], aligned FP32 weights[K]
-                                               const int64_t* source_topk,   // [T,K], global expert IDs, masked = -1
-                                               const output_t* bias,         // [T,H], or nullptr
-                                               output_t* combined_x,         // [T,H], write every element
-                                               float* combined_weights,      // [T,K], or nullptr; masked slots must be zero
-                                               int64_t num_tokens,           // actual source T
-                                               int64_t hidden,               // H
-                                               int64_t num_topk,             // K
-                                               int64_t experts_per_rank,
-                                               int64_t world_size,
-                                               int64_t max_tokens,  // partition stride is Tmax, not T
-                                               int64_t return_row_bytes) {
-    // one warp owns one source token; lanes stride over hidden coordinates.
-    constexpr int warp_size = 32;
-    const int lane = threadIdx.x % warp_size;
-    const int64_t row = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / warp_size;
-    if (row >= num_tokens)
-        return;
-
-    // Expanded without local reduction reads each valid k partition. Otherwise
-    // deduplicate destination ranks, selecting rank or first-k partitions exactly
-    // as combine_return_kernel does. Never read unpublished rows or weight fields.
-    // Accumulate x in FP32, add optional bias once, then cast once to output_t.
-    // Restore valid weights independently at their original k; write masked zeros.
-    int partition_slot_idx[kNumPartitionsInLayout];
-
-    if constexpr (kAllowMultipleReduction || !kExpand) {
-        const int64_t expert = lane < num_topk ? source_topk[row * num_topk + lane] : -1;
-        const int destination = expert >= 0 ? static_cast<int>(expert / experts_per_rank) : -1;
-        const unsigned same_destination = __match_any_sync(0xffffffffu, destination);
-        const int first_k = __ffs(same_destination) - 1;
-        const bool is_first_valid_k = destination >= 0 && lane == first_k;
-        // finding all first valid k for each rank
-        const unsigned representatives = __ballot_sync(0xffffffffu, is_first_valid_k);
-
-        // Compute the slot indices for each partition.
-        const bool use_rank_layout = kAllowMultipleReduction && world_size <= num_topk;
-        compute_partition_slots(partition_slot_idx, representatives, [=](int representative) {
-            const int dst_rank = __shfl_sync(0xffffffffu, destination, representative);
-            return use_rank_layout ? dst_rank : representative;
-        });
-
-        if constexpr (kWithWeights) {
-            const int partition = destination >= 0 ? (use_rank_layout ? destination : first_k) : -1;
-            restore_weights(stage_buffer, combined_weights, lane, partition, row, hidden, num_topk, max_tokens, return_row_bytes);
-        }
-
-    } else {
-        // kExpand && !kAllowMultipleReduction [K, T]布局
-
-        const int64_t expert = lane < num_topk ? source_topk[row * num_topk + lane] : -1;
-        // finding all valid k
-        const unsigned valid_ks = __ballot_sync(0xffffffffu, expert >= 0);
-
-        compute_partition_slots(partition_slot_idx, valid_ks, [](int k) { return k; });
-
-        if constexpr (kWithWeights) {
-            const int partition = expert >= 0 ? lane : -1;
-            restore_weights(stage_buffer, combined_weights, lane, partition, row, hidden, num_topk, max_tokens, return_row_bytes);
-        }
-    }
-
-    for (int64_t base = 0; base < hidden; base += 32) {
-        const int64_t h = base + lane;
-        float accum = 0.0f;
-
-#pragma unroll
-        for (int i = 0; i < kNumPartitionsInLayout; ++i) {
-            const int partition_slot = partition_slot_idx[i];
-            if (partition_slot < 0)
-                break;
-
-            const auto* return_row = stage_buffer + (partition_slot * max_tokens + row) * return_row_bytes;
-            const auto* returned_x = reinterpret_cast<const at::BFloat16*>(return_row);
-            if (h < hidden) {
-                accum += static_cast<float>(returned_x[h]);
-            }
-        }
-
-        if (h < hidden) {
-            if (bias != nullptr)
-                accum += static_cast<float>(bias[row * hidden + h]);
-            combined_x[row * hidden + h] = static_cast<output_t>(accum);
-        }
-    }
-}
-
-template <int kNumPartitionsInLayout = 1, typename Launch>
-void dispatch_combine_partitions(int64_t num_partitions, const Launch& launch) {
-    if (num_partitions == kNumPartitionsInLayout) {
-        launch.template operator()<kNumPartitionsInLayout>();
-    } else if constexpr (kNumPartitionsInLayout < 32) {
-        dispatch_combine_partitions<kNumPartitionsInLayout + 1>(num_partitions, launch);
-    } else {
-        TORCH_CHECK(false, "combine return partition count must be in [1,32], got ", num_partitions);
-    }
-}
-
-void launch_combine_reduce_epilogue(const torch::Tensor& stage_buffer,
-                                    const torch::Tensor& source_topk,
-                                    const c10::optional<torch::Tensor>& bias,
-                                    torch::Tensor& combined_x,
-                                    torch::Tensor& combined_weights,
-                                    int64_t num_experts,
-                                    int64_t world_size,
-                                    int64_t max_tokens,
-                                    bool with_weights,
-                                    bool expand,
-                                    bool allow_multiple_reduction,
-                                    cudaStream_t stream) {
-    const int64_t num_tokens = source_topk.size(0);
-    if (num_tokens == 0)
-        return;
-
-    const int64_t hidden = combined_x.size(1);
-    const int64_t num_topk = source_topk.size(1);
-    constexpr int threads = 256;
-    constexpr int warps_per_block = threads / 32;
-    const int64_t blocks = (num_tokens + warps_per_block - 1) / warps_per_block;
-
-    using scalar_t = at::BFloat16;
-
-    const auto launch = [&]<bool kExpand, bool kAllowMultipleReduction, bool kWithWeights>() {
-        dispatch_combine_partitions(stage_buffer.size(0), [&]<int kNumPartitionsInLayout>() {
-            combine_reduce_epilogue_kernel<scalar_t, kExpand, kAllowMultipleReduction, kWithWeights, kNumPartitionsInLayout>
-                <<<blocks, threads, 0, stream>>>(stage_buffer.data_ptr<uint8_t>(),
-                                                 source_topk.data_ptr<int64_t>(),
-                                                 bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
-                                                 combined_x.data_ptr<scalar_t>(),
-                                                 kWithWeights ? combined_weights.data_ptr<float>() : nullptr,
-                                                 num_tokens,
-                                                 hidden,
-                                                 num_topk,
-                                                 num_experts / world_size,
-                                                 world_size,
-                                                 max_tokens,
-                                                 stage_buffer.size(2));
-        });
-    };
-    const auto launch_with_weights = [&]<bool kExpand, bool kAllowMultipleReduction>() {
-        if (with_weights)
-            launch.template operator()<kExpand, kAllowMultipleReduction, true>();
-        else
-            launch.template operator()<kExpand, kAllowMultipleReduction, false>();
-    };
-    if (expand) {
-        if (allow_multiple_reduction)
-            launch_with_weights.template operator()<true, true>();
-        else
-            launch_with_weights.template operator()<true, false>();
-    } else {
-        if (allow_multiple_reduction)
-            launch_with_weights.template operator()<false, true>();
-        else
-            launch_with_weights.template operator()<false, false>();
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template <typename data_t, bool kExpand, bool kAllowMultipleReduction, bool kWithWeights>
@@ -979,6 +781,8 @@ std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool expand, 
     TORCH_CHECK(state.metadata.size() == (state.metadata_prepared ? 9 : 5) && state.stage_buffer.is_cuda(),
                 "dispatch_epilogue requires a native dispatch state");
     TORCH_CHECK(state.x_dtype == torch::kBFloat16, "dispatch output dtype must be bfloat16");
+    TORCH_CHECK(state.hidden > 0 && state.hidden % WindowLayout::kHiddenAlignment == 0,
+                "dispatch hidden must be a positive multiple of 256");
     c10::cuda::CUDAGuard guard(state.stage_buffer.device());
     if (!state.metadata_prepared) {
         const int64_t local_experts = state.metadata[0].numel();
@@ -1087,6 +891,7 @@ torch::Tensor combine_main(PeerRuntime& runtime,
     TORCH_CHECK(x.device() == window.device() && x.dim() == 2 && x.is_contiguous() && x.size(1) > 0,
                 "combine x must be contiguous CUDA [N,H] or [C,H] on the runtime device");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "combine x must be bfloat16");
+    TORCH_CHECK(x.size(1) % WindowLayout::kHiddenAlignment == 0, "combine hidden must be a positive multiple of 256");
     TORCH_CHECK(metadata[8].dim() == 2 && metadata[3].dim() == 1 && metadata[3].numel() > 0,
                 "combine metadata requires a [T,K] source snapshot and [L] expert counts");
 
@@ -1135,66 +940,6 @@ torch::Tensor combine_main(PeerRuntime& runtime,
     runtime.barrier(stream_handle);
 
     return returned;
-}
-
-std::vector<torch::Tensor> combine_epilogue(const torch::Tensor& stage_buffer,
-                                            const torch::Tensor& source_topk_snapshot,
-                                            int64_t hidden,
-                                            at::ScalarType x_dtype,
-                                            int64_t num_experts,
-                                            int64_t world_size,
-                                            int64_t max_tokens,
-                                            const c10::optional<torch::Tensor>& bias,
-                                            bool with_weights,
-                                            bool expand,
-                                            bool allow_multiple_reduction) {
-    // Input Check
-    TORCH_CHECK(
-        stage_buffer.is_cuda() && stage_buffer.scalar_type() == torch::kUInt8 && stage_buffer.dim() == 3 && stage_buffer.is_contiguous(),
-        "combine stage_buffer must be contiguous CUDA uint8 [P,Tmax,row_bytes]");
-    TORCH_CHECK(source_topk_snapshot.device() == stage_buffer.device() && source_topk_snapshot.scalar_type() == torch::kInt64 &&
-                    source_topk_snapshot.dim() == 2 && source_topk_snapshot.is_contiguous(),
-                "source_topk_snapshot must be contiguous CUDA int64 [T,K] on the stage_buffer device");
-    TORCH_CHECK(x_dtype == torch::kBFloat16, "combine output dtype must be bfloat16");
-    TORCH_CHECK(world_size > 0 && world_size <= 32 && num_experts > 0 && num_experts % world_size == 0,
-                "combine requires world_size in [1,32] and positive num_experts divisible by world_size");
-    const int64_t num_tokens = source_topk_snapshot.size(0);
-    const int64_t num_topk = source_topk_snapshot.size(1);
-    TORCH_CHECK(hidden > 0 && hidden <= std::numeric_limits<int>::max() && num_topk > 0 && num_topk <= 32 && num_topk <= num_experts &&
-                    max_tokens > 0 && num_tokens <= max_tokens,
-                "combine hidden/top-k or source token capacity is invalid");
-    const int partitions = WindowLayout::num_return_partitions(world_size, num_topk, allow_multiple_reduction);
-    const int64_t row_bytes = WindowLayout::return_row_bytes(hidden, num_topk);
-    TORCH_CHECK(stage_buffer.size(0) == partitions && stage_buffer.size(1) == max_tokens && stage_buffer.size(2) == row_bytes,
-                "combine stage_buffer shape does not match reduction mode, capacity and row layout");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(stage_buffer.data_ptr<uint8_t>()) % WindowLayout::kAlignment == 0,
-                "combine stage_buffer must be aligned for FP32 loads");
-    if (bias.has_value()) {
-        TORCH_CHECK(bias->device() == stage_buffer.device() && bias->scalar_type() == x_dtype && bias->dim() == 2 &&
-                        bias->size(0) == num_tokens && bias->size(1) == hidden && bias->is_contiguous(),
-                    "combine bias must be contiguous [T,H], with the output dtype on the stage_buffer device");
-    }
-
-    c10::cuda::CUDAGuard guard(stage_buffer.device());
-
-    const auto stream = c10::cuda::getCurrentCUDAStream();
-    auto combined_x = torch::empty({num_tokens, hidden}, stage_buffer.options().dtype(x_dtype));
-    auto combined_weights = torch::empty(with_weights ? std::vector<int64_t>{num_tokens, num_topk} : std::vector<int64_t>{0},
-                                         stage_buffer.options().dtype(torch::kFloat32));
-
-    launch_combine_reduce_epilogue(stage_buffer,
-                                   source_topk_snapshot,
-                                   bias,
-                                   combined_x,
-                                   combined_weights,
-                                   num_experts,
-                                   world_size,
-                                   max_tokens,
-                                   with_weights,
-                                   expand,
-                                   allow_multiple_reduction,
-                                   stream.stream());
-    return {combined_x, combined_weights};
 }
 
 }  // namespace nano_ep

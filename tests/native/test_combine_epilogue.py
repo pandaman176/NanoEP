@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch.utils import deterministic
 
-from nano_ep.backends._build import load_extension
+from nano_ep.backends._build import load_extension, prepare_combine_epilogue
 from nano_ep.testing.native_combine import (
     assert_combined_output,
     expert_inputs,
@@ -17,7 +17,7 @@ pytestmark = [pytest.mark.cuda]
 
 
 @pytest.fixture
-def native(request):
+def cuda_device(request):
     if not (
         request.config.getoption("--run-cuda")
         or request.config.getoption("--run-distributed")
@@ -25,11 +25,21 @@ def native(request):
         pytest.skip("opt in with --run-cuda or --run-distributed")
     if not torch.cuda.is_available():
         pytest.fail("CUDA tests requested but NVIDIA CUDA is unavailable")
+    return torch.device("cuda", torch.cuda.current_device())
+
+
+@pytest.fixture
+def native(cuda_device):
     return load_extension()
 
 
+@pytest.fixture
+def combine_epilogue(cuda_device):
+    return prepare_combine_epilogue(256, 3, 2, 3, 5).combine_epilogue
+
+
 @pytest.fixture(autouse=True)
-def poison_empty_outputs(native):
+def poison_empty_outputs(cuda_device):
     """Require explicit writes for masked weights and every output coordinate."""
     enabled = torch.are_deterministic_algorithms_enabled()
     warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
@@ -44,7 +54,7 @@ def poison_empty_outputs(native):
 
 
 def inputs(*, mode=False, dtype=torch.bfloat16, tokens=2):
-    ranks, experts, capacity, hidden, topk = 2, 6, 5, 33, 3
+    ranks, experts, capacity, hidden, topk = 2, 6, 5, 256, 3
     partitions = min(ranks, topk) if mode else topk
     row_bytes = return_row_bytes(hidden, topk)
     return {
@@ -66,11 +76,25 @@ def inputs(*, mode=False, dtype=torch.bfloat16, tokens=2):
     }
 
 
+def test_compiled_geometry_rejects_another_hidden_before_launch():
+    compiled = prepare_combine_epilogue(256, 3, 2, 3, 5)
+    assert compiled.geometry == (256, 3, 2, 3, 5)
+    args = inputs()
+    args["hidden"] = 512
+    args["stage_buffer"] = torch.full(
+        (3, 5, return_row_bytes(512, 3)), 165, dtype=torch.uint8, device="cuda"
+    )
+    before = args["stage_buffer"].clone()
+    with pytest.raises(RuntimeError, match="compiled geometry"):
+        compiled.combine_epilogue(**args)
+    torch.testing.assert_close(args["stage_buffer"], before, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_empty_source(native, mode, expand, weighted, dtype):
+def test_empty_source(combine_epilogue, mode, expand, weighted, dtype):
     args = inputs(mode=mode, dtype=dtype, tokens=0)
     args.update(
         expand=expand,
@@ -80,7 +104,7 @@ def test_empty_source(native, mode, expand, weighted, dtype):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        x, weights = native.combine_epilogue(**args)
+        x, weights = combine_epilogue(**args)
     stream.synchronize()
     assert x.shape == (0, args["hidden"]) and x.dtype == dtype
     assert weights.shape == ((0, 3) if weighted else (0,))
@@ -118,7 +142,7 @@ def test_empty_source(native, mode, expand, weighted, dtype):
         "bias_stride",
     ],
 )
-def test_invalid_storage_precedes_launch(native, kind):
+def test_invalid_storage_precedes_launch(combine_epilogue, kind):
     args = inputs()
     stage = args["stage_buffer"]
     before = stage.clone()
@@ -170,26 +194,33 @@ def test_invalid_storage_precedes_launch(native, kind):
             (6, 3), dtype=torch.int64, device="cuda"
         )
     elif kind == "bias_device":
-        args["bias"] = torch.empty((2, 33))
+        args["bias"] = torch.empty((2, 256))
     elif kind == "bias_dtype":
-        args["bias"] = torch.empty((2, 33), dtype=torch.float32, device="cuda")
+        args["bias"] = torch.empty((2, 256), dtype=torch.float32, device="cuda")
     elif kind == "bias_shape":
-        args["bias"] = torch.empty((33,), device="cuda")
+        args["bias"] = torch.empty((256,), device="cuda")
     else:
-        args["bias"] = torch.empty((2, 66), device="cuda")[:, ::2]
+        args["bias"] = torch.empty((2, 512), device="cuda")[:, ::2]
     with pytest.raises(RuntimeError):
-        native.combine_epilogue(**args)
+        combine_epilogue(**args)
     torch.testing.assert_close(stage, before, rtol=0, atol=0)
 
 
-def check_epilogue(native, case, source, expand, mode, weighted, bias):
+def check_epilogue(case, source, expand, mode, weighted, bias):
+    combine_epilogue = prepare_combine_epilogue(
+        case.hidden,
+        case.topk,
+        len(case.indices),
+        case.num_experts // len(case.indices),
+        case.capacity,
+    ).combine_epilogue
     packet = make_return_packet(case, source, expand, mode, weighted)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         stage = packet.cuda()
         snapshot = case.indices[source].cuda()
         device_bias = bias.cuda() if bias is not None else None
-        outputs = native.combine_epilogue(
+        outputs = combine_epilogue(
             stage,
             snapshot,
             case.hidden,
@@ -222,16 +253,14 @@ def check_epilogue(native, case, source, expand, mode, weighted, bias):
 
 @pytest.mark.parametrize(
     "ranks,topk,hidden",
-    [(1, 3, 4), (2, 3, 33), (2, 2, 65), (4, 2, 1), (2, 32, 1)],
+    [(1, 3, 256), (2, 3, 512), (2, 2, 768), (4, 2, 256), (2, 32, 256), (2, 8, 4096)],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])
 @pytest.mark.parametrize("biased", [False, True])
-def test_source_reduction(
-    native, ranks, topk, hidden, dtype, expand, mode, weighted, biased
-):
+def test_source_reduction(ranks, topk, hidden, dtype, expand, mode, weighted, biased):
     case = make_return_case(ranks, topk, hidden, dtype, tokens=11)
     case.capacity += 7
     for source in sorted({0, ranks - 1}):
@@ -243,19 +272,19 @@ def test_source_reduction(
             if biased
             else None
         )
-        check_epilogue(native, case, source, expand, mode, weighted, bias)
+        check_epilogue(case, source, expand, mode, weighted, bias)
 
 
 @pytest.mark.parametrize(
     "kind,tokens,ranks,topk,hidden",
     [
-        ("mixed", 0, 2, 3, 65),
-        ("empty", 5, 2, 3, 33),
-        ("masked", 11, 4, 2, 65),
-        ("nonfinite", 11, 2, 3, 33),
-        ("mixed", 3, 32, 32, 1),
-        ("mixed", 19, 1, 1, 129),
-        ("mixed", 19, 2, 32, 33),
+        ("mixed", 0, 2, 3, 256),
+        ("empty", 5, 2, 3, 512),
+        ("masked", 11, 4, 2, 256),
+        ("nonfinite", 11, 2, 3, 512),
+        ("mixed", 3, 32, 32, 256),
+        ("mixed", 19, 1, 1, 768),
+        ("mixed", 19, 2, 32, 256),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -263,44 +292,44 @@ def test_source_reduction(
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])
 def test_source_reduction_edges(
-    native, kind, tokens, ranks, topk, hidden, dtype, expand, mode, weighted
+    kind, tokens, ranks, topk, hidden, dtype, expand, mode, weighted
 ):
     case = make_return_case(ranks, topk, hidden, dtype, kind=kind, tokens=tokens)
     case.capacity += 7
     source = ranks - 1
     bias = torch.full((len(case.indices[source]), hidden), 0.5, dtype=dtype)
-    check_epilogue(native, case, source, expand, mode, weighted, bias)
+    check_epilogue(case, source, expand, mode, weighted, bias)
 
 
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("mode", [False, True])
-def test_fp32_accumulation_and_bias_before_final_cast(native, expand, mode):
-    case = make_return_case(3, 3, 65, torch.bfloat16, tokens=1)
+def test_fp32_accumulation_and_bias_before_final_cast(expand, mode):
+    case = make_return_case(3, 3, 256, torch.bfloat16, tokens=1)
     case.capacity += 3
     case.indices[0][0] = torch.tensor([0, 3, -1])
     case.values[0][0, 0].fill_(256)
     case.values[0][0, 1].fill_(1)
     case.values[0][0, 2].fill_(float("nan"))
     case.weights[0][0] = torch.tensor([0.2, -0.7, float("nan")])
-    bias = torch.full((1, 65), -256, dtype=torch.bfloat16)
-    x, _ = check_epilogue(native, case, 0, expand, mode, True, bias)
+    bias = torch.full((1, 256), -256, dtype=torch.bfloat16)
+    x, _ = check_epilogue(case, 0, expand, mode, True, bias)
     torch.testing.assert_close(
-        x.cpu(), torch.ones((1, 65), dtype=torch.bfloat16), rtol=0, atol=0
+        x.cpu(), torch.ones((1, 256), dtype=torch.bfloat16), rtol=0, atol=0
     )
 
 
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("mode", [False, True])
-def test_compact_client_rounding_differs_from_expanded(native, expand, mode):
-    case = make_return_case(2, 3, 33, torch.bfloat16, tokens=1)
+def test_compact_client_rounding_differs_from_expanded(expand, mode):
+    case = make_return_case(2, 3, 256, torch.bfloat16, tokens=1)
     case.capacity += 3
     case.indices[0][0] = torch.tensor([0, 1, 3])
     case.values[0][0, 0].fill_(256)
     case.values[0][0, 1].fill_(1)
     case.values[0][0, 2].fill_(-256)
-    x, _ = check_epilogue(native, case, 0, expand, mode, False, None)
+    x, _ = check_epilogue(case, 0, expand, mode, False, None)
     expected = torch.full(
-        (1, 33), 1 if expand and not mode else 0, dtype=torch.bfloat16
+        (1, 256), 1 if expand and not mode else 0, dtype=torch.bfloat16
     )
     torch.testing.assert_close(x.cpu(), expected, rtol=0, atol=0)
 
@@ -310,8 +339,11 @@ def test_compact_client_rounding_differs_from_expanded(native, expand, mode):
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])
 def test_main_to_epilogue_self_reuses_window(native, dtype, expand, mode, weighted):
-    case = make_return_case(1, 3, 65, dtype, tokens=11)
+    case = make_return_case(1, 3, 256, dtype, tokens=11)
     case.capacity += 7
+    combine_epilogue = prepare_combine_epilogue(
+        case.hidden, case.topk, 1, case.num_experts, case.capacity
+    ).combine_epilogue
     layout = native.window_layout(
         1, case.capacity, case.hidden, case.topk, case.num_experts, mode
     )
@@ -329,7 +361,7 @@ def test_main_to_epilogue_self_reuses_window(native, dtype, expand, mode, weight
                     case.values = [value + 0.25 for value in case.values]
                     case.weights = [weight - 0.5 for weight in case.weights]
                 x, weights, _ = expert_inputs(case, 0, expand)
-                bias = torch.full((11, 65), 0.5, dtype=dtype) if step else None
+                bias = torch.full((11, 256), 0.5, dtype=dtype) if step else None
                 runtime.local_window()[layout[3] :].fill_(165)
                 returned = native.combine_main(
                     runtime,
@@ -340,7 +372,7 @@ def test_main_to_epilogue_self_reuses_window(native, dtype, expand, mode, weight
                     expand,
                     mode,
                 )
-                outputs = native.combine_epilogue(
+                outputs = combine_epilogue(
                     returned,
                     device_metadata[8],
                     case.hidden,

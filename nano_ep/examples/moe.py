@@ -88,6 +88,8 @@ def parse_args():
     args = parser.parse_args()
     if args.tokens < 0 or min(args.hidden, args.topk, args.experts_per_rank, args.alignment, args.iterations) <= 0:
         parser.error("tokens must be nonnegative; other dimensions/iterations must be positive")
+    if args.hidden % 256 != 0:
+        parser.error("hidden must be a multiple of 256")
     return args
 
 

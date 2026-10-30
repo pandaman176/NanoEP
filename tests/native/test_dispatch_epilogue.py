@@ -214,7 +214,7 @@ def check_fresh_and_cached(
 @pytest.mark.parametrize("weighted", [False, True], ids=["unweighted", "weighted"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("kind", ["mixed", "empty", "masked", "skew"])
-@pytest.mark.parametrize("hidden,alignment", [(4, 1), (33, 4), (65, 16)])
+@pytest.mark.parametrize("hidden,alignment", [(256, 1), (512, 4), (768, 16)])
 def test_dispatch_copy_fresh_and_cached(
     native, expand, zero_padding, weighted, dtype, kind, hidden, alignment
 ):
@@ -233,7 +233,7 @@ def test_dispatch_copy_fresh_and_cached(
 def test_dispatch_copy_multiple_blocks(native, expand, zero_padding, dtype):
     check_fresh_and_cached(
         native,
-        copy_case("mixed", dtype, 129, tokens=19),
+        copy_case("mixed", dtype, 512, tokens=19),
         16,
         expand,
         True,
@@ -249,7 +249,7 @@ def test_dispatch_uses_allocated_reduction_mode(
 ):
     check_fresh_and_cached(
         native,
-        copy_case("mixed", dtype, 33, tokens=19),
+        copy_case("mixed", dtype, 256, tokens=19),
         4,
         expand,
         True,
@@ -262,7 +262,7 @@ def test_dispatch_uses_allocated_reduction_mode(
 def test_reserve_binding_uses_allocated_reduction_mode(
     native, allow_multiple_reduction
 ):
-    case = copy_case("mixed", torch.bfloat16, 33, tokens=19)
+    case = copy_case("mixed", torch.bfloat16, 256, tokens=19)
     with local_runtime(native, case, allow_multiple_reduction) as (
         runtime,
         window,
@@ -306,7 +306,7 @@ def test_reserve_binding_uses_allocated_reduction_mode(
 @pytest.mark.parametrize("expand,zero_padding", LAYOUTS, ids=LAYOUT_IDS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_dispatch_copy_nonfinite_payload(native, expand, zero_padding, dtype):
-    case = copy_case("mixed", dtype, 33)
+    case = copy_case("mixed", dtype, 256)
     case.xs[0][0, :3] = torch.tensor(
         [float("nan"), float("inf"), -float("inf")], dtype=dtype
     )
@@ -315,7 +315,7 @@ def test_dispatch_copy_nonfinite_payload(native, expand, zero_padding, dtype):
     check_fresh_and_cached(native, case, 4, expand, True, zero_padding)
 
 
-@pytest.mark.parametrize("topk,hidden", [(1, 1), (3, 65), (8, 4096), (32, 33)])
+@pytest.mark.parametrize("topk,hidden", [(1, 256), (3, 512), (8, 4096), (32, 256)])
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])
 def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighted):

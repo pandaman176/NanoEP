@@ -16,6 +16,24 @@ from nano_ep.testing.native_dispatch import (
 pytestmark = [pytest.mark.cuda]
 
 
+@pytest.mark.parametrize("hidden", [1, 33, 128, 255, 257])
+@pytest.mark.parametrize("tokens", [0, 2])
+@pytest.mark.parametrize("stage", ["dispatch_main", "reserve_and_put"])
+def test_hidden_constraint_precedes_communication(
+    native, runtime, hidden, tokens, stage
+):
+    peer, _ = runtime
+    x = torch.zeros((tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    indices = torch.full((tokens, 3), -1, dtype=torch.int64, device="cuda")
+    before = peer.local_window().clone()
+    with pytest.raises(RuntimeError, match="multiple of 256"):
+        if stage == "dispatch_main":
+            native.dispatch_main(peer, x, indices, None, 3, 5, 1, [])
+        else:
+            native.reserve_and_put(peer, x, indices, None, 3, 5)
+    torch.testing.assert_close(peer.local_window(), before, rtol=0, atol=0)
+
+
 @pytest.fixture
 def native(request):
     if not (
@@ -30,7 +48,7 @@ def native(request):
 
 @pytest.fixture
 def runtime(native):
-    layout = native.window_layout(1, 5, 4, 3, 3)
+    layout = native.window_layout(1, 5, 256, 3, 3)
     runtime = native.PeerRuntime(0, 1, layout[-1])
     window = runtime.local_window()
     window[layout[1] : layout[1] + 32].view(torch.int64).fill_(-1)
@@ -48,7 +66,7 @@ def runtime(native):
 @pytest.mark.parametrize("alignment", [1, 4, 16])
 def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
     runtime, layout = runtime
-    case = make_case(1, kind=kind, dtype=dtype)
+    case = make_case(1, kind=kind, dtype=dtype, hidden=256)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         x, indices, weights = (
@@ -124,7 +142,7 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_nonfinite_payload_is_preserved(native, runtime, dtype):
     runtime, _ = runtime
-    case = make_case(1, kind="mixed", dtype=dtype)
+    case = make_case(1, kind="mixed", dtype=dtype, hidden=256)
     case.xs[0][0, 0] = float("nan")
     case.xs[0][1, 0] = float("inf")
     state = native.dispatch_main(
@@ -161,7 +179,7 @@ def test_nonfinite_payload_is_preserved(native, runtime, dtype):
 )
 def test_invalid_input_precedes_communication(native, runtime, kind):
     runtime, layout = runtime
-    x = torch.ones((2, 4), dtype=torch.bfloat16, device="cuda")
+    x = torch.ones((2, 256), dtype=torch.bfloat16, device="cuda")
     indices = torch.tensor([[0, 1, -1], [2, -1, 0]], device="cuda")
     weights = torch.ones((2, 3), device="cuda")
     alignment, experts, capacity, cached = 4, 3, 5, []
@@ -174,7 +192,7 @@ def test_invalid_input_precedes_communication(native, runtime, kind):
     elif kind == "x_shape":
         x = x.flatten()
     elif kind == "x_stride":
-        x = torch.ones((2, 8), dtype=torch.bfloat16, device="cuda")[:, ::2]
+        x = torch.ones((2, 512), dtype=torch.bfloat16, device="cuda")[:, ::2]
     elif kind == "capacity":
         capacity = 1
     elif kind == "idx_cpu":

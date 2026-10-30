@@ -92,7 +92,7 @@ def check_kernel(probe, case, expand, mode, weighted):
 
 
 @pytest.mark.parametrize(
-    "ranks,topk,hidden", [(1, 3, 4), (2, 3, 33), (2, 2, 65), (4, 2, 65)]
+    "ranks,topk,hidden", [(1, 3, 256), (2, 3, 512), (2, 2, 768), (4, 2, 256)]
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("expand", [False, True])
@@ -112,14 +112,14 @@ def test_return_kernel_packets(
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("mode", [False, True])
 def test_return_kernel_edge_cases(probe, kind, tokens, expand, mode):
-    case = make_return_case(4, 2, 33, torch.bfloat16, kind=kind, tokens=tokens)
+    case = make_return_case(4, 2, 256, torch.bfloat16, kind=kind, tokens=tokens)
     check_kernel(probe, case, expand, mode, True)
 
 
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("mode", [False, True])
 def test_return_kernel_rounds_local_sum_to_bf16(probe, expand, mode):
-    case = make_return_case(2, 3, 65, torch.bfloat16, tokens=1)
+    case = make_return_case(2, 3, 256, torch.bfloat16, tokens=1)
     case.indices[0][0] = torch.tensor([0, 1, 3])
     case.values[0][0, 0].fill_(256)
     case.values[0][0, 1].fill_(1)

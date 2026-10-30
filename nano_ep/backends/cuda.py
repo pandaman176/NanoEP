@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.distributed as dist
 
-from nano_ep.backends._build import invoke, load_extension
+from nano_ep.backends._build import invoke, load_extension, prepare_combine_epilogue
 from nano_ep.config import EPConfig
 
 
@@ -91,6 +91,8 @@ class CudaBuffer:
         self._world_size = dist.get_world_size(group=group)
         self._rank = dist.get_rank(group=group)
         self._runtime = None
+        self._dispatch_epilogue = None
+        self._combine_epilogue = None
         self._comm_stream = None
         self._closed = True
         if dist.get_backend(group) != "gloo":
@@ -142,10 +144,13 @@ class CudaBuffer:
 
         if config.num_experts % self._world_size != 0:
             raise ValueError("num_experts must be divisible by world_size")
+        if config.hidden % 256 != 0:
+            raise ValueError("CUDA EP hidden must be a positive multiple of 256")
 
         allocation = {"handle": None, "error": None}
         try:
             self._backend = load_extension()
+            self._dispatch_epilogue = self._backend.dispatch_epilogue
             (
                 self._signal_offset,
                 self._count_offset,
@@ -161,6 +166,13 @@ class CudaBuffer:
                 config.num_experts,
                 allow_multiple_reduction,
             )
+            self._combine_epilogue = prepare_combine_epilogue(
+                config.hidden,
+                config.num_topk,
+                self._world_size,
+                config.num_experts // self._world_size,
+                config.num_max_tokens_per_rank,
+            ).combine_epilogue
             self._runtime = invoke(self._backend.PeerRuntime, self._rank, self._world_size, self._num_bytes)
             # All-one bytes represent int64 -1; recv_next and barrier signals stay zero.
             window = invoke(self._runtime.local_window)
@@ -261,6 +273,8 @@ class CudaBuffer:
             raise ValueError("x must be contiguous CUDA bfloat16 [T,H] on this buffer's device")
         if x.shape[1] != self._config.hidden or x.shape[0] > self._config.num_max_tokens_per_rank:
             raise ValueError("x hidden dimension or source token count does not match the buffer configuration")
+        if x.shape[1] % 256 != 0:
+            raise ValueError("CUDA EP hidden must be a positive multiple of 256")
         routing = handle.topk_idx if handle is not None else topk_idx
         shape = (x.shape[0], self._config.num_topk)
         if routing.device != device or routing.dtype != torch.int64 or routing.shape != shape or not routing.is_contiguous():
@@ -318,7 +332,7 @@ class CudaBuffer:
                     cached_metadata,
                     self._allow_multiple_reduction,
                 )
-                outputs = invoke(self._backend.dispatch_epilogue, state, expand, weights is not None, zero_padding)
+                outputs = invoke(self._dispatch_epilogue, state, expand, weights is not None, zero_padding)
                 metadata = state.metadata
                 recv_count, expanded_capacity = state.counts.tolist()  # Native-owned CPU int64 [2].
 
@@ -439,7 +453,7 @@ class CudaBuffer:
                     self._allow_multiple_reduction,
                 )
                 outputs = invoke(
-                    self._backend.combine_epilogue,
+                    self._combine_epilogue,
                     returned,
                     handle.topk_idx,
                     hidden,

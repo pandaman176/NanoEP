@@ -102,7 +102,7 @@ def test_automatic_barrier_epochs_and_notify_reuse(native, experts):
 @pytest.mark.parametrize("weighted", [False, True])
 @pytest.mark.parametrize("tokens", [0, 1, 11])
 def test_reserve_and_put_payload(native, dtype, weighted, tokens):
-    hidden, topk, capacity = 37, 3, 11
+    hidden, topk, capacity = 256, 3, 11
     layout = native.window_layout(1, capacity, hidden, topk, 4)
     runtime = native.PeerRuntime(0, 1, layout[-1])
     runtime.import_peer_handles([runtime.export_local_handle()])
@@ -189,7 +189,7 @@ def test_reserve_and_put_payload(native, dtype, weighted, tokens):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("tokens", [0, 11])
 def test_cached_payload_preserves_mapping_and_counter(native, dtype, tokens):
-    hidden, topk, capacity = 37, 3, 11
+    hidden, topk, capacity = 256, 3, 11
     layout = native.window_layout(1, capacity, hidden, topk, 4)
     runtime = native.PeerRuntime(0, 1, layout[-1])
     runtime.import_peer_handles([runtime.export_local_handle()])
@@ -299,10 +299,10 @@ def test_cached_payload_preserves_mapping_and_counter(native, dtype, tokens):
 @pytest.mark.parametrize("kind", ["shape", "dtype", "device", "stride", "empty_shape"])
 def test_invalid_cached_slot_storage(native, kind):
     tokens = 0 if kind == "empty_shape" else 3
-    layout = native.window_layout(1, 3, 4, 2, 4)
+    layout = native.window_layout(1, 3, 256, 2, 4)
     runtime = native.PeerRuntime(0, 1, layout[-1])
     runtime.import_peer_handles([runtime.export_local_handle()])
-    x = torch.zeros((tokens, 4), dtype=torch.bfloat16, device="cuda")
+    x = torch.zeros((tokens, 256), dtype=torch.bfloat16, device="cuda")
     indices = torch.zeros((tokens, 2), device="cuda", dtype=torch.int64)
     slots = torch.zeros((tokens, 1), device="cuda", dtype=torch.int64)
     if kind in ("shape", "empty_shape"):

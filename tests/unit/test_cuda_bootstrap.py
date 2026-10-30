@@ -26,6 +26,7 @@ def bootstrap(monkeypatch):
         "metadata": None,
         "backend": "gloo",
         "allow_multiple_reduction": False,
+        "hidden": 256,
     }
     group = object()
 
@@ -89,7 +90,7 @@ def bootstrap(monkeypatch):
     class Runtime:
         def __init__(self, rank, world_size, num_bytes, /):
             operation("allocate")
-            assert rank == local.rank and world_size == 2 and num_bytes == 5728
+            assert rank == local.rank and world_size == 2 and num_bytes == 9824
             self.rank = rank
             self.unmapped = False
             self.freed = False
@@ -122,11 +123,21 @@ def bootstrap(monkeypatch):
         ranks, tokens, hidden, topk, experts, allow_multiple_reduction, /
     ):
         operation("layout")
-        assert (ranks, tokens, hidden, topk, experts) == (2, 8, 128, 2, 4)
+        assert (ranks, tokens, hidden, topk, experts) == (2, 8, 256, 2, 4)
         assert allow_multiple_reduction is settings["allow_multiple_reduction"]
-        return [0, 32, 96, 96, 5728]
+        return [0, 32, 96, 96, 9824]
 
-    native = SimpleNamespace(PeerRuntime=Runtime, window_layout=window_layout)
+    def dispatch_epilogue(*args):
+        raise AssertionError("bootstrap must not execute dispatch epilogue")
+
+    def combine_epilogue(*args):
+        raise AssertionError("bootstrap must not execute combine epilogue")
+
+    native = SimpleNamespace(
+        PeerRuntime=Runtime,
+        window_layout=window_layout,
+        dispatch_epilogue=dispatch_epilogue,
+    )
 
     def load():
         operation("extension")
@@ -138,6 +149,13 @@ def bootstrap(monkeypatch):
         return object()
 
     monkeypatch.setattr(cuda, "load_extension", load)
+
+    def prepare(hidden, topk, ranks, experts_per_rank, capacity):
+        operation("specialization")
+        assert (hidden, topk, ranks, experts_per_rank, capacity) == (256, 2, 2, 2, 8)
+        return SimpleNamespace(combine_epilogue=combine_epilogue)
+
+    monkeypatch.setattr(cuda, "prepare_combine_epilogue", prepare)
     monkeypatch.setattr(cuda.torch.cuda, "Stream", stream)
     monkeypatch.setattr(
         cuda.torch.cuda,
@@ -160,8 +178,12 @@ def bootstrap(monkeypatch):
                 if settings["metadata"] == "reduction" and rank == 0:
                     mode = not mode
                 buffer = cuda.CudaBuffer(
-                    group, EPConfig(experts, 2, 128, 8), allow_multiple_reduction=mode
+                    group,
+                    EPConfig(experts, 2, settings["hidden"], 8),
+                    allow_multiple_reduction=mode,
                 )
+                assert buffer._dispatch_epilogue is dispatch_epilogue
+                assert buffer._combine_epilogue is combine_epilogue
                 if close:
                     buffer.close()
                     buffer.close()
@@ -196,7 +218,7 @@ def test_bootstrap_and_collective_close(bootstrap, allow_multiple_reduction):
             buffer._payload_offset,
             buffer._return_offset,
             buffer._num_bytes,
-        ) == (0, 32, 96, 96, 5728)
+        ) == (0, 32, 96, 96, 9824)
         assert buffer._comm_stream is not None
         window = bootstrap.runtimes[rank].window
         assert window.view(torch.int64)[4:10].tolist() == [-1] * 6
@@ -218,6 +240,7 @@ def test_bootstrap_and_collective_close(bootstrap, allow_multiple_reduction):
         "properties",
         "extension",
         "layout",
+        "specialization",
         "allocate",
         "initialize",
         "window_ready",
@@ -236,6 +259,7 @@ def test_one_rank_failure_reaches_both_ranks(bootstrap, failure):
     if failure in (
         "extension",
         "layout",
+        "specialization",
         "allocate",
         "initialize",
         "window_ready",
@@ -297,3 +321,15 @@ def test_control_group_must_be_gloo(bootstrap):
         isinstance(result, ValueError) and "Gloo" in str(result) for result in results
     )
     assert not bootstrap.rounds and not bootstrap.runtimes
+
+
+@pytest.mark.parametrize("hidden", [1, 128, 255, 257])
+def test_hidden_constraint_is_collective_and_precedes_allocation(bootstrap, hidden):
+    bootstrap.settings["hidden"] = hidden
+    results = bootstrap.run()
+    assert all(
+        isinstance(result, ValueError) and "multiple of 256" in str(result)
+        for result in results
+    )
+    assert not bootstrap.runtimes
+    assert not any(name == "extension" for name, rank in bootstrap.events)

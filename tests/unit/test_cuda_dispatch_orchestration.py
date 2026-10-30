@@ -17,10 +17,10 @@ def test_non_bf16_dispatch_rejected_before_stream_work(dispatch_runtime, dtype, 
     r = dispatch_runtime
     handle = None
     if cached:
-        valid = r.tensor("valid", torch.zeros((2, 4), dtype=torch.bfloat16))
+        valid = r.tensor("valid", torch.zeros((2, 256), dtype=torch.bfloat16))
         handle = r.buffer.dispatch(valid, topk_idx=r.indices).handle
     r.events.clear()
-    x = r.tensor("invalid", torch.zeros((2, 4), dtype=dtype))
+    x = r.tensor("invalid", torch.zeros((2, 256), dtype=dtype))
     with pytest.raises(ValueError, match="bfloat16"):
         r.buffer.dispatch(x, handle=handle, topk_idx=None if cached else r.indices)
     assert not r.events
@@ -151,7 +151,7 @@ def dispatch_runtime(monkeypatch):
         n, capacity = state.counts.tolist()
         rows = capacity if expand else n
         outputs = (
-            Tensor("recv_x", torch.zeros((rows, 4), dtype=state.dtype)),
+            Tensor("recv_x", torch.zeros((rows, 256), dtype=state.dtype)),
             Tensor(
                 "recv_idx",
                 torch.empty(0, dtype=torch.int64)
@@ -176,13 +176,14 @@ def dispatch_runtime(monkeypatch):
     monkeypatch.setattr(cuda.torch.cuda, "stream", use_stream)
     monkeypatch.setattr(cuda.torch.cuda, "Event", Event)
     buffer = cuda.CudaBuffer.__new__(cuda.CudaBuffer)
-    buffer._config = EPConfig(6, 3, 4, 5)
+    buffer._config = EPConfig(6, 3, 256, 5)
     buffer._device = buffer._rank = 0
     buffer._closed = False
     buffer._world_size = 2
     buffer._runtime = runtime
     buffer._comm_stream = comm
-    buffer._backend = SimpleNamespace(dispatch_main=main, dispatch_epilogue=epilogue)
+    buffer._backend = SimpleNamespace(dispatch_main=main)
+    buffer._dispatch_epilogue = epilogue
     buffer._allow_multiple_reduction = False
     return SimpleNamespace(
         buffer=buffer,
@@ -210,7 +211,7 @@ def test_fresh_dispatch_wires_state_and_streams(
 ):
     r = dispatch_runtime
     r.buffer._allow_multiple_reduction = mode
-    x = r.tensor("x", torch.zeros((2, 4), dtype=dtype))
+    x = r.tensor("x", torch.zeros((2, 256), dtype=dtype))
     weights = r.tensor("weights", torch.ones((2, 3))) if weighted else None
     ready = r.event() if explicit_event else None
     alignment = None if layout is None else 4
@@ -294,7 +295,7 @@ def test_cached_dispatch_reuses_handle_with_new_payload(
     dispatch_runtime, expand, weighted, asynchronous
 ):
     r = dispatch_runtime
-    x = r.tensor("x", torch.zeros((2, 4), dtype=torch.bfloat16))
+    x = r.tensor("x", torch.zeros((2, 256), dtype=torch.bfloat16))
     weights = r.tensor("weights", torch.ones((2, 3)))
     first = r.buffer.dispatch(
         x,
@@ -306,7 +307,7 @@ def test_cached_dispatch_reuses_handle_with_new_payload(
     )
     old_metadata = r.calls[0].state.metadata
     r.events.clear()
-    new_x = r.tensor("new_x", torch.full((2, 4), 7.0, dtype=torch.bfloat16))
+    new_x = r.tensor("new_x", torch.full((2, 256), 7.0, dtype=torch.bfloat16))
     new_weights = None if weighted else weights
     got = r.buffer.dispatch(
         new_x, weights=new_weights, handle=first.handle, async_op=asynchronous
@@ -332,7 +333,7 @@ def test_cached_dispatch_reuses_handle_with_new_payload(
 def test_native_failure_does_not_return_completion(dispatch_runtime, failure):
     r = dispatch_runtime
     r.settings["failure"] = failure
-    x = r.tensor("x", torch.zeros((2, 4), dtype=torch.bfloat16))
+    x = r.tensor("x", torch.zeros((2, 256), dtype=torch.bfloat16))
     with pytest.raises(RuntimeError, match=f"injected {failure} failure"):
         r.buffer.dispatch(x, topk_idx=r.indices)
     assert ("record_tensor", "x", "comm") in r.events

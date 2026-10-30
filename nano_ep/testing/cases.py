@@ -21,12 +21,13 @@ def make_case(
     seed: int = 0,
     kind: str = "random",
     dtype: torch.dtype = torch.float32,
+    hidden: int = 4,
 ) -> Case:
     """Small reproducible inputs, with weights intentionally nonzero at -1 slots."""
     if kind not in {"random", "empty", "masked", "skew", "mixed"}:
         raise ValueError(f"unknown case: {kind}")
     generator = torch.Generator().manual_seed(seed)
-    num_experts, num_topk, hidden, capacity = world_size * 3, 3, 4, 5
+    num_experts, num_topk, capacity = world_size * 3, 3, 5
     xs, indices, weights = [], [], []
     for rank in range(world_size):
         count = 5 - rank % 4

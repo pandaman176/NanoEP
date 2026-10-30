@@ -3,7 +3,6 @@
 from dataclasses import replace
 from datetime import timedelta
 import os
-from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -143,17 +142,12 @@ def source_reference(case, rank, expand, multiple, bias):
     return result.bfloat16()
 
 
-def delayed_backend(native):
+def delayed_epilogue(function):
     def epilogue(*args):
         torch.cuda._sleep(20_000_000)
-        return native.combine_epilogue(*args)
+        return function(*args)
 
-    return SimpleNamespace(
-        dispatch_main=native.dispatch_main,
-        dispatch_epilogue=native.dispatch_epilogue,
-        combine_main=native.combine_main,
-        combine_epilogue=epilogue,
-    )
+    return epilogue
 
 
 def combine_experts(buffer, received, bias, *, explicit_event, asynchronous):
@@ -209,19 +203,22 @@ def run():
     deterministic.fill_uninitialized_memory = True
     try:
         check_peer_runtime(rank, size)
-        cfg = EPConfig(size * 3, 3, 128, 5)
+        cfg = EPConfig(size * 3, 3, 256, 5)
         # A second lifetime catches stale IPC handles and counters after close.
         for lifetime in range(2):
             buffer = CudaBuffer(
                 dist.group.WORLD, cfg, allow_multiple_reduction=bool(lifetime)
             )
-            buffer._backend = delayed_backend(buffer._backend)
+            buffer._combine_epilogue = delayed_epilogue(buffer._combine_epilogue)
             for expand in (False, True):
                 for kind in ("mixed", "empty", "masked", "skew"):
                     c = make_case(
-                        size, kind=kind, seed=lifetime + 7, dtype=torch.bfloat16
+                        size,
+                        kind=kind,
+                        seed=lifetime + 7,
+                        dtype=torch.bfloat16,
+                        hidden=256,
                     )
-                    c.xs = [x.repeat(1, 32) for x in c.xs]
                     expected = reference_dispatch(
                         c.xs,
                         c.indices,
@@ -325,7 +322,7 @@ def run():
             # Exact BF16 roundtrips distinguish rank duplication from expert
             # duplication, with no weights, plus a source bias added once.
             c = make_case(size, kind="mixed", seed=31)
-            x_cpu = torch.full((len(c.xs[rank]), 128), rank + 1, dtype=torch.bfloat16)
+            x_cpu = torch.full((len(c.xs[rank]), 256), rank + 1, dtype=torch.bfloat16)
             for expand in (False, True):
                 idx = c.indices[rank].cuda()
                 received = buffer.dispatch(

@@ -4,7 +4,6 @@ import os
 from dataclasses import replace
 from datetime import timedelta
 from itertools import product
-from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -20,7 +19,7 @@ from nano_ep.testing.wire import align32, dispatch_row_bytes, return_row_bytes
 def make_case(size, topk, dtype, step):
     generator = torch.Generator().manual_seed(71 + step)
     xs, indices, weights = [], [], []
-    experts, hidden, capacity = size * 8, 65, 11
+    experts, hidden, capacity = size * 8, 256, 11
     for rank in range(size):
         tokens = 7 - rank % 3 if step == 0 else 4 + rank % 3
         if step == 1 and rank == size - 1:
@@ -122,7 +121,8 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
     other = make_case(size, topk, dtype, 1)
     config = EPConfig(original.num_experts, topk, original.hidden, original.capacity)
     with CudaBuffer(dist.group.WORLD, config, allow_multiple_reduction=mode) as buffer:
-        native = buffer._backend
+        dispatch_copy = buffer._dispatch_epilogue
+        combine_reduce = buffer._combine_epilogue
         assert buffer._payload_offset == buffer._return_offset
         payload_bytes = (
             size * original.capacity * dispatch_row_bytes(original.hidden, topk)
@@ -146,7 +146,7 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
             snapshots.append((before, after))
 
         def dispatch_epilogue(*args):
-            outputs = native.dispatch_epilogue(*args)
+            outputs = dispatch_copy(*args)
             if rank == 0 and not dispatch_gates:
                 # Keep an old arena reader pending until peer 1 attempts combine.
                 delay_reader(args[0].stage_buffer, 3)
@@ -154,19 +154,15 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
             return outputs
 
         def combine_epilogue(*args):
-            outputs = native.combine_epilogue(*args)
+            outputs = combine_reduce(*args)
             if rank == 0 and not combine_gates:
                 # Peer 1 attempts fresh dispatch while this return read is pending.
                 delay_reader(args[0], 5)
                 combine_gates.append(5)
             return outputs
 
-        buffer._backend = SimpleNamespace(
-            dispatch_main=native.dispatch_main,
-            dispatch_epilogue=dispatch_epilogue,
-            combine_main=native.combine_main,
-            combine_epilogue=combine_epilogue,
-        )
+        buffer._dispatch_epilogue = dispatch_epilogue
+        buffer._combine_epilogue = combine_epilogue
         with torch.cuda.stream(buffer._comm_stream):
             # All-one FP32 bytes are NaN. Unwritten records must never contribute.
             window[buffer._payload_offset :].fill_(255)

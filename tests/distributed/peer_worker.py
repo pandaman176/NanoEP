@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from nano_ep.backends._build import load_extension
+from nano_ep.backends._build import load_extension, prepare_combine_epilogue
 from nano_ep.testing.wire import dispatch_offsets, dispatch_row_bytes
 
 
@@ -251,7 +251,7 @@ def check_notify(native, rank):
 
 
 def check_payload(native, rank):
-    hidden, topk, capacity = 37, 3, 11
+    hidden, topk, capacity = 256, 3, 11
     layout = native.window_layout(2, capacity, hidden, topk, 4)
     runtime = native.PeerRuntime(rank, 2, layout[-1])
     window = runtime.local_window()
@@ -497,7 +497,7 @@ def check_dispatch_main(native, rank):
                 zero_padding=zero_padding,
             )
 
-    layout = native.window_layout(2, 5, 4, 3, 6)
+    layout = native.window_layout(2, 5, 256, 3, 6)
     runtime = native.PeerRuntime(rank, 2, layout[-1])
     window = runtime.local_window()
     window[layout[1] : layout[1] + 64].view(torch.int64).fill_(-1)
@@ -513,7 +513,7 @@ def check_dispatch_main(native, rank):
         ("masked", torch.bfloat16),
         ("skew", torch.bfloat16),
     ):
-        case = make_case(2, kind=kind, dtype=dtype)
+        case = make_case(2, kind=kind, dtype=dtype, hidden=256)
         with torch.cuda.stream(stream):
             x, indices, weights = (
                 case.xs[rank].cuda(),
@@ -584,8 +584,9 @@ def check_combine_main(native, rank):
         make_return_case,
     )
 
+    combine_epilogue = prepare_combine_epilogue(256, 3, 2, 3, 5).combine_epilogue
     for mode in (False, True):
-        layout = native.window_layout(2, 5, 33, 3, 6, mode)
+        layout = native.window_layout(2, 5, 256, 3, 6, mode)
         runtime = native.PeerRuntime(rank, 2, layout[-1])
         handles = [None, None]
         dist.all_gather_object(handles, runtime.export_local_handle())
@@ -599,7 +600,7 @@ def check_combine_main(native, rank):
                 (False, True),
                 ("mixed", "empty", "masked"),
             ):
-                case = make_return_case(2, 3, 33, dtype, kind=kind)
+                case = make_return_case(2, 3, 256, dtype, kind=kind)
                 x, weights, metadata = expert_inputs(case, rank, expand)
                 runtime.local_window()[layout[3] :].fill_(165)
                 device_x, device_weights = x.cuda(), weights.cuda()
@@ -623,7 +624,7 @@ def check_combine_main(native, rank):
                     if weighted
                     else None
                 )
-                combined = native.combine_epilogue(
+                combined = combine_epilogue(
                     returned,
                     device_metadata[8],
                     case.hidden,

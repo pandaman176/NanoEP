@@ -70,19 +70,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
                py::arg("max_tokens"),
                py::arg("expand"),
                py::arg("allow_multiple_reduction"));
-    module.def("combine_epilogue",
-               &nano_ep::combine_epilogue,
-               py::arg("stage_buffer"),
-               py::arg("source_topk_snapshot"),
-               py::arg("hidden"),
-               py::arg("x_dtype"),
-               py::arg("num_experts"),
-               py::arg("world_size"),
-               py::arg("max_tokens"),
-               py::arg("bias"),
-               py::arg("with_weights"),
-               py::arg("expand"),
-               py::arg("allow_multiple_reduction"));
     module.def(
         "window_layout",
         [](int ranks, int64_t tokens, int hidden, int topk, int64_t num_experts, bool allow_multiple_reduction) {

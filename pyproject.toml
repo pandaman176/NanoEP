@@ -27,7 +27,7 @@ include = ["nano_ep*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-nano_ep = ["py.typed", "_csrc/*.cpp", "_csrc/*.cu", "_csrc/*.hpp", "_csrc/include/nano_ep/*.hpp"]
+nano_ep = ["py.typed", "_csrc/*.cpp", "_csrc/*.cu", "_csrc/*.cuh", "_csrc/*.hpp", "_csrc/include/nano_ep/*.hpp"]
 
 [tool.ruff]
 line-length = 140

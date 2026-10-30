@@ -19,6 +19,9 @@ struct WindowLayout {
     int return_partitions;
     int64_t return_capacity;
 
+    // num of elements a warp will handle
+    // 32 threads * 16 bytes/thread / 2 bytes/element
+    static constexpr int64_t kHiddenAlignment = 32 * 16 / 2;
     static constexpr int64_t kAlignment = 32;
     static constexpr int64_t kRegionAlignment = kAlignment;
     static constexpr int64_t kRowAlignment = kAlignment;

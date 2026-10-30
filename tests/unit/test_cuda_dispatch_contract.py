@@ -30,8 +30,8 @@ class TensorStorage:
 def inputs():
     buffer = CudaBuffer.__new__(CudaBuffer)
     buffer._closed, buffer._device = False, 0
-    buffer._config = EPConfig(6, 3, 4, 5)
-    x = TensorStorage((2, 4))
+    buffer._config = EPConfig(6, 3, 256, 5)
+    x = TensorStorage((2, 256))
     idx = TensorStorage((2, 3), torch.int64)
     # Only the Python boundary's scalar fields/storage descriptors are supplied.
     handle = SimpleNamespace(
@@ -99,7 +99,7 @@ def test_dispatch_contract_before_native_work(inputs, kind):
         if kind == "foreign_owner":
             handle.owner = object()
         elif kind == "config":
-            handle.config = EPConfig(12, 3, 4, 5)
+            handle.config = EPConfig(12, 3, 256, 5)
         elif kind == "cached_indices":
             kwargs["topk_idx"] = idx
         elif kind == "alignment_change":
@@ -129,7 +129,7 @@ def test_dispatch_contract_before_native_work(inputs, kind):
     elif kind == "hidden":
         x = replace(x, shape=(2, 8))
     elif kind == "capacity":
-        x = replace(x, shape=(6, 4))
+        x = replace(x, shape=(6, 256))
     elif kind == "idx_dtype":
         kwargs["topk_idx"] = replace(idx, dtype=torch.float32)
     elif kind == "idx_shape":

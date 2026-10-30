@@ -21,7 +21,7 @@ def run():
     dist.init_process_group("gloo", timeout=timedelta(seconds=45))
     try:
         native = load_extension()
-        config = EPConfig(size * 2, 2, 128, 8)
+        config = EPConfig(size * 2, 2, 256, 8)
 
         for failure in ("allocate", "export", "import"):
 
@@ -76,7 +76,7 @@ def run():
                 assert buffer._allow_multiple_reduction is mode
                 assert (
                     buffer._num_bytes
-                    == native.window_layout(size, 8, 128, 2, config.num_experts, mode)[
+                    == native.window_layout(size, 8, 256, 2, config.num_experts, mode)[
                         -1
                     ]
                 )

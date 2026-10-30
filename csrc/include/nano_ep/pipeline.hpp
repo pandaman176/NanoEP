@@ -116,26 +116,4 @@ torch::Tensor combine_main(PeerRuntime& runtime,
                            bool expand,
                            bool allow_multiple_reduction);
 
-// Return [combined_x, combined_weights], with source shape from snapshot.
-// The source routing and mode determine which return partitions were written.
-// Deduplicate destination ranks for compact/local-reduced x; expanded without
-// local reduction reads each valid k. Weights select their original k from the
-// corresponding writer's row, independently of x reduction. Masked outputs are
-// zero. Read BF16 partial sums, accumulate FP32, add source bias once, then
-// cast to BF16. x_dtype must be BF16.
-// Bias is optional contiguous [T,H] with x_dtype. Without weights the second
-// result is an empty CUDA FP32 [0] tensor. Outputs own their storage; the caller
-// orders this read after combine_main and before the next dispatch or combine.
-std::vector<torch::Tensor> combine_epilogue(const torch::Tensor& stage_buffer,
-                                            const torch::Tensor& source_topk_snapshot,
-                                            int64_t hidden,
-                                            at::ScalarType x_dtype,
-                                            int64_t num_experts,
-                                            int64_t world_size,
-                                            int64_t max_tokens,
-                                            const c10::optional<torch::Tensor>& bias,
-                                            bool with_weights,
-                                            bool expand,
-                                            bool allow_multiple_reduction);
-
 }  // namespace nano_ep

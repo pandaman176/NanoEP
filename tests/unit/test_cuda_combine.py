@@ -13,7 +13,7 @@ from test_cuda_dispatch_orchestration import dispatch_runtime as dispatch_runtim
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.float16])
 def test_non_bf16_combine_rejected_before_stream_work(combine_runtime, dtype):
     r = combine_runtime
-    x = r.tensor("invalid", torch.zeros((2, 4), dtype=dtype))
+    x = r.tensor("invalid", torch.zeros((2, 256), dtype=dtype))
     with pytest.raises(ValueError, match="bfloat16"):
         r.buffer.combine(x, r.handle)
     assert not r.events and r.combine_calls.main is None
@@ -86,7 +86,7 @@ def combine_runtime(dispatch_runtime):
         return calls.outputs
 
     r.buffer._backend.combine_main = main
-    r.buffer._backend.combine_epilogue = epilogue
+    r.buffer._combine_epilogue = epilogue
     return SimpleNamespace(**vars(r), handle=handle, combine_calls=calls)
 
 
@@ -119,13 +119,13 @@ def test_combine_wires_native_reverse_path(
     r.handle.do_expand = expand
     r.buffer._allow_multiple_reduction = mode
     rows = 12 if expand else 2
-    x = r.tensor("expert_output", torch.zeros((rows, 4), dtype=dtype))
+    x = r.tensor("expert_output", torch.zeros((rows, 256), dtype=dtype))
     weights = (
         r.tensor("weights", torch.ones((rows,) if expand else (rows, 3)))
         if weighted
         else None
     )
-    bias = r.tensor("bias", torch.zeros((3, 4), dtype=dtype)) if biased else None
+    bias = r.tensor("bias", torch.zeros((3, 256), dtype=dtype)) if biased else None
     ready = r.event() if explicit_event else None
     got = r.buffer.combine(
         x,
@@ -141,7 +141,7 @@ def test_combine_wires_native_reverse_path(
     assert calls.epilogue == (
         calls.window,
         r.handle.topk_idx,
-        4,
+        256,
         dtype,
         6,
         2,
@@ -152,7 +152,7 @@ def test_combine_wires_native_reverse_path(
         mode,
     )
     assert got.x is calls.outputs[0]
-    assert got.x.shape == (3, 4) and got.x.dtype == dtype
+    assert got.x.shape == (3, 256) and got.x.dtype == dtype
     assert got.topk_weights is (calls.outputs[1] if weighted else None)
     dependency = (
         ("wait_event", "comm", ready)
@@ -217,7 +217,7 @@ def test_combine_wires_native_reverse_path(
 )
 def test_combine_invalid_inputs_precede_native_work(combine_runtime, kind):
     r = combine_runtime
-    x = r.tensor("x", torch.zeros((2, 4), dtype=torch.bfloat16))
+    x = r.tensor("x", torch.zeros((2, 256), dtype=torch.bfloat16))
     weights, bias = None, None
     error = ValueError
     if kind == "closed":
@@ -226,7 +226,7 @@ def test_combine_invalid_inputs_precede_native_work(combine_runtime, kind):
     elif kind == "owner":
         r.handle.owner = object()
     elif kind == "config":
-        r.handle.config = cuda.EPConfig(12, 3, 4, 5)
+        r.handle.config = cuda.EPConfig(12, 3, 256, 5)
     elif kind.startswith("x_") or kind in ("compact_rows", "expanded_rows"):
         if kind == "x_device":
             x.device = torch.device("cpu")
@@ -241,7 +241,7 @@ def test_combine_invalid_inputs_precede_native_work(combine_runtime, kind):
         elif kind == "x_hidden":
             x.payload = torch.zeros((2, 5), dtype=torch.bfloat16)
         elif kind == "compact_rows":
-            x.payload = torch.zeros((3, 4), dtype=torch.bfloat16)
+            x.payload = torch.zeros((3, 256), dtype=torch.bfloat16)
         else:
             r.handle.do_expand = True
     elif "weight" in kind:
@@ -256,10 +256,10 @@ def test_combine_invalid_inputs_precede_native_work(combine_runtime, kind):
             weights.payload = torch.zeros((2, 6))[:, ::2]
         else:
             r.handle.do_expand = True
-            x.payload = torch.zeros((12, 4), dtype=torch.bfloat16)
+            x.payload = torch.zeros((12, 256), dtype=torch.bfloat16)
             weights.payload = torch.zeros((12, 3))
     else:
-        bias = r.tensor("bias", torch.zeros((3, 4), dtype=torch.bfloat16))
+        bias = r.tensor("bias", torch.zeros((3, 256), dtype=torch.bfloat16))
         if kind == "bias_device":
             bias.device = torch.device("cpu")
         elif kind == "bias_dtype":
@@ -267,7 +267,7 @@ def test_combine_invalid_inputs_precede_native_work(combine_runtime, kind):
         elif kind == "bias_rank":
             bias.payload = bias.payload.flatten()
         elif kind == "bias_receive_rows":
-            bias.payload = torch.zeros((2, 4), dtype=torch.bfloat16)
+            bias.payload = torch.zeros((2, 256), dtype=torch.bfloat16)
         else:
             bias.payload = torch.zeros((3, 8), dtype=torch.bfloat16)[:, ::2]
     with pytest.raises(error):
@@ -289,7 +289,7 @@ def test_empty_source_still_returns_remote_expert_contributions(
     r.handle.send_counts.payload.zero_()
     r.handle.layout.src_ranks.payload.fill_(1)
     rows = 12 if expand else 2
-    x = r.tensor("x", torch.zeros((rows, 4), dtype=torch.bfloat16))
+    x = r.tensor("x", torch.zeros((rows, 256), dtype=torch.bfloat16))
     weights = (
         r.tensor("weights", torch.zeros((rows,) if expand else (rows, 3)))
         if weighted
@@ -297,7 +297,7 @@ def test_empty_source_still_returns_remote_expert_contributions(
     )
     got = r.buffer.combine(x, r.handle, weights=weights, async_op=True)
     assert r.combine_calls.main is not None and r.combine_calls.epilogue is not None
-    assert got.x.shape == (0, 4)
+    assert got.x.shape == (0, 256)
     if weighted:
         assert got.topk_weights is not None and got.topk_weights.shape == (0, 3)
     else:
@@ -308,7 +308,7 @@ def test_empty_source_still_returns_remote_expert_contributions(
 def test_combine_native_failure_propagates(combine_runtime, failure):
     r = combine_runtime
     r.settings["failure"] = failure
-    x = r.tensor("x", torch.zeros((2, 4), dtype=torch.bfloat16))
+    x = r.tensor("x", torch.zeros((2, 256), dtype=torch.bfloat16))
     with pytest.raises(RuntimeError, match=f"injected {failure} failure"):
         r.buffer.combine(x, r.handle)
     assert ("record_tensor", "x", "comm") in r.events
