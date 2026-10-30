@@ -46,7 +46,7 @@ result = buffer.combine(
 )
 ```
 
-The caller computes experts and applies gate weights. Compact `expert_x[N,H]` must already contain the sum of the local weighted expert outputs. Expanded `expert_x[C,H]` contains one output per assignment; padding is ignored. Expert outputs are BF16 on every rank; FP32 EP inputs are not supported.
+The caller computes experts and applies gate weights. Compact `expert_x[N,H]` must already contain the sum of the local weighted expert outputs. Expanded `expert_x[C,H]` contains one output per assignment; padding is ignored. Expert outputs are BF16 on every rank; FP32 EP inputs are not supported. The input data pointer must be 16-byte aligned for vector loads; contiguous views with an unaligned storage offset are rejected before the entry GPU barrier. Aligned nonzero storage offsets are supported.
 
 Optional FP32 `weights` uses the receive layout and is returned independently as `result.topk_weights[T,K]`, with masked positions zero; it never multiplies `expert_x`. With no weight payload, the result field is `None`. Optional source-local `bias[T,H]` has the expert-output dtype and is added once.
 

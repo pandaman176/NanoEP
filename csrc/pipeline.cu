@@ -2,6 +2,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cuda/atomic>
 #include <limits>
@@ -716,6 +717,7 @@ torch::Tensor combine_main(PeerRuntime& runtime,
     TORCH_CHECK(x.device() == window.device() && x.dim() == 2 && x.is_contiguous() && x.size(1) > 0,
                 "combine x must be contiguous CUDA [N,H] or [C,H] on the runtime device");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "combine x must be bfloat16");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % sizeof(int4) == 0, "combine x data pointer must be 16-byte aligned");
     TORCH_CHECK(x.size(1) % WindowLayout::kHiddenAlignment == 0, "combine hidden must be a positive multiple of 256");
     TORCH_CHECK(metadata[8].dim() == 2 && metadata[3].dim() == 1 && metadata[3].numel() > 0,
                 "combine metadata requires a [T,K] source snapshot and [L] expert counts");

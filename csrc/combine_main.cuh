@@ -2,13 +2,21 @@
 
 #include <ATen/cuda/CUDAContextLight.h>
 #include <c10/cuda/CUDAException.h>
+#include <cuda_bf16.h>
 #include <torch/extension.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <cuda/std/bit>
 
 #include "layout.hpp"
 
 namespace nano_ep {
+
+struct PackedBf16 {
+    uint16_t bits[8];
+};
+static_assert(sizeof(PackedBf16) == sizeof(int4));
 
 template <int kTopk>
 __device__ __forceinline__ int compute_expanded_slots(int64_t lane_slot, unsigned valid_mask, int64_t (&slots)[kTopk]) {
@@ -47,7 +55,15 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,  // [R], in
     constexpr int kWarpSize = 32;
     constexpr int64_t hidden = kHidden;
     constexpr int64_t return_row_bytes = WindowLayout::return_weights_offset(kHidden) + ((kTopk * sizeof(float) + 31) / 32) * 32;
-    static_assert(kHidden > 0 && kHidden % WindowLayout::kHiddenAlignment == 0);
+    constexpr int kElemsPerVector = sizeof(int4) / sizeof(nv_bfloat16);
+    constexpr int kVectorsPerLane = kHidden / (kWarpSize * kElemsPerVector);
+    constexpr int kUnrollFactor = [] {
+        for (int factor = 4; factor >= 1; --factor)
+            if (kVectorsPerLane % factor == 0)
+                return factor;
+        return 1;
+    }();
+    static_assert(kHidden > 0 && kHidden % (kWarpSize * kElemsPerVector) == 0);
     static_assert(kTopk > 0 && kTopk <= 32 && kWorldSize > 0 && kWorldSize <= 32 && kMaxTokens > 0);
 
     // Each warp processes one source token per iteration
@@ -109,9 +125,16 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,  // [R], in
                 const int64_t slot = __shfl_sync(0xffffffffu, lane_slot, k);
                 const int64_t peer_idx = k * kMaxTokens + src_token;
                 auto* peer_row = peer_window + return_offset + peer_idx * return_row_bytes;
-                auto* peer_x = reinterpret_cast<at::BFloat16*>(peer_row);
-                for (int64_t h = lane; h < hidden; h += kWarpSize)
-                    peer_x[h] = x[slot * hidden + h];
+                auto* output_vectors = reinterpret_cast<int4*>(peer_row);
+                const auto* input_vectors = reinterpret_cast<const int4*>(x + slot * kHidden);
+#pragma unroll
+                for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
+#pragma unroll
+                    for (int u = 0; u < kUnrollFactor; ++u) {
+                        const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
+                        output_vectors[index] = input_vectors[index];
+                    }
+                }
                 if constexpr (kWithWeights) {
                     if (lane == 0) {
                         auto* peer_weights = reinterpret_cast<float*>(peer_row + WindowLayout::return_weights_offset(hidden));
@@ -135,20 +158,46 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,  // [R], in
                     // Broadcast the only valid assignment's slot to the whole warp.
                     input_row = __shfl_sync(0xffffffffu, lane_slot, first_valid_k);
                 }
-                for (int64_t h = lane; h < hidden; h += kWarpSize)
-                    peer_x[h] = x[input_row * hidden + h];
+                auto* output_vectors = reinterpret_cast<int4*>(peer_row);
+                const auto* input_vectors = reinterpret_cast<const int4*>(x + input_row * kHidden);
+#pragma unroll
+                for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
+#pragma unroll
+                    for (int u = 0; u < kUnrollFactor; ++u) {
+                        const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
+                        output_vectors[index] = input_vectors[index];
+                    }
+                }
             } else if constexpr (kExpand) {
                 int64_t slots[kTopk];
                 // number of valid k's in this row
                 const int count = compute_expanded_slots(lane_slot, valid_mask, slots);
 
-                for (int64_t h = lane; h < hidden; h += kWarpSize) {
-                    float accum = 0.0f;
+                auto* output_vectors = reinterpret_cast<int4*>(peer_x);
+                for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
+                    float2 accum[kUnrollFactor][kElemsPerVector / 2] = {};
                     for (int k = 0; k < count; ++k) {
                         const int64_t slot = slots[k];
-                        accum += static_cast<float>(x[slot * hidden + h]);
+                        const auto* input_vectors = reinterpret_cast<const int4*>(x + slot * kHidden);
+                        for (int u = 0; u < kUnrollFactor; ++u) {
+                            const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
+                            // Load 16bytes, treated as 8 2byte bits: value.bits[0..7]
+                            const auto value = cuda::std::bit_cast<PackedBf16>(input_vectors[index]);
+                            for (int j = 0; j < kElemsPerVector / 2; ++j) {
+                                accum[u][j].x += __bfloat162float(__ushort_as_bfloat16(value.bits[2 * j]));
+                                accum[u][j].y += __bfloat162float(__ushort_as_bfloat16(value.bits[2 * j + 1]));
+                            }
+                        }
                     }
-                    peer_x[h] = static_cast<at::BFloat16>(accum);
+                    for (int u = 0; u < kUnrollFactor; ++u) {
+                        const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
+                        PackedBf16 value;
+                        for (int j = 0; j < kElemsPerVector / 2; ++j) {
+                            value.bits[2 * j] = __bfloat16_as_ushort(__float2bfloat16_rn(accum[u][j].x));
+                            value.bits[2 * j + 1] = __bfloat16_as_ushort(__float2bfloat16_rn(accum[u][j].y));
+                        }
+                        output_vectors[index] = cuda::std::bit_cast<int4>(value);
+                    }
                 }
             }
             if constexpr (kWithWeights) {

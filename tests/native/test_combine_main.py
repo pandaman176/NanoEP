@@ -75,6 +75,37 @@ def test_combine_hidden_constraint_precedes_barrier(native, launcher, hidden):
         torch.testing.assert_close(window, before, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("expand", [False, True])
+@pytest.mark.parametrize("mode", [False, True])
+@pytest.mark.parametrize("offset", [1, 4, 7, 8])
+def test_combine_input_alignment_before_barrier(native, launcher, expand, mode, offset):
+    case = make_return_case(1, 3, 256, torch.bfloat16, tokens=3)
+    case.capacity = 5
+    host_x, _, host_metadata = expert_inputs(case, 0, expand)
+    with empty_inputs(native, mode) as (runtime, window, _, _, _):
+        storage = torch.empty(
+            host_x.numel() + offset, dtype=torch.bfloat16, device="cuda"
+        )
+        x = storage[offset:].view(host_x.shape)
+        x.copy_(host_x)
+        assert x.is_contiguous() and x.storage_offset() == offset
+        assert x.data_ptr() % 16 == offset * x.element_size() % 16
+        metadata = [tensor.cuda() for tensor in host_metadata]
+        before = window.clone()
+        if offset % 8:
+            with pytest.raises(RuntimeError, match="16-byte aligned"):
+                native.combine_main(
+                    runtime, x, metadata, None, 5, expand, mode, launcher=launcher
+                )
+            torch.testing.assert_close(window, before, rtol=0, atol=0)
+        else:
+            returned = native.combine_main(
+                runtime, x, metadata, None, 5, expand, mode, launcher=launcher
+            )
+            assert_return_packets(returned, case, 0, expand, mode, False)
+            assert window[:8].view(torch.int64).item() == 2
+
+
 @pytest.mark.parametrize("dimension,value", [(0, 512), (1, 2), (2, 2), (3, 4), (4, 6)])
 def test_compiled_geometry_mismatch_precedes_barrier(native, dimension, value):
     geometry = [256, 3, 1, 3, 5]
