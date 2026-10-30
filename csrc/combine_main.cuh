@@ -2,12 +2,14 @@
 
 #include <ATen/cuda/CUDAContextLight.h>
 #include <c10/cuda/CUDAException.h>
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <torch/extension.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cuda/std/bit>
+#include <nano_ep/barrier.cuh>
 
 #include "layout.hpp"
 
@@ -40,17 +42,17 @@ template <int kHidden,
           bool kExpand,
           bool kAllowMultipleReduction,
           bool kWithWeights>
-__global__ void combine_return_kernel(const int64_t* peer_addresses,  // [R], includes self
-                                      const data_t* x,                // compact [N,H], expanded [C,H]
-                                      const float* weights,           // compact [N,K], expanded [C], or nullptr
-                                      const int64_t* src_ranks,       // [N]
-                                      const int64_t* src_tokens,      // [N]
-                                      const int64_t* local_topk_idx,  // [N,K], nonlocal/masked = -1
-                                      const int64_t* expanded_slots,  // expanded [N,K], compact nullptr
-                                      int rank,
-                                      int64_t recv_count,    // N, one warp per row
-                                      int64_t input_rows,    // N or C; bounds for expanded x/weights reads
-                                      int64_t return_offset  // bytes from each peer window base
+__device__ __forceinline__ void combine_return_rows(const int64_t* peer_addresses,  // [R], includes self
+                                                    const data_t* x,                // compact [N,H], expanded [C,H]
+                                                    const float* weights,           // compact [N,K], expanded [C], or nullptr
+                                                    const int64_t* src_ranks,       // [N]
+                                                    const int64_t* src_tokens,      // [N]
+                                                    const int64_t* local_topk_idx,  // [N,K], nonlocal/masked = -1
+                                                    const int64_t* expanded_slots,  // expanded [N,K], compact nullptr
+                                                    int rank,
+                                                    int64_t recv_count,    // N, one warp per row
+                                                    int64_t input_rows,    // N or C; bounds for expanded x/weights reads
+                                                    int64_t return_offset  // bytes from each peer window base
 ) {
     constexpr int kWarpSize = 32;
     constexpr int64_t hidden = kHidden;
@@ -212,6 +214,49 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,  // [R], in
     }
 }
 
+template <int kHidden,
+          int kTopk,
+          int kWorldSize,
+          int64_t kMaxTokens,
+          typename data_t,
+          bool kExpand,
+          bool kAllowMultipleReduction,
+          bool kWithWeights>
+__global__ void combine_return_kernel(const int64_t* peer_addresses,
+                                      const data_t* x,
+                                      const float* weights,
+                                      const int64_t* src_ranks,
+                                      const int64_t* src_tokens,
+                                      const int64_t* local_topk_idx,
+                                      const int64_t* expanded_slots,
+                                      int rank,
+                                      int64_t recv_count,
+                                      int64_t input_rows,
+                                      int64_t return_offset,
+                                      int64_t entry_epoch) {
+    auto grid = cooperative_groups::this_grid();
+    auto* local_signals = reinterpret_cast<uint64_t*>(peer_addresses[rank]);
+
+    // Previous stream work has finished before this kernel. Only CTA 0 exchanges
+    // readiness; the grid waits before any CTA overwrites the shared arena.
+    if (blockIdx.x == 0)
+        peer_barrier(peer_addresses, local_signals, rank, kWorldSize, static_cast<uint64_t>(entry_epoch));
+
+    // All CTAs wait for CTA 0
+    grid.sync();
+
+    combine_return_rows<kHidden, kTopk, kWorldSize, kMaxTokens, data_t, kExpand, kAllowMultipleReduction, kWithWeights>(
+        peer_addresses, x, weights, src_ranks, src_tokens, local_topk_idx, expanded_slots, rank, recv_count, input_rows, return_offset);
+
+    // Each writer orders its own remote stores before CTA 0 publishes completion.
+    // Empty ranks participate too. Stream ordering delays the epilogue until
+    // the whole kernel ends, so no final grid sync is needed after the exchange.
+    __threadfence_system();
+    grid.sync();
+    if (blockIdx.x == 0)
+        peer_barrier(peer_addresses, local_signals, rank, kWorldSize, static_cast<uint64_t>(entry_epoch + 1));
+}
+
 template <int kHidden, int kTopk, int kWorldSize, int64_t kMaxTokens>
 void launch_combine_return(const torch::Tensor& addresses,
                            const torch::Tensor& x,
@@ -221,30 +266,54 @@ void launch_combine_return(const torch::Tensor& addresses,
                            const WindowLayout& layout,
                            bool expand,
                            bool allow_multiple_reduction,
+                           int64_t entry_epoch,
                            cudaStream_t stream) {
-    const int64_t recv_count = metadata[0].numel();
-    if (recv_count == 0)
-        return;
-
+    int64_t recv_count = metadata[0].numel();
     const auto* weight_ptr = weights.has_value() ? weights->data_ptr<float>() : nullptr;
     constexpr int threads = 256;
-    const int blocks = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
     using scalar_t = at::BFloat16;
 
     const auto launch = [&]<bool kExpand, bool kAllowMultipleReduction, bool kWithWeights>() {
-        combine_return_kernel<kHidden, kTopk, kWorldSize, kMaxTokens, scalar_t, kExpand, kAllowMultipleReduction, kWithWeights>
-            <<<blocks, threads, 0, stream>>>(addresses.data_ptr<int64_t>(),
-                                             x.data_ptr<scalar_t>(),
-                                             weight_ptr,
-                                             metadata[0].data_ptr<int64_t>(),
-                                             metadata[1].data_ptr<int64_t>(),
-                                             metadata[2].data_ptr<int64_t>(),
-                                             kExpand ? metadata[5].data_ptr<int64_t>() : nullptr,
-                                             rank,
-                                             recv_count,
-                                             x.size(0),
-                                             layout.return_offset);
+        const auto kernel =
+            combine_return_kernel<kHidden, kTopk, kWorldSize, kMaxTokens, scalar_t, kExpand, kAllowMultipleReduction, kWithWeights>;
+        // Each host thread uses a fixed GPU; check each compiled variant once.
+        static thread_local bool has_pass = false;
+        if (!has_pass) {
+            int supported = 0;
+            C10_CUDA_CHECK(cudaDeviceGetAttribute(&supported, cudaDevAttrCooperativeLaunch, x.get_device()));
+            TORCH_CHECK(supported, "combine main requires CUDA cooperative launch support");
+
+            // combine_main will launch num_sm blocks, so each block must at least allow one active block to enable grid sync.
+            int active_blocks_per_sm = 0;
+            C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_sm, kernel, threads, 0));
+            TORCH_CHECK(active_blocks_per_sm >= 1, "combine main cannot fit a 256-thread cooperative block on an SM");
+
+            has_pass = true;
+        }
+        const int blocks = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+
+        auto* address_ptr = addresses.data_ptr<int64_t>();
+        const auto* x_ptr = x.data_ptr<scalar_t>();
+        const auto* src_ranks = metadata[0].data_ptr<int64_t>();
+        const auto* src_tokens = metadata[1].data_ptr<int64_t>();
+        const auto* local_topk = metadata[2].data_ptr<int64_t>();
+        const auto* expanded_slots = kExpand ? metadata[5].data_ptr<int64_t>() : nullptr;
+        int64_t input_rows = x.size(0);
+        int64_t return_offset = layout.return_offset;
+        void* args[] = {&address_ptr,
+                        &x_ptr,
+                        &weight_ptr,
+                        &src_ranks,
+                        &src_tokens,
+                        &local_topk,
+                        &expanded_slots,
+                        &rank,
+                        &recv_count,
+                        &input_rows,
+                        &return_offset,
+                        &entry_epoch};
+        C10_CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(kernel), dim3(blocks), dim3(threads), args, 0, stream));
     };
     const auto launch_with_weights = [&]<bool kExpand, bool kAllowMultipleReduction>() {
         if (weights.has_value())

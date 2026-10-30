@@ -2,8 +2,9 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
-#include <cuda/atomic>
+
 #include <cstdio>
+#include <cuda/atomic>
 
 // Test-only reads through imported pointers; no production API is added.
 __global__ void read_words_kernel(const int64_t* addresses, int64_t* output, int64_t ranks, int64_t offset, int64_t words) {

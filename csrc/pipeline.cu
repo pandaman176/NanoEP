@@ -762,11 +762,10 @@ torch::Tensor combine_main(PeerRuntime& runtime,
     auto returned =
         window.narrow(0, layout.return_offset, layout.return_capacity * row_bytes).view({layout.return_partitions, max_tokens, row_bytes});
 
-    runtime.barrier(stream_handle);
+    const int64_t entry_epoch = runtime.reserve_barrier_epochs(stream_handle, 2);
 
-    specialization.launch(addresses, x, metadata, weights, runtime.rank(), layout, expand, allow_multiple_reduction, stream.stream());
-
-    runtime.barrier(stream_handle);
+    specialization.launch(
+        addresses, x, metadata, weights, runtime.rank(), layout, expand, allow_multiple_reduction, entry_epoch, stream.stream());
 
     return returned;
 }

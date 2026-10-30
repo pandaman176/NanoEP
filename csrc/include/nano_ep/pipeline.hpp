@@ -19,6 +19,7 @@ struct CombineMainSpecialization {
                    const WindowLayout& layout,
                    bool expand,
                    bool allow_multiple_reduction,
+                   int64_t entry_epoch,
                    cudaStream_t stream);
 };
 
@@ -117,6 +118,7 @@ std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool expand, 
 // Rank layout is selected iff allow_multiple_reduction && R<=K. Otherwise a
 // compact/local-reduced row uses its first valid top-k slot as representative;
 // expanded single-reduction sends each assignment to its own k partition.
+// One cooperative kernel contains entry/exit barriers and payload work.
 // Entry/exit GPU barriers protect reuse and publication. Expanded padding is
 // never sent; local reduction uses FP32 and rounds partial sums to BF16.
 // Storage validation is host-only; metadata values/ownership and exact expanded

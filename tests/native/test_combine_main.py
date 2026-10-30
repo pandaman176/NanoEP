@@ -171,6 +171,41 @@ def test_empty_combine_barriers_and_borrowed_return_view(
             torch.testing.assert_close(tensor.cpu(), expected)
 
 
+def test_fused_combine_epochs_interleave_with_standalone_barriers(native, launcher):
+    with empty_inputs(native) as (runtime, window, _, x, metadata):
+        stream = torch.cuda.current_stream()
+        runtime.barrier(stream.cuda_stream, 7)
+        native.combine_main(
+            runtime, x, metadata, None, 5, False, False, launcher=launcher
+        )
+        assert window[:8].view(torch.int64).item() == 9
+        runtime.barrier(stream.cuda_stream)
+        assert window[:8].view(torch.int64).item() == 10
+        native.combine_main(
+            runtime, x, metadata, None, 5, False, False, launcher=launcher
+        )
+        assert window[:8].view(torch.int64).item() == 12
+        with pytest.raises(RuntimeError, match="strictly increase"):
+            runtime.barrier(stream.cuda_stream, 12)
+        runtime.barrier(stream.cuda_stream, 17)
+        native.combine_main(
+            runtime, x, metadata, None, 5, False, False, launcher=launcher
+        )
+        assert window[:8].view(torch.int64).item() == 19
+        other_stream = torch.cuda.Stream()
+        before = window.clone()
+        with (
+            torch.cuda.stream(other_stream),
+            pytest.raises(RuntimeError, match="same stream"),
+        ):
+            native.combine_main(
+                runtime, x, metadata, None, 5, False, False, launcher=launcher
+            )
+        torch.testing.assert_close(window, before, rtol=0, atol=0)
+        runtime.barrier(stream.cuda_stream)
+        assert window[:8].view(torch.int64).item() == 20
+
+
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])

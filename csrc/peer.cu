@@ -4,9 +4,9 @@
 
 #include <cstdio>
 #include <cstring>
-#include <cuda/atomic>
 #include <exception>
 #include <limits>
+#include <nano_ep/barrier.cuh>
 #include <nano_ep/peer.hpp>
 #include <utility>
 
@@ -152,74 +152,37 @@ torch::Tensor PeerRuntime::local_window() const {
     return torch::from_blob(local_ptr_, {num_bytes_}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA, device_));
 }
 
-__global__ void barrier_kernel(const int64_t* peer_addresses,
-                               uint64_t* local_window,
-                               int64_t rank,
-                               int64_t world_size,
-                               uint64_t epoch,
-                               unsigned long long timeout_cycles) {
-    const int64_t peer_id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (peer_id >= world_size)
-        return;
+__global__ void barrier_kernel(const int64_t* peer_addresses, uint64_t* local_window, int64_t rank, int64_t world_size, uint64_t epoch) {
+    peer_barrier(peer_addresses, local_window, rank, world_size, epoch);
+}
 
-    using Signal = cuda::atomic_ref<uint64_t, cuda::thread_scope_system>;
+int64_t PeerRuntime::reserve_barrier_epochs(int64_t stream_handle, int64_t count) {
+    TORCH_CHECK(!closing_ && !closed_, "PeerRuntime is closing or closed");
+    TORCH_CHECK(peer_addresses_.defined(), "Peer handles are not imported");
+    TORCH_CHECK(count > 0 && count <= std::numeric_limits<int64_t>::max() - last_barrier_epoch_, "Barrier epoch exhausted");
+    TORCH_CHECK(world_size_ <= 32, "Too many ranks");
+    TORCH_CHECK(num_bytes_ >= world_size_ * static_cast<int64_t>(sizeof(uint64_t)), "Window is too small for barrier signals");
+    auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    TORCH_CHECK(last_barrier_epoch_ == 0 || stream == barrier_stream_, "Barriers must use the same stream");
 
-    // Send
-    uint64_t* peer_window = reinterpret_cast<uint64_t*>(peer_addresses[peer_id]);
-    Signal outgoing(peer_window[rank]);
-    outgoing.store(epoch, cuda::memory_order_release);
-
-    // Receive
-    Signal incoming(local_window[peer_id]);
-    const auto start = clock64();
-    while (true) {
-        uint64_t observed = incoming.load(cuda::memory_order_acquire);
-        if (observed >= epoch) {
-            break;
-        }
-
-        if (clock64() - start > timeout_cycles) {
-            printf("Rank %lld timed out waiting for rank %lld at epoch %llu (observed %llu)\n",
-                   static_cast<long long>(rank),
-                   static_cast<long long>(peer_id),
-                   static_cast<unsigned long long>(epoch),
-                   static_cast<unsigned long long>(observed));
-
-            asm volatile("trap;");
-        }
-
-        __nanosleep(64);
-    }
+    const int64_t first_epoch = last_barrier_epoch_ + 1;
+    barrier_stream_ = stream;
+    last_barrier_epoch_ += count;
+    return first_epoch;
 }
 
 void PeerRuntime::barrier(int64_t stream_handle, int64_t epoch) {
     TORCH_CHECK(!closing_ && !closed_, "PeerRuntime is closing or closed");
-    TORCH_CHECK(peer_addresses_.defined(), "Peer handles are not imported");
     TORCH_CHECK(epoch > last_barrier_epoch_, "Barrier epoch must strictly increase");
-
-    constexpr int threads = 32;
-
-    TORCH_CHECK(world_size_ <= threads, "Too many ranks");
-    TORCH_CHECK(num_bytes_ >= world_size_ * static_cast<int64_t>(sizeof(uint64_t)), "Window is too small for barrier signals");
+    reserve_barrier_epochs(stream_handle, epoch - last_barrier_epoch_);
 
     c10::cuda::CUDAGuard device_guard(device_);
-
     auto stream = reinterpret_cast<cudaStream_t>(stream_handle);
-    constexpr unsigned long long timeout_cycles = 20'000'000'000ULL;
-
-    TORCH_CHECK(last_barrier_epoch_ == 0 || stream == barrier_stream_, "Barriers must use the same stream");
-
-    barrier_kernel<<<1, threads, 0, stream>>>(peer_addresses_.data_ptr<int64_t>(),
-                                              reinterpret_cast<uint64_t*>(local_ptr_),
-                                              rank_,
-                                              world_size_,
-                                              static_cast<uint64_t>(epoch),
-                                              timeout_cycles);
+    constexpr int threads = 32;
+    barrier_kernel<<<1, threads, 0, stream>>>(
+        peer_addresses_.data_ptr<int64_t>(), reinterpret_cast<uint64_t*>(local_ptr_), rank_, world_size_, static_cast<uint64_t>(epoch));
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-
-    barrier_stream_ = stream;
-    last_barrier_epoch_ = epoch;
 }
 
 void PeerRuntime::close_peer_mappings() {

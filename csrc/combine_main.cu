@@ -4,8 +4,8 @@
 
 namespace nano_ep {
 
-// Core extension owns validation, IPC lifetime and barriers. This module only
-// launches the return kernel for its compiled geometry, on the supplied stream.
+// The core owns validation, IPC lifetime and epoch allocation. The geometry
+// module launches one cooperative kernel with both barriers and payload work.
 static const CombineMainSpecialization specialization{
     NANO_EP_HIDDEN,
     NANO_EP_TOPK,

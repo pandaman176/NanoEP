@@ -9,8 +9,32 @@
 #include "combine_main.cuh"
 #include "layout.hpp"
 
-// Logical peers use distinct allocations on one physical GPU. This probe tests
-// the actual kernel/launcher's addressing; real IPC/barriers use peer_worker.
+template <bool kExpand, bool kMode, bool kWithWeights>
+__global__ void return_payload_kernel(const int64_t* addresses,
+                                      const at::BFloat16* x,
+                                      const float* weights,
+                                      const int64_t* src_ranks,
+                                      const int64_t* src_tokens,
+                                      const int64_t* local_topk,
+                                      const int64_t* slots,
+                                      int rank,
+                                      int64_t rows,
+                                      int64_t input_rows,
+                                      int64_t return_offset) {
+    nano_ep::combine_return_rows<NANO_EP_HIDDEN,
+                                 NANO_EP_TOPK,
+                                 NANO_EP_WORLD_SIZE,
+                                 NANO_EP_MAX_TOKENS,
+                                 at::BFloat16,
+                                 kExpand,
+                                 kMode,
+                                 kWithWeights>(
+        addresses, x, weights, src_ranks, src_tokens, local_topk, slots, rank, rows, input_rows, return_offset);
+}
+
+// Logical peers use distinct allocations on one physical GPU. They execute the
+// production payload helper without a collective; real IPC tests cover
+// barriers.
 void run_return_kernel(const std::vector<torch::Tensor>& windows,
                        const torch::Tensor& x,
                        const std::vector<torch::Tensor>& metadata,
@@ -29,8 +53,43 @@ void run_return_kernel(const std::vector<torch::Tensor>& windows,
     TORCH_CHECK(
         x.size(1) == NANO_EP_HIDDEN && metadata[8].size(1) == NANO_EP_TOPK && ranks == NANO_EP_WORLD_SIZE && capacity == NANO_EP_MAX_TOKENS,
         "probe inputs do not match the compiled geometry");
-    nano_ep::launch_combine_return<NANO_EP_HIDDEN, NANO_EP_TOPK, NANO_EP_WORLD_SIZE, NANO_EP_MAX_TOKENS>(
-        addresses, x, metadata, weights, rank, layout, expand, mode, c10::cuda::getCurrentCUDAStream().stream());
+    if (metadata[0].numel() == 0)
+        return;
+    constexpr int threads = 256;
+    const int blocks = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    const auto stream = c10::cuda::getCurrentCUDAStream().stream();
+    const auto launch = [&]<bool kExpand, bool kMode, bool kWithWeights>() {
+        return_payload_kernel<kExpand, kMode, kWithWeights>
+            <<<blocks, threads, 0, stream>>>(addresses.data_ptr<int64_t>(),
+                                             x.data_ptr<at::BFloat16>(),
+                                             weights.has_value() ? weights->data_ptr<float>() : nullptr,
+                                             metadata[0].data_ptr<int64_t>(),
+                                             metadata[1].data_ptr<int64_t>(),
+                                             metadata[2].data_ptr<int64_t>(),
+                                             kExpand ? metadata[5].data_ptr<int64_t>() : nullptr,
+                                             rank,
+                                             metadata[0].numel(),
+                                             x.size(0),
+                                             layout.return_offset);
+    };
+    const auto launch_with_weights = [&]<bool kExpand, bool kMode>() {
+        if (weights.has_value())
+            launch.template operator()<kExpand, kMode, true>();
+        else
+            launch.template operator()<kExpand, kMode, false>();
+    };
+    if (expand) {
+        if (mode)
+            launch_with_weights.template operator()<true, true>();
+        else
+            launch_with_weights.template operator()<true, false>();
+    } else {
+        if (mode)
+            launch_with_weights.template operator()<false, true>();
+        else
+            launch_with_weights.template operator()<false, false>();
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // Each warp exposes the production helper's result from every participating lane.

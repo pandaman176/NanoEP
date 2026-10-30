@@ -43,7 +43,7 @@ def probe(request, tmp_path_factory):
         return load(
             name="nano_ep_combine_probe_" + "_".join(map(str, geometry)),
             sources=[str(Path(__file__).with_name("combine_probe.cu"))],
-            extra_include_paths=[str(source_dir)],
+            extra_include_paths=[str(source_dir), str(source_dir / "include")],
             extra_cflags=["-O2", "-std=c++20"],
             extra_cuda_cflags=["-O2", "-std=c++20", *defines],
         )

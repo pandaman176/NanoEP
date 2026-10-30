@@ -32,6 +32,9 @@ public:
     // Advance the barrier epoch when entering each collective communication phase.
     void barrier(int64_t stream_handle);
     void barrier(int64_t stream_handle, int64_t epoch);
+    // Reserve consecutive phases for a fused kernel on the barrier stream.
+    // Return the first epoch; this advances host bookkeeping without a launch.
+    int64_t reserve_barrier_epochs(int64_t stream_handle, int64_t count);
     // Caller drains all window users before phase 1, then completes a host
     // group barrier across all importers before phase 2 (close).
     void close_peer_mappings();
