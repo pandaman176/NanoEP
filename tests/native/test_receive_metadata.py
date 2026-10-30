@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from nano_ep.backends._build import load_extension
+from nano_ep.testing.wire import dispatch_row_bytes
 
 pytestmark = [pytest.mark.cuda]
 
@@ -48,13 +49,14 @@ def make_records(rank, kind, alignment):
     src_ranks = torch.arange(rows, dtype=torch.int64) % 4
     src_tokens = torch.arange(rows - 1, -1, -1, dtype=torch.int64) * 3 + 7
     hidden = 7
-    row_bytes = (16 + 12 * topk + 4 * hidden + 15) // 16 * 16
+    row_bytes = dispatch_row_bytes(hidden, topk)
     stage = torch.full((rows, row_bytes), 165, dtype=torch.uint8)
     for row in range(rows):
         header = torch.cat(
             (src_ranks[row : row + 1], src_tokens[row : row + 1], indices[row])
         )
-        stage[row, : 16 + 8 * topk] = header.view(torch.uint8)
+        stage[row, :16] = header[:2].view(torch.uint8)
+        stage[row, 32 : 32 + 8 * topk] = header[2:].view(torch.uint8)
 
     local = torch.where(
         (indices >= start) & (indices < start + local_experts), indices - start, -1

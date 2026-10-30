@@ -97,7 +97,7 @@ std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool expand, 
 // Collective on the current stream. Use the same reduction mode and capacity
 // as the owning allocation. Return borrowed uint8 [P,Tmax,row_bytes] storage,
 // where P=K without local reduction, else min(R,K). Rows contain BF16 x[H],
-// padding to a four-byte boundary, then FP32 weights[K]. Absent/masked weights
+// padding to a 32-byte boundary, then FP32 weights[K]. Absent/masked weights
 // must not be read.
 // Rank layout is selected iff allow_multiple_reduction && R<=K. Otherwise a
 // compact/local-reduced row uses its first valid top-k slot as representative;

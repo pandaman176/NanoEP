@@ -1,19 +1,20 @@
 """Exercise shared-arena ownership and delayed readers with real CUDA IPC."""
 
+import os
 from dataclasses import replace
 from datetime import timedelta
 from itertools import product
-import os
 from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
+from peer_worker import load_probe
 
 from nano_ep import EPConfig
 from nano_ep.backends.cuda import CudaBuffer
 from nano_ep.testing.cases import Case
 from nano_ep.testing.oracle import reference_dispatch
-from peer_worker import load_probe
+from nano_ep.testing.wire import align32, dispatch_row_bytes, return_row_bytes
 
 
 def make_case(size, topk, dtype, step):
@@ -124,20 +125,15 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
         native = buffer._backend
         assert buffer._payload_offset == buffer._return_offset
         payload_bytes = (
-            size
-            * original.capacity
-            * ((16 + 12 * topk + 2 * original.hidden + 15) // 16 * 16)
+            size * original.capacity * dispatch_row_bytes(original.hidden, topk)
         )
         return_bytes = (
             (min(size, topk) if mode else topk)
             * original.capacity
-            * (((2 * original.hidden + 3) // 4 * 4 + 4 * topk + 15) // 16 * 16)
+            * return_row_bytes(original.hidden, topk)
         )
-        assert (
-            buffer._num_bytes
-            == (buffer._payload_offset + max(payload_bytes, return_bytes) + 255)
-            // 256
-            * 256
+        assert buffer._num_bytes == align32(
+            buffer._payload_offset + max(payload_bytes, return_bytes)
         )
         window = buffer._runtime.local_window()
         dispatch_gates, combine_gates = [], []

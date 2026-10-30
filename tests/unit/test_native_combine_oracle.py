@@ -11,14 +11,15 @@ from nano_ep.testing.native_combine import (
     make_return_packet,
     reference_combined,
 )
+from nano_ep.testing.wire import return_row_bytes, return_weights_offset
 
 
 
 def materialize_packets(case, expand, mode, weighted):
     ranks = len(case.indices)
     partitions = min(ranks, case.topk) if mode else case.topk
-    weight_offset = (2 * case.hidden + 3) // 4 * 4
-    stride = (weight_offset + 4 * case.topk + 15) // 16 * 16
+    weight_offset = return_weights_offset(case.hidden)
+    stride = return_row_bytes(case.hidden, case.topk)
     packets = [
         torch.full((partitions, case.capacity, stride), 165, dtype=torch.uint8)
         for _ in range(ranks)
@@ -82,7 +83,8 @@ def test_packet_checker_rejects_wrong_transfer(corruption):
     packet = materialize_packets(case, False, False, True)[0]
     fields = packet[..., : 2 * case.hidden].view(torch.bfloat16)
     if corruption == "missing_weight":
-        packet[0, 0, 2 * case.hidden + 2 * 4 : 2 * case.hidden + 3 * 4] = 165
+        offset = return_weights_offset(case.hidden)
+        packet[0, 0, offset + 2 * 4 : offset + 3 * 4] = 165
     elif corruption == "nonlocal_x":
         fields[1, 0, : case.hidden] = 0
     elif corruption == "masked_token":
@@ -105,15 +107,15 @@ def test_local_reduction_keeps_each_hidden_coordinate_and_weight():
         torch.tensor([11.0, 22.0, 33.0], dtype=torch.bfloat16),
     )
     torch.testing.assert_close(
-        packet[0, 0, 8:16].view(torch.float32), torch.tensor([0.2, 0.7])
+        packet[0, 0, 32:40].view(torch.float32), torch.tensor([0.2, 0.7])
     )
-    assert (packet[0, 0, 6:8] == 165).all()
+    assert (packet[0, 0, 6:32] == 165).all()
 
 
 def decode_packet(packet, case, source, expand, mode, bias):
     """Scalar wire decoder for fixture verification; no native execution."""
     x_fields = packet[..., : 2 * case.hidden].view(torch.bfloat16)
-    weight_offset = (2 * case.hidden + 3) // 4 * 4
+    weight_offset = return_weights_offset(case.hidden)
     weight_fields = packet[..., weight_offset:].view(torch.float32)
     ranks = len(case.indices)
     local_experts = case.num_experts // ranks

@@ -11,6 +11,7 @@ from nano_ep.testing.native_combine import (
     make_return_case,
     make_return_packet,
 )
+from nano_ep.testing.wire import return_row_bytes
 
 pytestmark = [pytest.mark.cuda]
 
@@ -45,7 +46,7 @@ def poison_empty_outputs(native):
 def inputs(*, mode=False, dtype=torch.bfloat16, tokens=2):
     ranks, experts, capacity, hidden, topk = 2, 6, 5, 33, 3
     partitions = min(ranks, topk) if mode else topk
-    row_bytes = ((2 * hidden + 3) // 4 * 4 + 4 * topk + 15) // 16 * 16
+    row_bytes = return_row_bytes(hidden, topk)
     return {
         "stage_buffer": torch.full(
             (partitions, capacity, row_bytes), 165, dtype=torch.uint8, device="cuda"

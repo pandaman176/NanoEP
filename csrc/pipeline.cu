@@ -177,9 +177,9 @@ __global__ void reserve_and_put_kernel(const int64_t* peer_addresses,
         auto* row = peer_window + payload_offset + dst_slot * payload_row_bytes;
         auto* row_src_rank = reinterpret_cast<int64_t*>(row);
         auto* row_src_token = reinterpret_cast<int64_t*>(row + 8);
-        auto* row_topk = reinterpret_cast<int64_t*>(row + 16);
-        auto* row_weights = reinterpret_cast<float*>(row + 16 + 8 * num_topk);
-        auto* row_x = reinterpret_cast<data_t*>(row + 16 + 12 * num_topk);
+        auto* row_topk = reinterpret_cast<int64_t*>(row + WindowLayout::kPayloadTopkOffset);
+        auto* row_weights = reinterpret_cast<float*>(row + WindowLayout::payload_weights_offset(num_topk));
+        auto* row_x = reinterpret_cast<data_t*>(row + WindowLayout::payload_x_offset(num_topk));
 
         if (lane == 0) {
             row_src_rank[0] = rank;
@@ -223,7 +223,7 @@ __global__ void build_receive_metadata_kernel(const uint8_t* stage_buffer,
     // └──────────┴───────────┴───────────┴────────────┴─────────┴─────────┘
     const auto* payload = stage_buffer + row * row_bytes;
     const auto* provenance = reinterpret_cast<const int64_t*>(payload);
-    const auto* topk = reinterpret_cast<const int64_t*>(payload + 16);
+    const auto* topk = reinterpret_cast<const int64_t*>(payload + WindowLayout::kPayloadTopkOffset);
     if (lane == 0) {
         src_ranks[row] = provenance[0];
         src_tokens[row] = provenance[1];
@@ -273,8 +273,8 @@ __global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,    //
         return;
 
     const auto* payload = stage_buffer + row * row_bytes;
-    const auto* weights = reinterpret_cast<const float*>(payload + 16 + 8 * num_topk);
-    const auto* x = reinterpret_cast<const output_t*>(payload + 16 + 12 * num_topk);
+    const auto* weights = reinterpret_cast<const float*>(payload + WindowLayout::payload_weights_offset(num_topk));
+    const auto* x = reinterpret_cast<const output_t*>(payload + WindowLayout::payload_x_offset(num_topk));
 
     if constexpr (kExpand) {
         for (int64_t k = 0; k < num_topk; ++k) {
@@ -340,7 +340,7 @@ __device__ __forceinline__ void restore_weights(const uint8_t* stage_buffer,  //
         float weight = 0.0f;
         if (partition >= 0) {
             const auto* return_row = stage_buffer + (partition * max_tokens + row) * return_row_bytes;
-            const auto* weights = reinterpret_cast<const float*>(return_row + ((hidden + 1) / 2) * sizeof(float));
+            const auto* weights = reinterpret_cast<const float*>(return_row + WindowLayout::return_weights_offset(hidden));
             weight = weights[lane];
         }
         combined_weights[row * num_topk + lane] = weight;
@@ -581,7 +581,7 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,  // [R], in
                 peer_x[h] = x[slot * hidden + h];
             if constexpr (kWithWeights) {
                 if (lane == 0) {
-                    auto* peer_weights = reinterpret_cast<float*>(peer_row + ((hidden + 1) / 2) * sizeof(float));
+                    auto* peer_weights = reinterpret_cast<float*>(peer_row + WindowLayout::return_weights_offset(hidden));
                     peer_weights[k] = weights[slot];
                 }
             }
@@ -612,7 +612,7 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,  // [R], in
         if constexpr (kWithWeights) {
             // One lane writes each original top-k position in the same return row.
             if (valid_k) {
-                auto* peer_weights = reinterpret_cast<float*>(peer_row + ((hidden + 1) / 2) * sizeof(float));
+                auto* peer_weights = reinterpret_cast<float*>(peer_row + WindowLayout::return_weights_offset(hidden));
                 const int64_t weight_idx = kExpand ? expanded_slots[row * num_topk + lane] : row * num_topk + lane;
                 peer_weights[lane] = weights[weight_idx];
             }
@@ -822,8 +822,8 @@ std::vector<torch::Tensor> build_receive_metadata(
                 "expert_offsets must be contiguous CUDA int64 [experts_per_rank+1] on the stage_buffer device");
     const int64_t recv_count = stage_buffer.size(0);
     const int64_t row_bytes = stage_buffer.size(1);
-    TORCH_CHECK(row_bytes >= 16 + 12 * num_topk + 2 && row_bytes % WindowLayout::kRowAlignment == 0 &&
-                    reinterpret_cast<uintptr_t>(stage_buffer.data_ptr<uint8_t>()) % alignof(int64_t) == 0,
+    TORCH_CHECK(row_bytes >= WindowLayout::payload_row_bytes(1, num_topk) && row_bytes % WindowLayout::kRowAlignment == 0 &&
+                    reinterpret_cast<uintptr_t>(stage_buffer.data_ptr<uint8_t>()) % WindowLayout::kAlignment == 0,
                 "stage_buffer must contain aligned full dispatch payload rows");
 
     c10::cuda::CUDAGuard guard(stage_buffer.device());
@@ -1167,7 +1167,7 @@ std::vector<torch::Tensor> combine_epilogue(const torch::Tensor& stage_buffer,
     const int64_t row_bytes = WindowLayout::return_row_bytes(hidden, num_topk);
     TORCH_CHECK(stage_buffer.size(0) == partitions && stage_buffer.size(1) == max_tokens && stage_buffer.size(2) == row_bytes,
                 "combine stage_buffer shape does not match reduction mode, capacity and row layout");
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(stage_buffer.data_ptr<uint8_t>()) % alignof(float) == 0,
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(stage_buffer.data_ptr<uint8_t>()) % WindowLayout::kAlignment == 0,
                 "combine stage_buffer must be aligned for FP32 loads");
     if (bias.has_value()) {
         TORCH_CHECK(bias->device() == stage_buffer.device() && bias->scalar_type() == x_dtype && bias->dim() == 2 &&

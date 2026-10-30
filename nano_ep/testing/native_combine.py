@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import torch
 
 from .oracle import reference_layout, reference_plan
+from .wire import return_row_bytes, return_weights_offset
 
 
 @dataclass
@@ -104,7 +105,7 @@ def expert_inputs(case, rank, expand, *, alignment=4):
 
 
 def _packet_views(packet, hidden):
-    weight_offset = (2 * hidden + 3) // 4 * 4
+    weight_offset = return_weights_offset(hidden)
     return packet[..., : 2 * hidden].view(torch.bfloat16), packet[..., weight_offset:].view(torch.float32)
 
 
@@ -115,7 +116,7 @@ def assert_return_packets(actual, case, source, expand, mode, weighted):
     actual = actual.cpu()
     written = torch.zeros(actual.shape, dtype=torch.bool)
     local_experts = case.num_experts // len(case.indices)
-    weight_offset = (2 * case.hidden + 3) // 4 * 4
+    weight_offset = return_weights_offset(case.hidden)
     for token, routing in enumerate(case.indices[source].tolist()):
         for owner in range(len(case.indices)):
             choices = [k for k, expert in enumerate(routing) if expert >= 0 and expert // local_experts == owner]
@@ -144,8 +145,7 @@ def make_return_packet(case, source, expand, mode, weighted):
     ranks = len(case.indices)
     local_experts = case.num_experts // ranks
     partitions = min(ranks, case.topk) if mode else case.topk
-    weight_offset = (2 * case.hidden + 3) // 4 * 4
-    stride = (weight_offset + 4 * case.topk + 15) // 16 * 16
+    stride = return_row_bytes(case.hidden, case.topk)
     packet = torch.full((partitions, case.capacity, stride), 255, dtype=torch.uint8)
     x, weights = _packet_views(packet, case.hidden)
     for token, routing in enumerate(case.indices[source].tolist()):

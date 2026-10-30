@@ -84,7 +84,7 @@ def test_empty_combine_barriers_and_borrowed_return_view(
             )
         stream.synchronize()
         partitions = 1 if mode else 3
-        assert returned.shape == (partitions, 5, 32)
+        assert returned.shape == (partitions, 5, 64)
         assert returned.dtype == torch.uint8 and returned.device == x.device
         assert returned.is_contiguous()
         assert returned.data_ptr() == window.data_ptr() + layout[3]

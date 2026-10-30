@@ -1,16 +1,17 @@
 """Independent PeerRuntime acceptance; never constructs CudaBuffer."""
 
-from datetime import timedelta
-from functools import lru_cache
 import json
 import os
-from pathlib import Path
 import time
+from datetime import timedelta
+from functools import lru_cache
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
 
 from nano_ep.backends._build import load_extension
+from nano_ep.testing.wire import dispatch_offsets, dispatch_row_bytes
 
 
 @lru_cache(maxsize=1)
@@ -287,7 +288,7 @@ def check_payload(native, rank):
     def validate_payload(received, slots_cpu, sources, weighted):
         dtype = sources[0][0].dtype
         x_bytes = sources[0][0].element_size() * hidden
-        row_bytes = (16 + 12 * topk + x_bytes + 15) // 16 * 16
+        row_bytes = dispatch_row_bytes(hidden, topk)
         expected = {
             (source, token): (
                 x[token],
@@ -326,17 +327,24 @@ def check_payload(native, rank):
             seen.add(key)
             wanted_x, wanted_indices, wanted_weights = expected[key]
             torch.testing.assert_close(
-                row[16 : 16 + 8 * topk].view(torch.int64), wanted_indices
+                row[
+                    dispatch_offsets(topk)[0] : dispatch_offsets(topk)[0] + 8 * topk
+                ].view(torch.int64),
+                wanted_indices,
             )
             if weighted:
                 torch.testing.assert_close(
-                    row[16 + 8 * topk : 16 + 12 * topk].view(torch.float32),
+                    row[
+                        dispatch_offsets(topk)[1] : dispatch_offsets(topk)[1] + 4 * topk
+                    ].view(torch.float32),
                     wanted_weights,
                     rtol=0,
                     atol=0,
                 )
             torch.testing.assert_close(
-                row[16 + 12 * topk : 16 + 12 * topk + x_bytes].view(dtype),
+                row[
+                    dispatch_offsets(topk)[2] : dispatch_offsets(topk)[2] + x_bytes
+                ].view(dtype),
                 wanted_x,
                 rtol=0,
                 atol=0,
@@ -360,7 +368,9 @@ def check_payload(native, rank):
                 torch.int64
             ).tolist()
             for k, expert in enumerate(
-                row[16 : 16 + 8 * topk].view(torch.int64).tolist()
+                row[dispatch_offsets(topk)[0] : dispatch_offsets(topk)[0] + 8 * topk]
+                .view(torch.int64)
+                .tolist()
             ):
                 if rank * 2 <= expert < (rank + 1) * 2:
                     expected_local[slot, k] = expert - rank * 2
@@ -381,7 +391,7 @@ def check_payload(native, rank):
             (torch.bfloat16, True),
         )
     ):
-        row_bytes = (16 + 12 * topk + 2 * hidden + 15) // 16 * 16
+        row_bytes = dispatch_row_bytes(hidden, topk)
         sources = [inputs(source, round_id, dtype, weighted) for source in range(2)]
         source_x, source_indices, source_weights = sources[rank]
         with torch.cuda.stream(stream):

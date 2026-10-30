@@ -1,6 +1,7 @@
 import pytest
 
 from nano_ep.backends._build import load_extension
+from nano_ep.testing.wire import align32, dispatch_row_bytes, return_row_bytes
 
 pytestmark = [pytest.mark.cuda]
 
@@ -21,23 +22,18 @@ def test_window_layout_binding_and_allocation(
         ranks, tokens, hidden, topk, experts, allow_multiple_reduction
     )
 
-    def align(size):
-        return (size + 255) // 256 * 256
-
-    payload = align(256 + (ranks + experts + 1) * 8)
+    payload = align32(align32(ranks * 8) + (ranks + experts + 1) * 8)
     returned = payload
     partitions = min(ranks, topk) if allow_multiple_reduction else topk
-    total = align(
+    total = align32(
         payload
         + max(
-            ranks * tokens * ((16 + 12 * topk + 2 * hidden + 15) // 16 * 16),
-            partitions
-            * tokens
-            * (((2 * hidden + 3) // 4 * 4 + 4 * topk + 15) // 16 * 16),
+            ranks * tokens * dispatch_row_bytes(hidden, topk),
+            partitions * tokens * return_row_bytes(hidden, topk),
         )
     )
-    assert layout == [0, 256, payload, returned, total]
-    assert native.window_layout(2, 3, 4, 2, 4) == [0, 256, 512, 512, 1024]
+    assert layout == [0, align32(ranks * 8), payload, returned, total]
+    assert native.window_layout(2, 3, 4, 2, 4) == [0, 32, 96, 96, 864]
     with pytest.raises(ValueError, match="WindowLayout"):
         native.window_layout(0, 3, 4, 2, 4)
     with pytest.raises(OverflowError, match="overflow"):
@@ -45,7 +41,7 @@ def test_window_layout_binding_and_allocation(
     runtime = native.PeerRuntime(0, 1, layout[-1])
     window = runtime.local_window()
     assert window.numel() == layout[-1]
-    assert window.data_ptr() % 256 == 0
+    assert window.data_ptr() % 32 == 0
     for start, end in zip(layout[:-1], layout[1:], strict=True):
         assert window[start:end].numel() == end - start
     del window

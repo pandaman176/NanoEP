@@ -89,7 +89,7 @@ def bootstrap(monkeypatch):
     class Runtime:
         def __init__(self, rank, world_size, num_bytes, /):
             operation("allocate")
-            assert rank == local.rank and world_size == 2 and num_bytes == 4096
+            assert rank == local.rank and world_size == 2 and num_bytes == 5728
             self.rank = rank
             self.unmapped = False
             self.freed = False
@@ -124,7 +124,7 @@ def bootstrap(monkeypatch):
         operation("layout")
         assert (ranks, tokens, hidden, topk, experts) == (2, 8, 128, 2, 4)
         assert allow_multiple_reduction is settings["allow_multiple_reduction"]
-        return [0, 256, 512, 512, 4096]
+        return [0, 32, 96, 96, 5728]
 
     native = SimpleNamespace(PeerRuntime=Runtime, window_layout=window_layout)
 
@@ -196,12 +196,12 @@ def test_bootstrap_and_collective_close(bootstrap, allow_multiple_reduction):
             buffer._payload_offset,
             buffer._return_offset,
             buffer._num_bytes,
-        ) == (0, 256, 512, 512, 4096)
+        ) == (0, 32, 96, 96, 5728)
         assert buffer._comm_stream is not None
         window = bootstrap.runtimes[rank].window
-        assert window.view(torch.int64)[32:38].tolist() == [-1] * 6
-        assert torch.count_nonzero(window[:256]).item() == 0
-        assert torch.count_nonzero(window[304:]).item() == 0
+        assert window.view(torch.int64)[4:10].tolist() == [-1] * 6
+        assert torch.count_nonzero(window[:32]).item() == 0
+        assert torch.count_nonzero(window[80:]).item() == 0
         operations = [
             name for name, actual_rank in bootstrap.events if actual_rank == rank
         ]

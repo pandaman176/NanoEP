@@ -1,10 +1,12 @@
 """Exercise the portable C++ window layout without a CUDA extension."""
 
-from pathlib import Path
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
+
+from nano_ep.testing.wire import align32, dispatch_row_bytes, return_row_bytes
 
 
 
@@ -22,7 +24,12 @@ def layout_binary(tmp_path_factory):
         "int main(int argc, char** argv) {\n"
         "  try {\n"
         "    const auto x = nano_ep::WindowLayout::make(std::stoi(argv[1]), std::stoll(argv[2]), std::stoi(argv[3]), std::stoi(argv[4]), std::stoll(argv[5]), std::stoi(argv[6]));\n"
-        "    if (argc > 7) {\n"
+        '    if (argc > 7 && std::string(argv[7]) == "fields") {\n'
+        "      const auto h = std::stoi(argv[3]), k = std::stoi(argv[4]);\n"
+        "      std::cout << x.kRegionAlignment << ' ' << x.kRowAlignment << ' ' << x.kPayloadTopkOffset << ' '\n"
+        "        << x.payload_weights_offset(k) << ' ' << x.payload_x_offset(k) << ' ' << x.payload_row_bytes(h,k) << ' '\n"
+        "        << x.return_weights_offset(h) << ' ' << x.return_row_bytes(h,k);\n"
+        "    } else if (argc > 7) {\n"
         "      std::cout << x.return_rank_layout << ' ' << x.return_partitions << ' ' << x.return_capacity << ' '\n"
         "        << nano_ep::WindowLayout::return_row_bytes(std::stoi(argv[3]), std::stoi(argv[4]));\n"
         "    } else {\n"
@@ -66,6 +73,7 @@ def run_layout(
     allow_multiple_reduction=False,
     *,
     details=False,
+    fields=False,
 ):
     return subprocess.run(
         [
@@ -74,7 +82,7 @@ def run_layout(
                 str,
                 (ranks, tokens, hidden, topk, experts, int(allow_multiple_reduction)),
             ),
-            *(["details"] if details else []),
+            *(["fields"] if fields else ["details"] if details else []),
         ],
         capture_output=True,
         text=True,
@@ -83,10 +91,41 @@ def run_layout(
 
 
 def test_hand_calculated_layout(layout_binary):
-    # R=2,T=3,H=4,K=2: 6 dispatch rows (48 B), 6 return rows (16 B).
+    # R=2,T=3,H=4,K=2: 6 dispatch rows (128 B), 6 return rows (64 B).
     result = run_layout(layout_binary, 2, 3, 4, 2, 4)
     assert result.returncode == 0, result.stderr
-    assert list(map(int, result.stdout.split())) == [0, 256, 512, 512, 1024, 304]
+    assert list(map(int, result.stdout.split())) == [0, 32, 96, 96, 864, 80]
+
+
+@pytest.mark.parametrize("topk", [1, 3, 8, 32])
+@pytest.mark.parametrize("hidden", [1, 33, 65, 4096])
+def test_rows_fields_and_regions_are_aligned_to_32_bytes(layout_binary, topk, hidden):
+    result = run_layout(layout_binary, 2, 3, hidden, topk, 64, fields=True)
+    assert result.returncode == 0, result.stderr
+    region, row, indices, weights, x, dispatch_stride, return_weights, return_stride = (
+        map(int, result.stdout.split())
+    )
+    assert region == row == indices == 32
+    assert indices >= 16 and indices + 8 * topk <= weights
+    assert weights + 4 * topk <= x and x + 2 * hidden <= dispatch_stride
+    assert 2 * hidden <= return_weights and return_weights + 4 * topk <= return_stride
+    assert dispatch_stride == x + align32(2 * hidden)
+    assert return_stride == return_weights + align32(4 * topk)
+    for slot in range(3):
+        assert all(
+            (slot * dispatch_stride + offset) % 32 == 0
+            for offset in (0, indices, weights, x)
+        )
+        assert (slot * return_stride + return_weights) % 32 == 0
+    if topk == 3 and hidden == 65:
+        assert [
+            indices,
+            weights,
+            x,
+            dispatch_stride,
+            return_weights,
+            return_stride,
+        ] == [32, 64, 96, 256, 160, 192]
 
 
 @pytest.mark.parametrize(
@@ -110,25 +149,19 @@ def test_shared_arena_covers_both_phases_without_overlapping_control(
     assert result.returncode == 0, result.stderr
     signal, count, payload, returned, total, recv_next = map(int, result.stdout.split())
     assert signal == 0
-    assert all(
-        offset % 256 == 0 for offset in (signal, count, payload, returned, total)
-    )
+    assert all(offset % 32 == 0 for offset in (signal, count, payload, returned, total))
     assert signal < count < payload == returned < total
     assert signal + ranks * 8 <= count
     assert recv_next == count + (ranks + experts) * 8
-    assert 0 <= payload - (recv_next + 8) < 256
-    payload_stride = (16 + 12 * topk + 2 * hidden + 15) // 16 * 16
-    return_stride = ((2 * hidden + 3) // 4 * 4 + 4 * topk + 15) // 16 * 16
+    assert 0 <= payload - (recv_next + 8) < 32
+    payload_stride = dispatch_row_bytes(hidden, topk)
+    return_stride = return_row_bytes(hidden, topk)
     partitions = min(ranks, topk) if allow_multiple_reduction else topk
     payload_bytes = ranks * tokens * payload_stride
     return_bytes = partitions * tokens * return_stride
-    assert total == (payload + max(payload_bytes, return_bytes) + 255) // 256 * 256
-    previous_total = (
-        ((payload + payload_bytes + 255) // 256 * 256 + return_bytes + 255) // 256 * 256
-    )
-    assert previous_total - total == min(
-        (payload_bytes + 255) // 256 * 256, (return_bytes + 255) // 256 * 256
-    )
+    assert total == align32(payload + max(payload_bytes, return_bytes))
+    previous_total = align32(align32(payload + payload_bytes) + return_bytes)
+    assert previous_total - total == min(align32(payload_bytes), align32(return_bytes))
 
 
 @pytest.mark.parametrize(
@@ -152,7 +185,7 @@ def test_return_partition_policy(layout_binary, ranks, topk, allow_multiple_redu
     assert bool(rank_layout) == (allow_multiple_reduction and ranks <= topk)
     assert partitions == (min(ranks, topk) if allow_multiple_reduction else topk)
     assert capacity == partitions * tokens
-    assert stride == ((2 * hidden + 3) // 4 * 4 + 4 * topk + 15) // 16 * 16
+    assert stride == return_row_bytes(hidden, topk)
     # Partition-major addressing spans exactly the reserved rows.
     slots = {
         partition * tokens + token
@@ -171,25 +204,25 @@ def test_modes_preserve_dispatch_regions_and_reduce_return_storage(layout_binary
     assert offsets[0][:4] == offsets[1][:4]
     assert offsets[0][5] == offsets[1][5]
     # Single reduction needs 8 return partitions; multiple fits in dispatch's arena.
-    assert offsets[0][4] == 512 + 8 * 128 * 112
-    assert offsets[1][4] == 512 + 2 * 128 * 192
+    assert offsets[0][4] == 192 + 8 * 128 * 128
+    assert offsets[1][4] == 192 + 2 * 128 * 224
 
 
 def test_maximum_replaces_sum_without_rejecting_representable_layout(layout_binary):
     # Each phase fits int64, but summing their bytes would overflow.
-    tokens = ((1 << 63) - 1) // 40
+    tokens = ((1 << 63) - 1) // 192
     result = run_layout(layout_binary, 1, tokens, 1, 1, 1)
     assert result.returncode == 0, result.stderr
     offsets = list(map(int, result.stdout.split()))
-    assert offsets[2] == offsets[3] == 512
-    assert offsets[4] == (512 + tokens * 32 + 255) // 256 * 256
+    assert offsets[2] == offsets[3] == 64
+    assert offsets[4] == align32(64 + tokens * 128)
 
 
 def test_count_region_has_no_epoch_fields(layout_binary):
     # 32 rank counts + 64 expert counts + recv_next occupy 776 B.
     result = run_layout(layout_binary, 32, 1, 1, 1, 64)
     assert result.returncode == 0, result.stderr
-    assert list(map(int, result.stdout.split())) == [0, 256, 1280, 1280, 2304, 1024]
+    assert list(map(int, result.stdout.split())) == [0, 256, 1056, 1056, 5152, 1024]
 
 
 def test_expert_count_capacity_changes_offsets(layout_binary):
@@ -198,9 +231,9 @@ def test_expert_count_capacity_changes_offsets(layout_binary):
     assert small.returncode == large.returncode == 0
     small_offsets = list(map(int, small.stdout.split()))
     large_offsets = list(map(int, large.stdout.split()))
-    assert small_offsets[2] == 512
-    assert large_offsets[2] == 1536
-    assert large_offsets[5] == 1296
+    assert small_offsets[2] == 96
+    assert large_offsets[2] == 1088
+    assert large_offsets[5] == 1072
 
 
 @pytest.mark.parametrize(
@@ -231,7 +264,7 @@ def test_invalid_dimensions(layout_binary, args):
         (32, (1 << 63) - 1, 1, 1, 64),
         (1, ((1 << 63) - 1) // 32, 1, 1, 4),
         (1, ((1 << 63) - 1) // 128, 1, 32, 32),
-        (1, ((1 << 63) - 1) // 4608 + 1, 1, 32, 32),
+        (1, ((1 << 63) - 1) // 5120 + 1, 1, 32, 32),
         (1, 1, 1, 1, (1 << 63) - 1),
     ],
 )

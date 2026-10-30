@@ -13,6 +13,7 @@ from nano_ep.testing.native_combine import (
     expert_inputs,
     make_return_case,
 )
+from nano_ep.testing.wire import return_row_bytes
 
 pytestmark = [pytest.mark.cuda]
 
@@ -51,7 +52,7 @@ def check_kernel(probe, case, expand, mode, weighted):
     ranks = len(case.indices)
     offset, total = probe.layout(ranks, case.capacity, case.hidden, case.topk, mode)
     partitions = min(ranks, case.topk) if mode else case.topk
-    stride = ((2 * case.hidden + 3) // 4 * 4 + 4 * case.topk + 15) // 16 * 16
+    stride = return_row_bytes(case.hidden, case.topk)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         windows = [

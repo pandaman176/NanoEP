@@ -65,8 +65,4 @@ received.event.current_stream_wait()
 
 Close collectively after consumers finish, preferably with `with CudaBuffer(...)`. Closing drains GPU work, coordinates unmapping across ranks, then frees allocations. Do not use handles after close or across buffers. Fatal rank failure relies on the process-group/launcher timeout.
 
-## BF16 communication contract
-
-CUDA EP dispatch/combine x and bias now use BF16 exclusively; weights and accumulators remain FP32. Dispatch transfers BF16 directly. Expanded local reductions accumulate in FP32 and round their partials to BF16 before communication; the source sums partials in FP32 and casts once. Independent row operators retain their existing dtype support.
-
-This changes the communication byte ABI and removes FP32 EP inputs. Recompile the extension, recreate buffers, and update old callers. Regions still use 256-byte alignment and rows use 16-byte alignment in this revision. Dispatch row stride is align16(16+12K+2H); return row stride is align16(align4(2H)+4K).
+Communication region starts, row strides and top-k/weights/x field starts are aligned to 32 bytes. Public tensors retain their contiguous logical shapes; odd hidden sizes still require vector/TMA tail handling. Native extensions and buffers must be rebuilt after this byte-ABI change.

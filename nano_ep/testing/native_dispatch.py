@@ -2,6 +2,8 @@
 
 import torch
 
+from nano_ep.testing.wire import dispatch_offsets, dispatch_row_bytes
+
 from .oracle import reference_dispatch, reference_layout, reference_plan
 
 
@@ -71,7 +73,7 @@ def assert_dispatch_state(state, case, rank, alignment, weights):
     rows, topk = expected.recv_count, case.num_topk
     dtype = case.xs[rank].dtype
     payload_bytes = case.xs[rank].element_size() * case.hidden
-    row_bytes = (16 + 12 * topk + payload_bytes + 15) // 16 * 16
+    row_bytes = dispatch_row_bytes(case.hidden, topk)
     assert state.metadata_prepared and state.rank == rank
     assert state.hidden == case.hidden and state.x_dtype == case.xs[rank].dtype
     assert state.counts.device.type == "cpu" and state.counts.dtype == torch.int64
@@ -110,13 +112,19 @@ def assert_dispatch_state(state, case, rank, alignment, weights):
     for row, (source, token) in enumerate(keys):
         record = payload[row]
         assert record[:16].view(torch.int64).tolist() == [source, token]
-        torch.testing.assert_close(record[16 : 16 + 8 * topk].view(torch.int64), case.indices[source][token])
+        torch.testing.assert_close(
+            record[dispatch_offsets(topk)[0] : dispatch_offsets(topk)[0] + 8 * topk].view(torch.int64), case.indices[source][token]
+        )
         if weights is not None:
             torch.testing.assert_close(
-                record[16 + 8 * topk : 16 + 12 * topk].view(torch.float32), weights[source][token], rtol=0, atol=0, equal_nan=True
+                record[dispatch_offsets(topk)[1] : dispatch_offsets(topk)[1] + 4 * topk].view(torch.float32),
+                weights[source][token],
+                rtol=0,
+                atol=0,
+                equal_nan=True,
             )
         torch.testing.assert_close(
-            record[16 + 12 * topk : 16 + 12 * topk + payload_bytes].view(dtype),
+            record[dispatch_offsets(topk)[2] : dispatch_offsets(topk)[2] + payload_bytes].view(dtype),
             case.xs[source][token],
             rtol=0,
             atol=0,

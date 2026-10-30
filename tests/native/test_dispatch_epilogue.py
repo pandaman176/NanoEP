@@ -13,6 +13,7 @@ from nano_ep.testing.native_dispatch import (
     assert_dispatch_output,
     assert_dispatch_state,
 )
+from nano_ep.testing.wire import align32, dispatch_offsets
 
 pytestmark = [pytest.mark.cuda]
 
@@ -372,8 +373,13 @@ def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighte
                 zero_padding=expand,
             )
             records = state.stage_buffer.cpu()
-            start = 16 + 12 * topk
-            assert records.shape[1] == (start + 2 * hidden + 15) // 16 * 16
+            start = dispatch_offsets(topk)[2]
+            assert records.shape[1] == align32(start + 2 * hidden)
+            assert state.stage_buffer.data_ptr() % 32 == 0
+            assert all(
+                (state.stage_buffer.data_ptr() + offset) % 32 == 0
+                for offset in dispatch_offsets(topk)
+            )
             for row, token in enumerate(state.metadata[1].tolist()):
                 torch.testing.assert_close(
                     records[row, start : start + 2 * hidden],

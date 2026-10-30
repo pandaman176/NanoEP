@@ -4,6 +4,12 @@
 #include <limits>
 #include <stdexcept>
 
+#ifdef __CUDACC__
+#define NANO_EP_HOST_DEVICE __host__ __device__
+#else
+#define NANO_EP_HOST_DEVICE
+#endif
+
 namespace nano_ep {
 
 struct WindowLayout {
@@ -13,19 +19,29 @@ struct WindowLayout {
     int return_partitions;
     int64_t return_capacity;
 
-    static constexpr int64_t kRegionAlignment = 256;  // cudaMalloc is 256-byte aligned
-    static constexpr int64_t kRowAlignment = 16;      // easier for vectorized loads/stores
+    static constexpr int64_t kAlignment = 32;
+    static constexpr int64_t kRegionAlignment = kAlignment;
+    static constexpr int64_t kRowAlignment = kAlignment;
+    static constexpr int64_t kPayloadTopkOffset = kAlignment;
     static constexpr int64_t kCountNotReady = -1;
 
-    // Dispatch row: int64 source rank/token, int64 topk[K], float weights[K], BF16 x[H].
-    static int64_t payload_row_bytes(int hidden, int topk) {
-        return align(checked_add(checked_add(16, checked_mul(topk, 12)), checked_mul(hidden, 2)), kRowAlignment);
+    NANO_EP_HOST_DEVICE static constexpr int64_t payload_weights_offset(int64_t topk) { return align_field(kPayloadTopkOffset + topk * 8); }
+
+    NANO_EP_HOST_DEVICE static constexpr int64_t payload_x_offset(int64_t topk) {
+        return align_field(payload_weights_offset(topk) + topk * 4);
     }
 
-    // Return row: BF16 x[H], align4 padding, float weights[K]. A locally reduced x may carry
+    NANO_EP_HOST_DEVICE static constexpr int64_t return_weights_offset(int64_t hidden) { return align_field(hidden * 2); }
+
+    // Each field begins at a 32-byte boundary; provenance occupies the first 16 bytes.
+    static int64_t payload_row_bytes(int hidden, int topk) {
+        return align(checked_add(payload_x_offset(topk), checked_mul(hidden, 2)), kRowAlignment);
+    }
+
+    // Return row: BF16 x[H], align32 padding, float weights[K]. A locally reduced x may carry
     // several independent routing-weight payloads; the source selects each k.
     static int64_t return_row_bytes(int hidden, int topk) {
-        return align(checked_add(align(checked_mul(hidden, 2), 4), checked_mul(topk, 4)), kRowAlignment);
+        return align(checked_add(return_weights_offset(hidden), checked_mul(topk, 4)), kRowAlignment);
     }
 
     static constexpr bool use_rank_layout(int ranks, int topk, bool allow_multiple_reduction) {
@@ -75,6 +91,8 @@ struct WindowLayout {
     }
 
 private:
+    NANO_EP_HOST_DEVICE static constexpr int64_t align_field(int64_t bytes) { return (bytes + kAlignment - 1) / kAlignment * kAlignment; }
+
     static int64_t checked_add(int64_t a, int64_t b) {
         if (a > std::numeric_limits<int64_t>::max() - b) {
             throw std::overflow_error("WindowLayout byte size overflow");
@@ -96,3 +114,5 @@ private:
 };
 
 }  // namespace nano_ep
+
+#undef NANO_EP_HOST_DEVICE

@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from nano_ep.backends._build import load_extension
+from nano_ep.testing.wire import dispatch_offsets, dispatch_row_bytes
 
 pytestmark = [pytest.mark.cuda]
 
@@ -145,7 +146,7 @@ def test_reserve_and_put_payload(native, dtype, weighted, tokens):
             range(len(valid_tokens))
         )
         x_bytes = x.element_size() * hidden
-        row_bytes = (16 + 12 * topk + x_bytes + 15) // 16 * 16
+        row_bytes = dispatch_row_bytes(hidden, topk)
         for token in range(tokens):
             slot = slots_cpu[token, 0].item()
             if token not in valid_tokens:
@@ -156,17 +157,24 @@ def test_reserve_and_put_payload(native, dtype, weighted, tokens):
             ]
             assert row[:16].view(torch.int64).tolist() == [0, token]
             torch.testing.assert_close(
-                row[16 : 16 + 8 * topk].view(torch.int64), indices_cpu[token]
+                row[
+                    dispatch_offsets(topk)[0] : dispatch_offsets(topk)[0] + 8 * topk
+                ].view(torch.int64),
+                indices_cpu[token],
             )
             if weighted:
                 torch.testing.assert_close(
-                    row[16 + 8 * topk : 16 + 12 * topk].view(torch.float32),
+                    row[
+                        dispatch_offsets(topk)[1] : dispatch_offsets(topk)[1] + 4 * topk
+                    ].view(torch.float32),
                     weights_cpu[token],
                     rtol=0,
                     atol=0,
                 )
             torch.testing.assert_close(
-                row[16 + 12 * topk : 16 + 12 * topk + x_bytes].view(dtype),
+                row[
+                    dispatch_offsets(topk)[2] : dispatch_offsets(topk)[2] + x_bytes
+                ].view(dtype),
                 x_cpu[token],
                 rtol=0,
                 atol=0,
@@ -190,7 +198,7 @@ def test_cached_payload_preserves_mapping_and_counter(native, dtype, tokens):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     x_bytes = torch.empty((), dtype=dtype).element_size() * hidden
-    row_bytes = (16 + 12 * topk + x_bytes + 15) // 16 * 16
+    row_bytes = dispatch_row_bytes(hidden, topk)
     try:
         with torch.cuda.stream(stream):
             pattern = torch.tensor(
@@ -256,17 +264,27 @@ def test_cached_payload_preserves_mapping_and_counter(native, dtype, tokens):
                     ]
                     assert row[:16].view(torch.int64).tolist() == [0, token]
                     torch.testing.assert_close(
-                        row[16 : 16 + 8 * topk].view(torch.int64), indices_cpu[token]
+                        row[
+                            dispatch_offsets(topk)[0] : dispatch_offsets(topk)[0]
+                            + 8 * topk
+                        ].view(torch.int64),
+                        indices_cpu[token],
                     )
                     torch.testing.assert_close(
-                        row[16 + 12 * topk : 16 + 12 * topk + x_bytes].view(dtype),
+                        row[
+                            dispatch_offsets(topk)[2] : dispatch_offsets(topk)[2]
+                            + x_bytes
+                        ].view(dtype),
                         x_cpu[token],
                         rtol=0,
                         atol=0,
                     )
                     if weights is not None:
                         torch.testing.assert_close(
-                            row[16 + 8 * topk : 16 + 12 * topk].view(torch.float32),
+                            row[
+                                dispatch_offsets(topk)[1] : dispatch_offsets(topk)[1]
+                                + 4 * topk
+                            ].view(torch.float32),
                             weights[token].cpu(),
                             rtol=0,
                             atol=0,
