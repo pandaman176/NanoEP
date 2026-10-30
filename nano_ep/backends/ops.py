@@ -1,6 +1,6 @@
 """CUDA tensor operators. Payloads and indices remain on the same CUDA device."""
 
-from ._build import invoke, load_extension
+from ._build import load_extension
 
 
 def route_counts(topk_idx, num_experts: int, world_size: int):
@@ -10,7 +10,7 @@ def route_counts(topk_idx, num_experts: int, world_size: int):
     experts in each row. Rank counts deduplicate destinations per token;
     expert counts count every valid assignment. E is divisible by R.
     """
-    return invoke(load_extension().route_counts, topk_idx, num_experts, world_size)
+    return load_extension().route_counts(topk_idx, num_experts, world_size)
 
 
 def pack_rows(x, indices):
@@ -19,7 +19,7 @@ def pack_rows(x, indices):
     Repeated indices intentionally duplicate rows. P may be zero. Inputs are
     unmodified; the result owns its storage. Supported x: FP32, FP64, BF16.
     """
-    return invoke(load_extension().pack_rows, x, indices)
+    return load_extension().pack_rows(x, indices)
 
 
 def expand_rows(x, expanded_slots, capacity: int):
@@ -29,7 +29,7 @@ def expand_rows(x, expanded_slots, capacity: int):
     ignored, all nonnegative slots are unique and below capacity. NaN x in a
     fully masked compact row must never enter output or its padding gaps.
     """
-    return invoke(load_extension().expand_rows, x, expanded_slots, capacity)
+    return load_extension().expand_rows(x, expanded_slots, capacity)
 
 
 def reduce_rows(x, expanded_slots):
@@ -40,4 +40,4 @@ def reduce_rows(x, expanded_slots):
     zero. Padding rows may contain NaNs: they must not be read or multiplied
     by zero. This operator never applies gate weights.
     """
-    return invoke(load_extension().reduce_rows, x, expanded_slots)
+    return load_extension().reduce_rows(x, expanded_slots)

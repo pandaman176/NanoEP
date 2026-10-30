@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.distributed as dist
 
-from nano_ep.backends._build import invoke, load_extension, prepare_combine_epilogue, prepare_combine_main
+from nano_ep.backends._build import load_extension, prepare_combine_epilogue, prepare_combine_main
 from nano_ep.config import EPConfig
 
 
@@ -77,9 +77,9 @@ def close_peer_runtime(runtime, group, device):
     """
     torch.cuda.synchronize(device)
     dist.barrier(group=group)
-    invoke(runtime.close_peer_mappings)
+    runtime.close_peer_mappings()
     dist.barrier(group=group)
-    invoke(runtime.close)
+    runtime.close()
 
 
 class CudaBuffer:
@@ -158,8 +158,7 @@ class CudaBuffer:
                 self._payload_offset,
                 self._return_offset,
                 self._num_bytes,
-            ) = invoke(
-                self._backend.window_layout,
+            ) = self._backend.window_layout(
                 self._world_size,
                 config.num_max_tokens_per_rank,
                 config.hidden,
@@ -181,13 +180,13 @@ class CudaBuffer:
                 config.num_experts // self._world_size,
                 config.num_max_tokens_per_rank,
             )
-            self._runtime = invoke(self._backend.PeerRuntime, self._rank, self._world_size, self._num_bytes)
+            self._runtime = self._backend.PeerRuntime(self._rank, self._world_size, self._num_bytes)
             # All-one bytes represent int64 -1; recv_next and barrier signals stay zero.
-            window = invoke(self._runtime.local_window)
+            window = self._runtime.local_window()
             window[self._count_offset : self._count_offset + (self._world_size + config.num_experts) * 8].fill_(255)
             torch.cuda.current_stream(self._device).synchronize()
             del window
-            self._handle = invoke(self._runtime.export_local_handle)
+            self._handle = self._runtime.export_local_handle()
             allocation["handle"] = self._handle
         except Exception as exc:  # noqa: BLE001 - Report local failures before any rank raises.
             allocation["error"] = f"{type(exc).__name__}: {exc}"
@@ -201,7 +200,7 @@ class CudaBuffer:
             handles = [result["handle"] for result in allocations]
             import_error = None
             try:
-                invoke(self._runtime.import_peer_handles, handles)
+                self._runtime.import_peer_handles(handles)
                 self._comm_stream = torch.cuda.Stream(device=self._device)
             except Exception as exc:  # noqa: BLE001 - Report local failures before any rank raises.
                 import_error = f"{type(exc).__name__}: {exc}"
@@ -217,7 +216,7 @@ class CudaBuffer:
             try:
                 if self._runtime is not None:
                     torch.cuda.synchronize(self._device)
-                    invoke(self._runtime.close_peer_mappings)
+                    self._runtime.close_peer_mappings()
             except Exception as exc:  # noqa: BLE001 - Keep allocations alive if any importer cannot unmap.
                 unmap_error = f"{type(exc).__name__}: {exc}"
 
@@ -230,7 +229,7 @@ class CudaBuffer:
                 free_error = None
                 try:
                     if self._runtime is not None:
-                        invoke(self._runtime.close)
+                        self._runtime.close()
                 except Exception as exc:  # noqa: BLE001 - Include cleanup errors in the collective failure.
                     free_error = f"{type(exc).__name__}: {exc}"
                 free_errors = [None] * self._world_size
@@ -328,8 +327,7 @@ class CudaBuffer:
                 for tensor in (*input_tensors, *cached_metadata):
                     tensor.record_stream(self._comm_stream)
 
-                state = invoke(
-                    self._backend.dispatch_main,
+                state = self._backend.dispatch_main(
                     self._runtime,
                     x,
                     routing,
@@ -340,7 +338,7 @@ class CudaBuffer:
                     cached_metadata,
                     self._allow_multiple_reduction,
                 )
-                outputs = invoke(self._dispatch_epilogue, state, expand, weights is not None, zero_padding)
+                outputs = self._dispatch_epilogue(state, expand, weights is not None, zero_padding)
                 metadata = state.metadata
                 recv_count, expanded_capacity = state.counts.tolist()  # Native-owned CPU int64 [2].
 
@@ -450,8 +448,7 @@ class CudaBuffer:
                 for tensor in input_tensors:
                     tensor.record_stream(self._comm_stream)
 
-                returned = invoke(
-                    self._backend.combine_main,
+                returned = self._backend.combine_main(
                     self._runtime,
                     x,
                     metadata,
@@ -461,8 +458,7 @@ class CudaBuffer:
                     self._allow_multiple_reduction,
                     self._combine_main_module.launcher,
                 )
-                outputs = invoke(
-                    self._combine_epilogue,
+                outputs = self._combine_epilogue(
                     returned,
                     handle.topk_idx,
                     hidden,

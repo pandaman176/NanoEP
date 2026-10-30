@@ -11,38 +11,38 @@ from torch.utils import deterministic
 from nano_ep import EPConfig
 from nano_ep.backends.cuda import CudaBuffer
 from nano_ep.backends.cuda import close_peer_runtime
-from nano_ep.backends._build import invoke, load_extension
+from nano_ep.backends._build import load_extension
 from nano_ep.testing.cases import make_case
 from nano_ep.testing.oracle import reference_dispatch
 
 
 def check_peer_runtime(rank, size):
     native = load_extension()
-    runtime = invoke(native.PeerRuntime, rank, size, 1 << 20)
+    runtime = native.PeerRuntime(rank, size, 1 << 20)
     handles = [None] * size
-    dist.all_gather_object(handles, invoke(runtime.export_local_handle))
-    invoke(runtime.import_peer_handles, handles)
-    addresses = invoke(runtime.peer_addresses)
-    local_window = invoke(runtime.local_window)
+    dist.all_gather_object(handles, runtime.export_local_handle())
+    runtime.import_peer_handles(handles)
+    addresses = runtime.peer_addresses()
+    local_window = runtime.local_window()
     assert addresses.is_cuda and addresses.dtype == torch.int64
     assert addresses.shape == (size,) and torch.all(addresses != 0)
     assert local_window.is_cuda and local_window.dtype == torch.uint8
     assert local_window.numel() == 1 << 20
     assert addresses[rank].item() == local_window.data_ptr()
     for epoch in (1, 2, 3):
-        invoke(runtime.barrier, torch.cuda.current_stream().cuda_stream, epoch)
+        runtime.barrier(torch.cuda.current_stream().cuda_stream, epoch)
         torch.cuda.synchronize()
     # Borrowed views cannot outlive the runtime window.
     del local_window, addresses
     try:
-        invoke(runtime.close)
+        runtime.close()
     except RuntimeError as error:
         assert "close_peer_mappings" in str(error)
     else:
         raise AssertionError("freeing before the unmap phase must fail")
     close_peer_runtime(runtime, dist.group.WORLD, torch.cuda.current_device())
-    invoke(runtime.close_peer_mappings)
-    invoke(runtime.close)
+    runtime.close_peer_mappings()
+    runtime.close()
 
 
 def assert_dispatch(got, expected, config, rank):

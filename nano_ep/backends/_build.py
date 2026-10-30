@@ -88,7 +88,3 @@ def prepare_combine_main(hidden: int, topk: int, world_size: int, experts_per_ra
         extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo", *defines],
         verbose=os.environ.get("NANO_EP_BUILD_VERBOSE") == "1",
     )
-
-
-def invoke(function, *args):
-    return function(*args)
