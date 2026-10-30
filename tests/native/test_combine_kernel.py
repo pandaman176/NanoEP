@@ -84,7 +84,14 @@ def test_slot_shuffle_compacts_int64_values_for_every_lane(probe, topk):
 
 
 def check_kernel(
-    probe, case, expand, mode, weighted, *, expected_first_recv_count=None
+    probe,
+    case,
+    expand,
+    mode,
+    weighted,
+    *,
+    expected_first_recv_count=None,
+    packet_check=None,
 ):
     ranks = len(case.indices)
     probe = probe(case.hidden, case.topk, ranks, case.capacity)
@@ -126,6 +133,8 @@ def check_kernel(
                 offset : offset + partitions * case.capacity * stride
             ].view(partitions, case.capacity, stride)
             assert_return_packets(returned, case, source, expand, mode, weighted)
+            if packet_check is not None:
+                packet_check(returned, source)
             assert (window[:offset] == 165).all().item()
             assert (window[offset + returned.numel() :] == 165).all().item()
     stream.synchronize()
@@ -165,6 +174,41 @@ def test_return_kernel_rounds_local_sum_to_bf16(probe, expand, mode):
     case.values[0][0, 1].fill_(1)
     case.values[0][0, 2].fill_(-256)
     check_kernel(probe, case, expand, mode, True)
+
+
+@pytest.mark.parametrize(
+    "ranks,topk,k", [(2, 1, 0), (2, 3, 0), (2, 3, 2), (4, 3, 1), (2, 32, 31)]
+)
+@pytest.mark.parametrize("weighted", [False, True])
+def test_expanded_single_assignment_preserves_payload_bits(
+    probe, ranks, topk, k, weighted
+):
+    case = make_return_case(ranks, topk, 256, torch.bfloat16, tokens=2)
+    case.capacity = 5
+    local_experts = case.num_experts // ranks
+    bits = torch.tensor(
+        [0x8000, 0, 0x3F80, 0x7F80, 0xFF80, 0x7FC5, 1, 0x8001], dtype=torch.uint16
+    )
+    payload = bits.view(torch.bfloat16).repeat(case.hidden // bits.numel())
+    for source in range(ranks):
+        case.indices[source].fill_(-1)
+        case.values[source].fill_(float("nan"))
+        for token in range(2):
+            destination = (source + token + 1) % ranks
+            case.indices[source][token, k] = destination * local_experts + 2
+            case.values[source][token, k] = payload.roll(source + token)
+
+    def check_bits(returned, source):
+        for token in range(2):
+            destination = int(case.indices[source][token, k]) // local_experts
+            partition = destination if ranks <= topk else k
+            actual = (
+                returned[partition, token, : case.hidden * 2].cpu().view(torch.int16)
+            )
+            expected = case.values[source][token, k].view(torch.int16)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    check_kernel(probe, case, True, True, weighted, packet_check=check_bits)
 
 
 @pytest.mark.parametrize("ranks,topk", [(2, 3), (4, 2)])

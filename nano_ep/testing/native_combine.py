@@ -154,7 +154,10 @@ def make_return_packet(case, source, expand, mode, weighted):
             groups = [[k] for k in choices] if expand and not mode else ([choices] if choices else [])
             for group in groups:
                 partition = owner if mode and ranks <= case.topk else group[0]
-                x[partition, token] = _local_sum(case, source, token, group).bfloat16()
+                if expand and len(group) == 1:
+                    x[partition, token] = case.values[source][token, group[0]]
+                else:
+                    x[partition, token] = _local_sum(case, source, token, group).bfloat16()
                 if weighted:
                     for k in group:
                         weights[partition, token, k] = case.weights[source][token, k]

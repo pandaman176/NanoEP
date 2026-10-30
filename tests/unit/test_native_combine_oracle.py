@@ -35,12 +35,12 @@ def materialize_packets(case, expand, mode, weighted):
             for group in groups:
                 partition = owner if mode and ranks <= case.topk else group[0]
                 output = packets[source][partition, token]
-                if expand:
+                if expand and len(group) > 1:
                     value = torch.zeros(case.hidden)
                     for k in group:
                         value += x[int(slots[row, k])].float()
                 else:
-                    value = x[row].float()
+                    value = x[int(slots[row, group[0]])] if expand else x[row]
                 output[: 2 * case.hidden].view(torch.bfloat16).copy_(value.bfloat16())
                 if weighted:
                     for k in group:
@@ -48,6 +48,27 @@ def materialize_packets(case, expand, mode, weighted):
                             weights[int(slots[row, k])] if expand else weights[row, k]
                         )
     return packets
+
+
+@pytest.mark.parametrize("mode", [False, True])
+@pytest.mark.parametrize("ranks", [2, 4])
+def test_expanded_single_assignment_fixture_preserves_bits(mode, ranks):
+    case = make_return_case(ranks, 3, 8, torch.bfloat16, tokens=1)
+    owner, k = ranks - 1, 2
+    case.indices[0].fill_(-1)
+    case.indices[0][0, k] = owner * (case.num_experts // ranks) + 2
+    bits = torch.tensor(
+        [0x8000, 0, 0x3F80, 0x7F80, 0xFF80, 0x7FC5, 1, 0x8001], dtype=torch.uint16
+    )
+    case.values[0][0, k] = bits.view(torch.bfloat16)
+    partition = owner if mode and ranks <= case.topk else k
+    packets = [
+        make_return_packet(case, 0, True, mode, True),
+        materialize_packets(case, True, mode, True)[0],
+    ]
+    for packet in packets:
+        actual = packet[partition, 0, : case.hidden * 2].view(torch.int16)
+        torch.testing.assert_close(actual, bits.view(torch.int16), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("ranks,topk", [(1, 3), (2, 3), (2, 2), (4, 2)])

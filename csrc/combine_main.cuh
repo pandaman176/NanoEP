@@ -128,7 +128,16 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,  // [R], in
             auto* peer_row = peer_window + return_offset + peer_idx * return_row_bytes;
             auto* peer_x = reinterpret_cast<at::BFloat16*>(peer_row);
 
-            if constexpr (kExpand) {
+            const bool no_local_reduce = !kExpand || (kAllowMultipleReduction && __popc(valid_mask) == 1);
+            if (no_local_reduce) {
+                int64_t input_row = row;
+                if constexpr (kExpand) {
+                    // Broadcast the only valid assignment's slot to the whole warp.
+                    input_row = __shfl_sync(0xffffffffu, lane_slot, first_valid_k);
+                }
+                for (int64_t h = lane; h < hidden; h += kWarpSize)
+                    peer_x[h] = x[input_row * hidden + h];
+            } else if constexpr (kExpand) {
                 int64_t slots[kTopk];
                 // number of valid k's in this row
                 const int count = compute_expanded_slots(lane_slot, valid_mask, slots);
@@ -141,9 +150,6 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,  // [R], in
                     }
                     peer_x[h] = static_cast<at::BFloat16>(accum);
                 }
-            } else {
-                for (int64_t h = lane; h < hidden; h += kWarpSize)
-                    peer_x[h] = x[row * hidden + h];
             }
             if constexpr (kWithWeights) {
                 // One lane writes each original top-k position in the same return row.
