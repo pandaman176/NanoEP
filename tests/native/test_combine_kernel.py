@@ -51,7 +51,41 @@ def probe(request, tmp_path_factory):
     return prepare
 
 
-def check_kernel(probe, case, expand, mode, weighted):
+@pytest.mark.parametrize("topk", [1, 3, 32])
+def test_slot_shuffle_compacts_int64_values_for_every_lane(probe, topk):
+    module = probe(256, topk, 2, 5)
+    values = (1 << 40) + torch.arange(7 * topk, dtype=torch.int64).reshape(7, topk)
+    valid = torch.zeros((7, topk), dtype=torch.bool)
+    valid[1, 0] = True
+    valid[2, -1] = True
+    valid[3, [0, topk - 1]] = True
+    valid[4] = True
+    valid[5, ::2] = True
+    valid[6, 1::2] = True
+    slots = values.masked_fill(~valid, -1)
+    expected = torch.full((7, topk), -1, dtype=torch.int64)
+    counts = valid.sum(1).to(torch.int32)
+    for row in range(7):
+        expected[row, : counts[row].item()] = slots[row, valid[row]]
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        actual, actual_counts = module.compact_slots(slots.cuda())
+        torch.testing.assert_close(
+            actual.cpu(), expected[:, None].expand(-1, 32, -1), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            actual_counts.cpu(), counts[:, None].expand(-1, 32), rtol=0, atol=0
+        )
+        empty, empty_counts = module.compact_slots(
+            torch.empty((0, topk), dtype=torch.int64, device="cuda")
+        )
+        assert empty.shape == (0, 32, topk) and empty_counts.shape == (0, 32)
+    stream.synchronize()
+
+
+def check_kernel(
+    probe, case, expand, mode, weighted, *, expected_first_recv_count=None
+):
     ranks = len(case.indices)
     probe = probe(case.hidden, case.topk, ranks, case.capacity)
     offset, total = probe.layout(ranks, case.capacity, case.hidden, case.topk, mode)
@@ -65,6 +99,8 @@ def check_kernel(probe, case, expand, mode, weighted):
         ]
         for owner in range(ranks):
             x, weights, metadata = expert_inputs(case, owner, expand)
+            if owner == 0 and expected_first_recv_count is not None:
+                assert metadata[0].numel() == expected_first_recv_count
             device_x, device_weights = x.cuda(), weights.cuda()
             device_metadata = [tensor.cuda() for tensor in metadata]
             probe.run(
@@ -129,3 +165,59 @@ def test_return_kernel_rounds_local_sum_to_bf16(probe, expand, mode):
     case.values[0][0, 1].fill_(1)
     case.values[0][0, 2].fill_(-256)
     check_kernel(probe, case, expand, mode, True)
+
+
+@pytest.mark.parametrize("ranks,topk", [(2, 3), (4, 2)])
+@pytest.mark.parametrize("expand", [False, True])
+@pytest.mark.parametrize("mode", [False, True])
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize(
+    "boundary", ["sm", "wave_minus_one", "wave", "wave_plus_one", "multiple_waves"]
+)
+def test_return_kernel_across_sm_grid_iterations(
+    probe, ranks, topk, expand, mode, weighted, boundary
+):
+    sms = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    wave = sms * 8
+    receive_count = {
+        "sm": sms + 1,
+        "wave_minus_one": wave - 1,
+        "wave": wave,
+        "wave_plus_one": wave + 1,
+        "multiple_waves": 2 * wave + 17,
+    }[boundary]
+    source_counts = [receive_count // ranks] * ranks
+    for source in range(receive_count % ranks):
+        source_counts[source] += 1
+    if source_counts[-1] > 0:
+        source_counts[0] += 1
+        source_counts[-1] -= 1
+
+    case = make_return_case(ranks, topk, 256, torch.bfloat16, tokens=max(source_counts))
+    case.capacity = 2 * wave + 23
+    last_rank_expert = (ranks - 1) * (case.num_experts // ranks)
+    patterns = (
+        [[0, last_rank_expert, -1], [-1, 1, last_rank_expert + 1], [2, -1, 0]]
+        if topk == 3
+        else [[0, last_rank_expert], [-1, 1], [2, 0]]
+    )
+    position = 0
+    for source, count in enumerate(source_counts):
+        routing = torch.empty((count, topk), dtype=torch.int64)
+        for token in range(count):
+            # Shift routing between waves so reused warps see different masks.
+            routing[token] = torch.tensor(
+                patterns[(position % wave + position // wave) % len(patterns)]
+            )
+            position += 1
+        case.indices[source] = routing
+        case.values[source] = case.values[source][:count].clone()
+        case.weights[source] = case.weights[source][:count].clone()
+        case.values[source][routing < 0] = float("nan")
+        case.weights[source][routing < 0] = float("nan")
+
+    check_kernel(
+        probe, case, expand, mode, weighted, expected_first_recv_count=receive_count
+    )
