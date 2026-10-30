@@ -95,7 +95,7 @@ def check_rounds(buffer, rank, size):
     )
     for expand, dtype, weighted, asynchronous, kind in product(
         (False, True),
-        (torch.float32, torch.bfloat16),
+        (torch.bfloat16,),
         (False, True),
         (False, True),
         ("mixed", "empty", "masked", "skew"),

@@ -11,6 +11,21 @@ from nano_ep import EPConfig
 
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.float16])
+@pytest.mark.parametrize("cached", [False, True])
+def test_non_bf16_dispatch_rejected_before_stream_work(dispatch_runtime, dtype, cached):
+    r = dispatch_runtime
+    handle = None
+    if cached:
+        valid = r.tensor("valid", torch.zeros((2, 4), dtype=torch.bfloat16))
+        handle = r.buffer.dispatch(valid, topk_idx=r.indices).handle
+    r.events.clear()
+    x = r.tensor("invalid", torch.zeros((2, 4), dtype=dtype))
+    with pytest.raises(ValueError, match="bfloat16"):
+        r.buffer.dispatch(x, handle=handle, topk_idx=None if cached else r.indices)
+    assert not r.events
+
+
 @pytest.fixture
 def dispatch_runtime(monkeypatch):
     events, calls = [], []
@@ -185,7 +200,7 @@ def dispatch_runtime(monkeypatch):
 
 
 @pytest.mark.parametrize("layout", [None, False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("weighted", [False, True])
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -279,7 +294,7 @@ def test_cached_dispatch_reuses_handle_with_new_payload(
     dispatch_runtime, expand, weighted, asynchronous
 ):
     r = dispatch_runtime
-    x = r.tensor("x", torch.zeros((2, 4)))
+    x = r.tensor("x", torch.zeros((2, 4), dtype=torch.bfloat16))
     weights = r.tensor("weights", torch.ones((2, 3)))
     first = r.buffer.dispatch(
         x,
@@ -291,7 +306,7 @@ def test_cached_dispatch_reuses_handle_with_new_payload(
     )
     old_metadata = r.calls[0].state.metadata
     r.events.clear()
-    new_x = r.tensor("new_x", torch.full((2, 4), 7.0))
+    new_x = r.tensor("new_x", torch.full((2, 4), 7.0, dtype=torch.bfloat16))
     new_weights = None if weighted else weights
     got = r.buffer.dispatch(
         new_x, weights=new_weights, handle=first.handle, async_op=asynchronous
@@ -317,7 +332,7 @@ def test_cached_dispatch_reuses_handle_with_new_payload(
 def test_native_failure_does_not_return_completion(dispatch_runtime, failure):
     r = dispatch_runtime
     r.settings["failure"] = failure
-    x = r.tensor("x", torch.zeros((2, 4)))
+    x = r.tensor("x", torch.zeros((2, 4), dtype=torch.bfloat16))
     with pytest.raises(RuntimeError, match=f"injected {failure} failure"):
         r.buffer.dispatch(x, topk_idx=r.indices)
     assert ("record_tensor", "x", "comm") in r.events

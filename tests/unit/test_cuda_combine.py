@@ -10,6 +10,15 @@ from test_cuda_dispatch_orchestration import dispatch_runtime as dispatch_runtim
 
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.float16])
+def test_non_bf16_combine_rejected_before_stream_work(combine_runtime, dtype):
+    r = combine_runtime
+    x = r.tensor("invalid", torch.zeros((2, 4), dtype=dtype))
+    with pytest.raises(ValueError, match="bfloat16"):
+        r.buffer.combine(x, r.handle)
+    assert not r.events and r.combine_calls.main is None
+
+
 @pytest.fixture
 def combine_runtime(dispatch_runtime):
     r = dispatch_runtime
@@ -97,7 +106,7 @@ def handle_metadata(handle):
 
 
 @pytest.mark.parametrize("expand", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])
 @pytest.mark.parametrize("biased", [False, True])
@@ -208,7 +217,7 @@ def test_combine_wires_native_reverse_path(
 )
 def test_combine_invalid_inputs_precede_native_work(combine_runtime, kind):
     r = combine_runtime
-    x = r.tensor("x", torch.zeros((2, 4)))
+    x = r.tensor("x", torch.zeros((2, 4), dtype=torch.bfloat16))
     weights, bias = None, None
     error = ValueError
     if kind == "closed":
@@ -228,11 +237,11 @@ def test_combine_invalid_inputs_precede_native_work(combine_runtime, kind):
         elif kind == "x_rank":
             x.payload = x.payload.flatten()
         elif kind == "x_stride":
-            x.payload = torch.zeros((2, 8))[:, ::2]
+            x.payload = torch.zeros((2, 8), dtype=torch.bfloat16)[:, ::2]
         elif kind == "x_hidden":
-            x.payload = torch.zeros((2, 5))
+            x.payload = torch.zeros((2, 5), dtype=torch.bfloat16)
         elif kind == "compact_rows":
-            x.payload = torch.zeros((3, 4))
+            x.payload = torch.zeros((3, 4), dtype=torch.bfloat16)
         else:
             r.handle.do_expand = True
     elif "weight" in kind:
@@ -247,20 +256,20 @@ def test_combine_invalid_inputs_precede_native_work(combine_runtime, kind):
             weights.payload = torch.zeros((2, 6))[:, ::2]
         else:
             r.handle.do_expand = True
-            x.payload = torch.zeros((12, 4))
+            x.payload = torch.zeros((12, 4), dtype=torch.bfloat16)
             weights.payload = torch.zeros((12, 3))
     else:
-        bias = r.tensor("bias", torch.zeros((3, 4)))
+        bias = r.tensor("bias", torch.zeros((3, 4), dtype=torch.bfloat16))
         if kind == "bias_device":
             bias.device = torch.device("cpu")
         elif kind == "bias_dtype":
-            bias.payload = bias.payload.to(torch.bfloat16)
+            bias.payload = bias.payload.float()
         elif kind == "bias_rank":
             bias.payload = bias.payload.flatten()
         elif kind == "bias_receive_rows":
-            bias.payload = torch.zeros((2, 4))
+            bias.payload = torch.zeros((2, 4), dtype=torch.bfloat16)
         else:
-            bias.payload = torch.zeros((3, 8))[:, ::2]
+            bias.payload = torch.zeros((3, 8), dtype=torch.bfloat16)[:, ::2]
     with pytest.raises(error):
         r.buffer.combine(x, r.handle, weights=weights, bias=bias)
     assert not r.events and r.combine_calls.main is None
@@ -280,7 +289,7 @@ def test_empty_source_still_returns_remote_expert_contributions(
     r.handle.send_counts.payload.zero_()
     r.handle.layout.src_ranks.payload.fill_(1)
     rows = 12 if expand else 2
-    x = r.tensor("x", torch.zeros((rows, 4)))
+    x = r.tensor("x", torch.zeros((rows, 4), dtype=torch.bfloat16))
     weights = (
         r.tensor("weights", torch.zeros((rows,) if expand else (rows, 3)))
         if weighted
@@ -299,7 +308,7 @@ def test_empty_source_still_returns_remote_expert_contributions(
 def test_combine_native_failure_propagates(combine_runtime, failure):
     r = combine_runtime
     r.settings["failure"] = failure
-    x = r.tensor("x", torch.zeros((2, 4)))
+    x = r.tensor("x", torch.zeros((2, 4), dtype=torch.bfloat16))
     with pytest.raises(RuntimeError, match=f"injected {failure} failure"):
         r.buffer.combine(x, r.handle)
     assert ("record_tensor", "x", "comm") in r.events

@@ -103,65 +103,62 @@ def expert_inputs(case, rank, expand, *, alignment=4):
     return x, weights, metadata
 
 
+def _packet_views(packet, hidden):
+    weight_offset = (2 * hidden + 3) // 4 * 4
+    return packet[..., : 2 * hidden].view(torch.bfloat16), packet[..., weight_offset:].view(torch.float32)
+
+
 def assert_return_packets(actual, case, source, expand, mode, weighted):
-    """Inspect published fields and require every other byte to retain its poison."""
-    ranks = len(case.indices)
-    local_experts = case.num_experts // ranks
-    partitions = min(ranks, case.topk) if mode else case.topk
-    stride = (4 * case.hidden + 4 * case.topk + 15) // 16 * 16
-    assert actual.dtype == torch.uint8 and actual.shape == (partitions, case.capacity, stride)
+    """Inspect BF16 x / FP32 weights; all unpublished bytes retain their poison."""
+    expected = make_return_packet(case, source, expand, mode, weighted)
+    assert actual.dtype == torch.uint8 and actual.shape == expected.shape
     actual = actual.cpu()
-    expected = torch.full(actual.shape, 165, dtype=torch.uint8).view(torch.float32)
-    written = torch.zeros(expected.shape, dtype=torch.bool)
+    written = torch.zeros(actual.shape, dtype=torch.bool)
+    local_experts = case.num_experts // len(case.indices)
+    weight_offset = (2 * case.hidden + 3) // 4 * 4
     for token, routing in enumerate(case.indices[source].tolist()):
-        for owner in range(ranks):
+        for owner in range(len(case.indices)):
             choices = [k for k, expert in enumerate(routing) if expert >= 0 and expert // local_experts == owner]
-            if not choices:
-                continue
-            groups = [[k] for k in choices] if expand and not mode else [choices]
+            groups = [[k] for k in choices] if expand and not mode else ([choices] if choices else [])
             for group in groups:
-                partition = owner if mode and ranks <= case.topk else group[0]
-                value = _local_sum(case, source, token, group)
-                if not expand:
-                    value = value.to(case.values[source].dtype).float()
-                expected[partition, token, : case.hidden] = value
-                written[partition, token, : case.hidden] = True
+                partition = owner if mode and len(case.indices) <= case.topk else group[0]
+                written[partition, token, : 2 * case.hidden] = True
                 if weighted:
                     for k in group:
-                        expected[partition, token, case.hidden + k] = case.weights[source][token, k]
-                        written[partition, token, case.hidden + k] = True
-    floats = actual.view(torch.float32)
-    torch.testing.assert_close(floats[written], expected[written], rtol=0, atol=0, equal_nan=True)
-    untouched_bytes = (~written).repeat_interleave(4, dim=-1)
-    assert (actual[untouched_bytes] == 165).all(), "unpublished return fields or padding were overwritten"
+                        written[partition, token, weight_offset + 4 * k : weight_offset + 4 * (k + 1)] = True
+    actual_x, actual_weights = _packet_views(actual, case.hidden)
+    expected_x, expected_weights = _packet_views(expected, case.hidden)
+    x_mask = written[..., : 2 * case.hidden : 2]
+    weight_mask = written[..., weight_offset::4]
+    torch.testing.assert_close(actual_x[x_mask], expected_x[x_mask], rtol=0, atol=0, equal_nan=True)
+    torch.testing.assert_close(actual_weights[weight_mask], expected_weights[weight_mask], rtol=0, atol=0, equal_nan=True)
+    assert (actual[~written] == 165).all(), "unpublished return fields or padding were overwritten"
 
 
 def make_return_packet(case, source, expand, mode, weighted):
-    """Encode source assignments as return rows; unpublished FP32 fields are NaN.
+    """Encode BF16 partials and aligned FP32 weights; unpublished fields are NaN.
 
-    This fixture does not invoke a native kernel or use receive metadata. The
-    extra capacity and NaN gaps expose readers that use T instead of Tmax or
-    consume a partition/weight field that its sender never published.
+    Independent of native kernels and receive metadata. Extra capacity and NaN
+    gaps expose incorrect partition strides and reads of unpublished fields.
     """
     ranks = len(case.indices)
     local_experts = case.num_experts // ranks
     partitions = min(ranks, case.topk) if mode else case.topk
-    words = (case.hidden + case.topk + 3) // 4 * 4
-    fields = torch.full((partitions, case.capacity, words), float("nan"))
+    weight_offset = (2 * case.hidden + 3) // 4 * 4
+    stride = (weight_offset + 4 * case.topk + 15) // 16 * 16
+    packet = torch.full((partitions, case.capacity, stride), 255, dtype=torch.uint8)
+    x, weights = _packet_views(packet, case.hidden)
     for token, routing in enumerate(case.indices[source].tolist()):
         for owner in range(ranks):
             choices = [k for k, expert in enumerate(routing) if expert >= 0 and expert // local_experts == owner]
             groups = [[k] for k in choices] if expand and not mode else ([choices] if choices else [])
             for group in groups:
                 partition = owner if mode and ranks <= case.topk else group[0]
-                value = _local_sum(case, source, token, group)
-                if not expand:
-                    value = value.to(case.values[source].dtype).float()
-                fields[partition, token, : case.hidden] = value
+                x[partition, token] = _local_sum(case, source, token, group).bfloat16()
                 if weighted:
                     for k in group:
-                        fields[partition, token, case.hidden + k] = case.weights[source][token, k]
-    return fields.view(torch.uint8)
+                        weights[partition, token, k] = case.weights[source][token, k]
+    return packet
 
 
 def reference_combined(case, source, expand, mode, bias=None):
@@ -169,7 +166,7 @@ def reference_combined(case, source, expand, mode, bias=None):
 
     Expanded single reduction visits valid k in order. Otherwise partial sums
     visit destination ranks in first-occurrence order. Compact client sums round
-    to the input dtype; expanded local sums stay FP32. Source bias is added once
+    to BF16; expanded local sums also round to BF16 on the wire. Source bias is added once
     in FP32 before the final cast. Routing weights remain an independent payload.
     """
     routing = case.indices[source]
@@ -186,8 +183,7 @@ def reference_combined(case, source, expand, mode, bias=None):
             partial = torch.zeros(case.hidden, dtype=torch.float32)
             for k in choices:
                 partial += case.values[source][token, k].float()
-            if not expand:
-                partial = partial.to(dtype).float()
+            partial = partial.bfloat16().float()
             result[token] += partial
     if bias is not None:
         result += bias.cpu().float()

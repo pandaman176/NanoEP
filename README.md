@@ -2,7 +2,7 @@
 
 Single-node expert-parallel dispatch and combine for PyTorch, using CUDA IPC and peer GPU memory access.
 
-- FP32/BF16 payloads, compact and expert-major expanded layouts.
+- BF16 EP payloads, compact and expert-major expanded layouts.
 - Cached routing handles, optional weight payloads, and asynchronous operations.
 - Minimal by design: readable CUDA kernels without NVSHMEM or NCCL Gin.
 
@@ -40,22 +40,22 @@ torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 dist.init_process_group("gloo")
 try:
     rank, size = dist.get_rank(), dist.get_world_size()
-    config = EPConfig(num_experts=2 * size, num_topk=2, hidden=128, num_max_tokens_per_rank=16)
-    x = torch.randn(16, 128, device="cuda")
+    config = EPConfig(num_experts=2 * size, num_topk=2, hidden=256, num_max_tokens_per_rank=16)
+    x = torch.randn(16, 256, device="cuda", dtype=torch.bfloat16)
     indices = torch.tensor([[2 * rank, 2 * rank + 1]], device="cuda", dtype=torch.int64).repeat(16, 1)
     weights = torch.full((16, 2), 0.5, device="cuda")
 
     with CudaBuffer(dist.group.WORLD, config) as buffer:
         received = buffer.dispatch(x, topk_idx=indices, weights=weights, do_expand=True, zero_padding=True)
         # Example identity experts: apply each gate weight exactly once.
-        expert_x = received.x * received.topk_weights[:, None]
+        expert_x = (received.x.float() * received.topk_weights[:, None]).to(received.x.dtype)
         result = buffer.combine(expert_x, received.handle)
         torch.testing.assert_close(result.x, x)
 finally:
     dist.destroy_process_group()
 ```
 
-Use global expert IDs, contiguous expert placement per rank, and `-1` for masked choices. Call collectives in the same order on all ranks. `combine` sums expert outputs; its optional `weights` argument returns a separate payload and does not weight `x`.
+Use BF16 payloads, global expert IDs, contiguous expert placement per rank, and `-1` for masked choices. Call collectives in the same order on all ranks. `combine` sums expert outputs; its optional `weights` argument returns a separate payload and does not weight `x`.
 
 For asynchronous calls, pass `async_op=True` and call `result.event.current_stream_wait()` on the consumer stream before using the result. Dispatch may still synchronize for exact receive counts; CUDA Graph capture is not supported.
 

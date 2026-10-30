@@ -14,7 +14,7 @@ from nano_ep.backends.cuda import CudaBuffer
 @dataclass(frozen=True)
 class TensorStorage:
     shape: tuple[int, ...]
-    dtype: torch.dtype = torch.float32
+    dtype: torch.dtype = torch.bfloat16
     device: torch.device = torch.device("cuda", 0)
     contiguous: bool = True
 
@@ -40,7 +40,7 @@ def inputs():
         topk_idx=idx,
         alignment=4,
         do_expand=True,
-        x_dtype=torch.float32,
+        x_dtype=torch.bfloat16,
     )
     return buffer, x, idx, handle
 
@@ -109,7 +109,7 @@ def test_dispatch_contract_before_native_work(inputs, kind):
         elif kind == "cached_tokens":
             x = replace(x, shape=(1, 4))
         else:
-            x = replace(x, dtype=torch.bfloat16)
+            x = replace(x, dtype=torch.float32)
     elif kind.startswith("alignment_"):
         kwargs["alignment"] = {
             "alignment_zero": 0,
@@ -139,7 +139,7 @@ def test_dispatch_contract_before_native_work(inputs, kind):
     elif kind == "idx_device":
         kwargs["topk_idx"] = replace(idx, device=torch.device("cuda", 1))
     else:
-        weight = TensorStorage((2, 3))
+        weight = TensorStorage((2, 3), torch.float32)
         if kind == "weight_dtype":
             weight = replace(weight, dtype=torch.float64)
         elif kind == "weight_shape":

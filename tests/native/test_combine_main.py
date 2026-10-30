@@ -28,7 +28,7 @@ def native(request):
 
 
 @contextmanager
-def empty_inputs(native, mode=False, dtype=torch.float32, tokens=2):
+def empty_inputs(native, mode=False, dtype=torch.bfloat16, tokens=2):
     # A source may have tokens while receiving no assignments at all.
     capacity, hidden, topk, experts = 5, 4, 3, 3
     layout = native.window_layout(1, capacity, hidden, topk, experts, mode)
@@ -61,7 +61,7 @@ def empty_inputs(native, mode=False, dtype=torch.float32, tokens=2):
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("tokens", [0, 2])
 def test_empty_combine_barriers_and_borrowed_return_view(
     native, mode, expand, weighted, dtype, tokens
@@ -102,7 +102,7 @@ def test_empty_combine_barriers_and_borrowed_return_view(
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_nonempty_combine_self_return_packets(native, mode, expand, weighted, dtype):
     case = make_return_case(1, 3, 33, dtype)
     layout = native.window_layout(
@@ -148,6 +148,7 @@ def test_nonempty_combine_self_return_packets(native, mode, expand, weighted, dt
         "snapshot_rank",
         "source_capacity",
         "x_dtype",
+        "x_fp32",
         "x_device",
         "x_rank",
         "x_stride",
@@ -182,15 +183,17 @@ def test_invalid_combine_storage_precedes_barrier(native, kind):
             metadata[8] = torch.full((6, 3), -1, dtype=torch.int64, device="cuda")
         elif kind == "x_dtype":
             x = x.double()
+        elif kind == "x_fp32":
+            x = x.float()
         elif kind == "x_device":
             x = x.cpu()
         elif kind == "x_rank":
             x = x.flatten()
         elif kind == "x_stride":
             metadata[0] = torch.zeros(2, dtype=torch.int64, device="cuda")
-            x = torch.zeros((2, 8), device="cuda")[:, ::2]
+            x = torch.zeros((2, 8), dtype=torch.bfloat16, device="cuda")[:, ::2]
         elif kind in ("compact_rows", "expanded_rows"):
-            x = torch.empty((1, 4), device="cuda")
+            x = torch.empty((1, 4), dtype=torch.bfloat16, device="cuda")
             expand = kind == "expanded_rows"
         elif kind == "weight_dtype":
             weights = torch.empty((0, 3), dtype=torch.float64, device="cuda")
@@ -204,7 +207,7 @@ def test_invalid_combine_storage_precedes_barrier(native, kind):
             metadata[1] = torch.zeros(2, dtype=torch.int64, device="cuda")
             metadata[2] = torch.zeros((2, 3), dtype=torch.int64, device="cuda")
             metadata[5] = torch.zeros((2, 3), dtype=torch.int64, device="cuda")
-            x = torch.zeros((2, 4), device="cuda")
+            x = torch.zeros((2, 4), dtype=torch.bfloat16, device="cuda")
             weights = torch.zeros(4, device="cuda")[::2]
         elif kind == "capacity":
             capacity = 0

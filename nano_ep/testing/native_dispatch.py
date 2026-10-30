@@ -69,7 +69,9 @@ def assert_dispatch_state(state, case, rank, alignment, weights):
     world_size = len(case.xs)
     local_experts = case.num_experts // world_size
     rows, topk = expected.recv_count, case.num_topk
-    row_bytes = (16 + 12 * topk + 4 * case.hidden + 15) // 16 * 16
+    dtype = case.xs[rank].dtype
+    payload_bytes = case.xs[rank].element_size() * case.hidden
+    row_bytes = (16 + 12 * topk + payload_bytes + 15) // 16 * 16
     assert state.metadata_prepared and state.rank == rank
     assert state.hidden == case.hidden and state.x_dtype == case.xs[rank].dtype
     assert state.counts.device.type == "cpu" and state.counts.dtype == torch.int64
@@ -114,8 +116,8 @@ def assert_dispatch_state(state, case, rank, alignment, weights):
                 record[16 + 8 * topk : 16 + 12 * topk].view(torch.float32), weights[source][token], rtol=0, atol=0, equal_nan=True
             )
         torch.testing.assert_close(
-            record[16 + 12 * topk : 16 + 12 * topk + 4 * case.hidden].view(torch.float32),
-            case.xs[source][token].float(),
+            record[16 + 12 * topk : 16 + 12 * topk + payload_bytes].view(dtype),
+            case.xs[source][token],
             rtol=0,
             atol=0,
             equal_nan=True,

@@ -126,12 +126,12 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
         payload_bytes = (
             size
             * original.capacity
-            * ((16 + 12 * topk + 4 * original.hidden + 15) // 16 * 16)
+            * ((16 + 12 * topk + 2 * original.hidden + 15) // 16 * 16)
         )
         return_bytes = (
             (min(size, topk) if mode else topk)
             * original.capacity
-            * ((4 * original.hidden + 4 * topk + 15) // 16 * 16)
+            * (((2 * original.hidden + 3) // 4 * 4 + 4 * topk + 15) // 16 * 16)
         )
         assert (
             buffer._num_bytes
@@ -267,7 +267,7 @@ def run():
             (False, True),
             (False, True),
             (False, True),
-            (torch.float32, torch.bfloat16),
+            (torch.bfloat16,),
             (3, 8),
         ):
             run_case(

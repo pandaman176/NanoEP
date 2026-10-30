@@ -43,7 +43,7 @@ def runtime(native):
     runtime.close()
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("kind", ["mixed", "empty", "masked", "skew"])
 @pytest.mark.parametrize("alignment", [1, 4, 16])
 def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
@@ -121,7 +121,7 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
         torch.testing.assert_close(fresh.metadata[8].cpu(), masked.indices[0])
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_nonfinite_payload_is_preserved(native, runtime, dtype):
     runtime, _ = runtime
     case = make_case(1, kind="mixed", dtype=dtype)
@@ -139,6 +139,7 @@ def test_nonfinite_payload_is_preserved(native, runtime, dtype):
     [
         "x_cpu",
         "x_dtype",
+        "x_fp32",
         "x_shape",
         "x_stride",
         "capacity",
@@ -160,7 +161,7 @@ def test_nonfinite_payload_is_preserved(native, runtime, dtype):
 )
 def test_invalid_input_precedes_communication(native, runtime, kind):
     runtime, layout = runtime
-    x = torch.ones((2, 4), device="cuda")
+    x = torch.ones((2, 4), dtype=torch.bfloat16, device="cuda")
     indices = torch.tensor([[0, 1, -1], [2, -1, 0]], device="cuda")
     weights = torch.ones((2, 3), device="cuda")
     alignment, experts, capacity, cached = 4, 3, 5, []
@@ -168,10 +169,12 @@ def test_invalid_input_precedes_communication(native, runtime, kind):
         x = x.cpu()
     elif kind == "x_dtype":
         x = x.double()
+    elif kind == "x_fp32":
+        x = x.float()
     elif kind == "x_shape":
         x = x.flatten()
     elif kind == "x_stride":
-        x = torch.ones((2, 8), device="cuda")[:, ::2]
+        x = torch.ones((2, 8), dtype=torch.bfloat16, device="cuda")[:, ::2]
     elif kind == "capacity":
         capacity = 1
     elif kind == "idx_cpu":

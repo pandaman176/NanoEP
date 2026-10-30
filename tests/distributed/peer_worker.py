@@ -263,7 +263,6 @@ def check_payload(native, rank):
     runtime.import_peer_handles(handles)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    row_bytes = (16 + 12 * topk + 4 * hidden + 15) // 16 * 16
 
     def inputs(source, round_id, dtype, weighted):
         tokens = ((11, 7), (0, 11), (11, 11), (3, 0))[round_id][source]
@@ -286,9 +285,12 @@ def check_payload(native, rank):
         return x, indices, weights
 
     def validate_payload(received, slots_cpu, sources, weighted):
+        dtype = sources[0][0].dtype
+        x_bytes = sources[0][0].element_size() * hidden
+        row_bytes = (16 + 12 * topk + x_bytes + 15) // 16 * 16
         expected = {
             (source, token): (
-                x[token].float(),
+                x[token],
                 indices[token],
                 weights[token] if weighted else None,
             )
@@ -334,7 +336,7 @@ def check_payload(native, rank):
                     atol=0,
                 )
             torch.testing.assert_close(
-                row[16 + 12 * topk : 16 + 12 * topk + 4 * hidden].view(torch.float32),
+                row[16 + 12 * topk : 16 + 12 * topk + x_bytes].view(dtype),
                 wanted_x,
                 rtol=0,
                 atol=0,
@@ -373,12 +375,13 @@ def check_payload(native, rank):
 
     for round_id, (dtype, weighted) in enumerate(
         (
-            (torch.float32, False),
+            (torch.bfloat16, False),
             (torch.bfloat16, True),
             (torch.bfloat16, False),
-            (torch.float32, True),
+            (torch.bfloat16, True),
         )
     ):
+        row_bytes = (16 + 12 * topk + 2 * hidden + 15) // 16 * 16
         sources = [inputs(source, round_id, dtype, weighted) for source in range(2)]
         source_x, source_indices, source_weights = sources[rank]
         with torch.cuda.stream(stream):
@@ -495,9 +498,9 @@ def check_dispatch_main(native, rank):
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     for kind, dtype in (
-        ("mixed", torch.float32),
+        ("mixed", torch.bfloat16),
         ("empty", torch.bfloat16),
-        ("masked", torch.float32),
+        ("masked", torch.bfloat16),
         ("skew", torch.bfloat16),
     ):
         case = make_case(2, kind=kind, dtype=dtype)
@@ -581,7 +584,7 @@ def check_combine_main(native, rank):
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for dtype, expand, weighted, kind in product(
-                (torch.float32, torch.bfloat16),
+                (torch.bfloat16,),
                 (False, True),
                 (False, True),
                 ("mixed", "empty", "masked"),

@@ -54,7 +54,7 @@ def make_inputs(args, rank, size, iteration, device):
     tokens = args.tokens
     if args.pattern == "uneven":
         tokens = 0 if rank == size - 1 else max(0, tokens - rank * 3)
-    dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
+    dtype = torch.bfloat16
     row = torch.arange(tokens, device=device)
     col = torch.arange(args.hidden, device=device)
     x = (((row[:, None] * 7 + col + rank * 11 + iteration * 3) % 127 - 63) / 64).to(dtype)
@@ -75,7 +75,7 @@ def make_inputs(args, rank, size, iteration, device):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--layout", choices=("compact", "expanded"), default="expanded")
-    parser.add_argument("--dtype", choices=("fp32", "bf16"), default="bf16")
+    parser.add_argument("--dtype", choices=("bf16",), default="bf16")
     parser.add_argument("--tokens", type=int, default=129)
     parser.add_argument("--hidden", type=int, default=1024)
     parser.add_argument("--topk", type=int, default=3)

@@ -257,8 +257,8 @@ class CudaBuffer:
             raise ValueError("do_expand must be bool or None")
 
         device = torch.device("cuda", self._device)
-        if x.device != device or x.ndim != 2 or not x.is_contiguous() or x.dtype not in (torch.float32, torch.bfloat16):
-            raise ValueError("x must be contiguous CUDA float32/bfloat16 [T,H] on this buffer's device")
+        if x.device != device or x.ndim != 2 or not x.is_contiguous() or x.dtype != torch.bfloat16:
+            raise ValueError("x must be contiguous CUDA bfloat16 [T,H] on this buffer's device")
         if x.shape[1] != self._config.hidden or x.shape[0] > self._config.num_max_tokens_per_rank:
             raise ValueError("x hidden dimension or source token count does not match the buffer configuration")
         routing = handle.topk_idx if handle is not None else topk_idx
@@ -388,8 +388,8 @@ class CudaBuffer:
         layout = handle.layout
         rows = layout.expanded_capacity if handle.do_expand else layout.recv_count
         hidden = self._config.hidden
-        if x.device != device or x.dtype not in (torch.float32, torch.bfloat16) or x.shape != (rows, hidden) or not x.is_contiguous():
-            raise ValueError("combine x must be contiguous CUDA float32/bfloat16 with the handle's exact receive shape")
+        if x.device != device or x.dtype != torch.bfloat16 or x.shape != (rows, hidden) or not x.is_contiguous():
+            raise ValueError("combine x must be contiguous CUDA bfloat16 with the handle's exact receive shape")
         weight_shape = (rows,) if handle.do_expand else (rows, self._config.num_topk)
         if weights is not None and (
             weights.device != device or weights.dtype != torch.float32 or weights.shape != weight_shape or not weights.is_contiguous()

@@ -211,7 +211,7 @@ def check_fresh_and_cached(
 
 @pytest.mark.parametrize("expand,zero_padding", LAYOUTS, ids=LAYOUT_IDS)
 @pytest.mark.parametrize("weighted", [False, True], ids=["unweighted", "weighted"])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("kind", ["mixed", "empty", "masked", "skew"])
 @pytest.mark.parametrize("hidden,alignment", [(4, 1), (33, 4), (65, 16)])
 def test_dispatch_copy_fresh_and_cached(
@@ -228,7 +228,7 @@ def test_dispatch_copy_fresh_and_cached(
 
 
 @pytest.mark.parametrize("expand,zero_padding", LAYOUTS, ids=LAYOUT_IDS)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_dispatch_copy_multiple_blocks(native, expand, zero_padding, dtype):
     check_fresh_and_cached(
         native,
@@ -241,7 +241,7 @@ def test_dispatch_copy_multiple_blocks(native, expand, zero_padding, dtype):
 
 
 @pytest.mark.parametrize("expand,zero_padding", LAYOUTS, ids=LAYOUT_IDS)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("allow_multiple_reduction", [False, True])
 def test_dispatch_uses_allocated_reduction_mode(
     native, expand, zero_padding, dtype, allow_multiple_reduction
@@ -261,7 +261,7 @@ def test_dispatch_uses_allocated_reduction_mode(
 def test_reserve_binding_uses_allocated_reduction_mode(
     native, allow_multiple_reduction
 ):
-    case = copy_case("mixed", torch.float32, 33, tokens=19)
+    case = copy_case("mixed", torch.bfloat16, 33, tokens=19)
     with local_runtime(native, case, allow_multiple_reduction) as (
         runtime,
         window,
@@ -303,7 +303,7 @@ def test_reserve_binding_uses_allocated_reduction_mode(
 
 
 @pytest.mark.parametrize("expand,zero_padding", LAYOUTS, ids=LAYOUT_IDS)
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_dispatch_copy_nonfinite_payload(native, expand, zero_padding, dtype):
     case = copy_case("mixed", dtype, 33)
     case.xs[0][0, :3] = torch.tensor(
@@ -312,3 +312,73 @@ def test_dispatch_copy_nonfinite_payload(native, expand, zero_padding, dtype):
     case.weights[0][0, 0] = float("nan")
     case.weights[0][1, 2] = float("inf")
     check_fresh_and_cached(native, case, 4, expand, True, zero_padding)
+
+
+@pytest.mark.parametrize("topk,hidden", [(1, 1), (3, 65), (8, 4096), (32, 33)])
+@pytest.mark.parametrize("expand", [False, True])
+@pytest.mark.parametrize("weighted", [False, True])
+def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighted):
+    # Include signed zero, subnormals, infinities and distinct NaN encodings.
+    bits = torch.tensor(
+        [0, -32768, 1, -32767, 16257, 32639, 32640, -128, 32705, 32641],
+        dtype=torch.int16,
+    )
+    tokens = 11
+    x = (
+        bits.repeat((tokens * hidden + len(bits) - 1) // len(bits))[: tokens * hidden]
+        .view(torch.bfloat16)
+        .reshape(tokens, hidden)
+    )
+    indices = torch.arange(topk).repeat(tokens, 1)
+    indices[1].fill_(-1)
+    weights = torch.arange(tokens * topk, dtype=torch.float32).reshape(tokens, topk) / 7
+    case = replace(
+        make_case(1, dtype=torch.bfloat16),
+        xs=[x],
+        indices=[indices],
+        weights=[weights],
+        num_experts=max(3, topk),
+        num_topk=topk,
+        hidden=hidden,
+        capacity=tokens,
+        expert_matrices=torch.empty(0),
+    )
+    with local_runtime(native, case) as (runtime, window, layout):
+        cached = []
+        for replay in (False, True):
+            if replay:
+                case = replace(case, xs=[x.flip(0).contiguous()], weights=[-weights])
+            window[layout[2] :].fill_(165)
+            state = native.dispatch_main(
+                runtime,
+                case.xs[0].cuda(),
+                case.indices[0].cuda(),
+                case.weights[0].cuda() if weighted else None,
+                case.num_experts,
+                tokens,
+                4,
+                cached,
+            )
+            outputs = native.dispatch_epilogue(state, expand, weighted, expand)
+            assert_dispatch_state(state, case, 0, 4, case.weights if weighted else None)
+            assert_dispatch_output(
+                state,
+                outputs,
+                case,
+                0,
+                4,
+                case.weights if weighted else None,
+                expand=expand,
+                zero_padding=expand,
+            )
+            records = state.stage_buffer.cpu()
+            start = 16 + 12 * topk
+            assert records.shape[1] == (start + 2 * hidden + 15) // 16 * 16
+            for row, token in enumerate(state.metadata[1].tolist()):
+                torch.testing.assert_close(
+                    records[row, start : start + 2 * hidden],
+                    case.xs[0][token].view(torch.uint8),
+                )
+                assert (records[row, start + 2 * hidden :] == 165).all()
+            assert (window[layout[2] + records.numel() :].cpu() == 165).all()
+            cached = state.metadata

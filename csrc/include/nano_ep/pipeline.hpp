@@ -16,7 +16,7 @@ struct WindowLayout;
 // stage_buffer is borrowed uint8 [N,row_bytes] communication storage. Keep its
 // runtime alive and consume it on the same stream before the next dispatch or
 // combine overwrites the shared arena. Metadata owns its storage independently.
-// hidden/x_dtype describe the original x, whose wire representation is FP32.
+// hidden/x_dtype describe BF16 x and its dispatch wire format.
 // metadata_prepared means preparation has been enqueued, not GPU completion.
 struct DispatchState {
     std::vector<torch::Tensor> metadata;
@@ -64,7 +64,7 @@ torch::Tensor reserve_and_put(PeerRuntime& runtime,
 std::vector<torch::Tensor> build_receive_metadata(
     const torch::Tensor& stage_buffer, const torch::Tensor& expert_offsets, int64_t rank, int64_t experts_per_rank, int64_t num_topk);
 
-// All ranks use matching geometry and all enter either fresh or cached mode.
+// All ranks use BF16 x, matching geometry and either fresh or cached mode.
 // Local storage checks precede window mutation and the entry barrier. Routing
 // values are a caller precondition: -1 or distinct valid experts per token.
 // Existing kernels assert bounds/uniqueness on device, without a validation
@@ -96,13 +96,14 @@ std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool expand, 
 
 // Collective on the current stream. Use the same reduction mode and capacity
 // as the owning allocation. Return borrowed uint8 [P,Tmax,row_bytes] storage,
-// where P=K without local reduction, else min(R,K). Rows contain FP32 x[H]
-// and FP32 weights[K]; absent/masked weights must not be read.
+// where P=K without local reduction, else min(R,K). Rows contain BF16 x[H],
+// padding to a four-byte boundary, then FP32 weights[K]. Absent/masked weights
+// must not be read.
 // Rank layout is selected iff allow_multiple_reduction && R<=K. Otherwise a
 // compact/local-reduced row uses its first valid top-k slot as representative;
 // expanded single-reduction sends each assignment to its own k partition.
 // Entry/exit GPU barriers protect reuse and publication. Expanded padding is
-// never sent; local reduction uses FP32 and stores FP32 partial sums.
+// never sent; local reduction uses FP32 and rounds partial sums to BF16.
 // Storage validation is host-only; metadata values/ownership and exact expanded
 // capacity are handle preconditions. No routing scan or GPU scalar readback is
 // added. The device kernel asserts provenance and expanded-slot bounds. Empty
@@ -120,8 +121,8 @@ torch::Tensor combine_main(PeerRuntime& runtime,
 // Deduplicate destination ranks for compact/local-reduced x; expanded without
 // local reduction reads each valid k. Weights select their original k from the
 // corresponding writer's row, independently of x reduction. Masked outputs are
-// zero. Accumulate FP32, add source bias once, then cast to x_dtype. The wire
-// partial sums stay FP32 (unlike DeepEP's BF16 partial storage).
+// zero. Read BF16 partial sums, accumulate FP32, add source bias once, then
+// cast to BF16. x_dtype must be BF16.
 // Bias is optional contiguous [T,H] with x_dtype. Without weights the second
 // result is an empty CUDA FP32 [0] tensor. Outputs own their storage; the caller
 // orders this read after combine_main and before the next dispatch or combine.

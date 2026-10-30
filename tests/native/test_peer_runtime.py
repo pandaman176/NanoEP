@@ -97,7 +97,7 @@ def test_automatic_barrier_epochs_and_notify_reuse(native, experts):
         runtime.close()
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("weighted", [False, True])
 @pytest.mark.parametrize("tokens", [0, 1, 11])
 def test_reserve_and_put_payload(native, dtype, weighted, tokens):
@@ -129,7 +129,7 @@ def test_reserve_and_put_payload(native, dtype, weighted, tokens):
             slots = native.reserve_and_put(runtime, x, indices, weights, 4, capacity)
             runtime.barrier(stream.cuda_stream)
             # Read on the producer stream; no default-stream ordering is assumed.
-            slots_cpu, indices_cpu, x_cpu = slots.cpu(), indices.cpu(), x.float().cpu()
+            slots_cpu, indices_cpu, x_cpu = slots.cpu(), indices.cpu(), x.cpu()
             weights_cpu = weights.cpu() if weighted else None
             received = window.cpu()
 
@@ -144,7 +144,8 @@ def test_reserve_and_put_payload(native, dtype, weighted, tokens):
         assert sorted(slots_cpu[valid_tokens, 0].tolist()) == list(
             range(len(valid_tokens))
         )
-        row_bytes = (16 + 12 * topk + 4 * hidden + 15) // 16 * 16
+        x_bytes = x.element_size() * hidden
+        row_bytes = (16 + 12 * topk + x_bytes + 15) // 16 * 16
         for token in range(tokens):
             slot = slots_cpu[token, 0].item()
             if token not in valid_tokens:
@@ -165,7 +166,7 @@ def test_reserve_and_put_payload(native, dtype, weighted, tokens):
                     atol=0,
                 )
             torch.testing.assert_close(
-                row[16 + 12 * topk : 16 + 12 * topk + 4 * hidden].view(torch.float32),
+                row[16 + 12 * topk : 16 + 12 * topk + x_bytes].view(dtype),
                 x_cpu[token],
                 rtol=0,
                 atol=0,
@@ -177,7 +178,7 @@ def test_reserve_and_put_payload(native, dtype, weighted, tokens):
         runtime.close()
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("tokens", [0, 11])
 def test_cached_payload_preserves_mapping_and_counter(native, dtype, tokens):
     hidden, topk, capacity = 37, 3, 11
@@ -188,7 +189,8 @@ def test_cached_payload_preserves_mapping_and_counter(native, dtype, tokens):
     recv_next = window[layout[1] + 40 : layout[1] + 48].view(torch.int64)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
-    row_bytes = (16 + 12 * topk + 4 * hidden + 15) // 16 * 16
+    x_bytes = torch.empty((), dtype=dtype).element_size() * hidden
+    row_bytes = (16 + 12 * topk + x_bytes + 15) // 16 * 16
     try:
         with torch.cuda.stream(stream):
             pattern = torch.tensor(
@@ -232,7 +234,7 @@ def test_cached_payload_preserves_mapping_and_counter(native, dtype, tokens):
                     window.cpu(),
                     indices.cpu(),
                 )
-                x_cpu = x.float().cpu()
+                x_cpu = x.cpu()
                 expected_count = int((indices_cpu >= 0).any(dim=1).sum())
                 assert recv_next.item() == expected_count
                 if cached:
@@ -257,9 +259,7 @@ def test_cached_payload_preserves_mapping_and_counter(native, dtype, tokens):
                         row[16 : 16 + 8 * topk].view(torch.int64), indices_cpu[token]
                     )
                     torch.testing.assert_close(
-                        row[16 + 12 * topk : 16 + 12 * topk + 4 * hidden].view(
-                            torch.float32
-                        ),
+                        row[16 + 12 * topk : 16 + 12 * topk + x_bytes].view(dtype),
                         x_cpu[token],
                         rtol=0,
                         atol=0,
@@ -284,7 +284,7 @@ def test_invalid_cached_slot_storage(native, kind):
     layout = native.window_layout(1, 3, 4, 2, 4)
     runtime = native.PeerRuntime(0, 1, layout[-1])
     runtime.import_peer_handles([runtime.export_local_handle()])
-    x = torch.zeros((tokens, 4), device="cuda")
+    x = torch.zeros((tokens, 4), dtype=torch.bfloat16, device="cuda")
     indices = torch.zeros((tokens, 2), device="cuda", dtype=torch.int64)
     slots = torch.zeros((tokens, 1), device="cuda", dtype=torch.int64)
     if kind in ("shape", "empty_shape"):

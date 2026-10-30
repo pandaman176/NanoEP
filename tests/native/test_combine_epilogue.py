@@ -42,10 +42,10 @@ def poison_empty_outputs(native):
         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
-def inputs(*, mode=False, dtype=torch.float32, tokens=2):
+def inputs(*, mode=False, dtype=torch.bfloat16, tokens=2):
     ranks, experts, capacity, hidden, topk = 2, 6, 5, 33, 3
     partitions = min(ranks, topk) if mode else topk
-    row_bytes = (4 * hidden + 4 * topk + 15) // 16 * 16
+    row_bytes = ((2 * hidden + 3) // 4 * 4 + 4 * topk + 15) // 16 * 16
     return {
         "stage_buffer": torch.full(
             (partitions, capacity, row_bytes), 165, dtype=torch.uint8, device="cuda"
@@ -68,7 +68,7 @@ def inputs(*, mode=False, dtype=torch.float32, tokens=2):
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_empty_source(native, mode, expand, weighted, dtype):
     args = inputs(mode=mode, dtype=dtype, tokens=0)
     args.update(
@@ -104,6 +104,7 @@ def test_empty_source(native, mode, expand, weighted, dtype):
         "snapshot_rank",
         "snapshot_stride",
         "output_dtype",
+        "output_fp32",
         "world_size",
         "experts",
         "hidden",
@@ -149,6 +150,8 @@ def test_invalid_storage_precedes_launch(native, kind):
         )[:, ::2]
     elif kind == "output_dtype":
         args["x_dtype"] = torch.float64
+    elif kind == "output_fp32":
+        args["x_dtype"] = torch.float32
     elif kind == "world_size":
         args["world_size"] = 0
     elif kind == "experts":
@@ -168,7 +171,7 @@ def test_invalid_storage_precedes_launch(native, kind):
     elif kind == "bias_device":
         args["bias"] = torch.empty((2, 33))
     elif kind == "bias_dtype":
-        args["bias"] = torch.empty((2, 33), dtype=torch.bfloat16, device="cuda")
+        args["bias"] = torch.empty((2, 33), dtype=torch.float32, device="cuda")
     elif kind == "bias_shape":
         args["bias"] = torch.empty((33,), device="cuda")
     else:
@@ -220,7 +223,7 @@ def check_epilogue(native, case, source, expand, mode, weighted, bias):
     "ranks,topk,hidden",
     [(1, 3, 4), (2, 3, 33), (2, 2, 65), (4, 2, 1), (2, 32, 1)],
 )
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])
@@ -254,7 +257,7 @@ def test_source_reduction(
         ("mixed", 19, 2, 32, 33),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])
@@ -295,11 +298,13 @@ def test_compact_client_rounding_differs_from_expanded(native, expand, mode):
     case.values[0][0, 1].fill_(1)
     case.values[0][0, 2].fill_(-256)
     x, _ = check_epilogue(native, case, 0, expand, mode, False, None)
-    expected = torch.full((1, 33), 1 if expand else 0, dtype=torch.bfloat16)
+    expected = torch.full(
+        (1, 33), 1 if expand and not mode else 0, dtype=torch.bfloat16
+    )
     torch.testing.assert_close(x.cpu(), expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])

@@ -83,7 +83,7 @@ def run_layout(
 
 
 def test_hand_calculated_layout(layout_binary):
-    # R=2,T=3,H=4,K=2: 6 dispatch rows (64 B), 6 return rows (32 B).
+    # R=2,T=3,H=4,K=2: 6 dispatch rows (48 B), 6 return rows (16 B).
     result = run_layout(layout_binary, 2, 3, 4, 2, 4)
     assert result.returncode == 0, result.stderr
     assert list(map(int, result.stdout.split())) == [0, 256, 512, 512, 1024, 304]
@@ -117,8 +117,8 @@ def test_shared_arena_covers_both_phases_without_overlapping_control(
     assert signal + ranks * 8 <= count
     assert recv_next == count + (ranks + experts) * 8
     assert 0 <= payload - (recv_next + 8) < 256
-    payload_stride = (16 + 12 * topk + 4 * hidden + 15) // 16 * 16
-    return_stride = (4 * hidden + 4 * topk + 15) // 16 * 16
+    payload_stride = (16 + 12 * topk + 2 * hidden + 15) // 16 * 16
+    return_stride = ((2 * hidden + 3) // 4 * 4 + 4 * topk + 15) // 16 * 16
     partitions = min(ranks, topk) if allow_multiple_reduction else topk
     payload_bytes = ranks * tokens * payload_stride
     return_bytes = partitions * tokens * return_stride
@@ -152,7 +152,7 @@ def test_return_partition_policy(layout_binary, ranks, topk, allow_multiple_redu
     assert bool(rank_layout) == (allow_multiple_reduction and ranks <= topk)
     assert partitions == (min(ranks, topk) if allow_multiple_reduction else topk)
     assert capacity == partitions * tokens
-    assert stride == (4 * hidden + 4 * topk + 15) // 16 * 16
+    assert stride == ((2 * hidden + 3) // 4 * 4 + 4 * topk + 15) // 16 * 16
     # Partition-major addressing spans exactly the reserved rows.
     slots = {
         partition * tokens + token
@@ -171,8 +171,8 @@ def test_modes_preserve_dispatch_regions_and_reduce_return_storage(layout_binary
     assert offsets[0][:4] == offsets[1][:4]
     assert offsets[0][5] == offsets[1][5]
     # Single reduction needs 8 return partitions; multiple fits in dispatch's arena.
-    assert offsets[0][4] == 512 + 8 * 128 * 176
-    assert offsets[1][4] == 512 + 2 * 128 * 256
+    assert offsets[0][4] == 512 + 8 * 128 * 112
+    assert offsets[1][4] == 512 + 2 * 128 * 192
 
 
 def test_maximum_replaces_sum_without_rejecting_representable_layout(layout_binary):

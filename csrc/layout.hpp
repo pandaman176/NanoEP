@@ -17,17 +17,15 @@ struct WindowLayout {
     static constexpr int64_t kRowAlignment = 16;      // easier for vectorized loads/stores
     static constexpr int64_t kCountNotReady = -1;
 
-    // Dispatch row: int64 source rank/token, int64 topk[K], float routing weights[K], float x[H].
-    //                             8  + 8           + 8k             + 4k                + 4H
-    // BF16 payloads can be represented exactly in the FP32 communication storage.
+    // Dispatch row: int64 source rank/token, int64 topk[K], float weights[K], BF16 x[H].
     static int64_t payload_row_bytes(int hidden, int topk) {
-        return align(checked_add(checked_add(16, checked_mul(topk, 12)), checked_mul(hidden, 4)), kRowAlignment);
+        return align(checked_add(checked_add(16, checked_mul(topk, 12)), checked_mul(hidden, 2)), kRowAlignment);
     }
 
-    // Return row: float x[H], float weights[K]. A locally reduced x may carry
+    // Return row: BF16 x[H], align4 padding, float weights[K]. A locally reduced x may carry
     // several independent routing-weight payloads; the source selects each k.
     static int64_t return_row_bytes(int hidden, int topk) {
-        return align(checked_add(checked_mul(hidden, 4), checked_mul(topk, 4)), kRowAlignment);
+        return align(checked_add(align(checked_mul(hidden, 2), 4), checked_mul(topk, 4)), kRowAlignment);
     }
 
     static constexpr bool use_rank_layout(int ranks, int topk, bool allow_multiple_reduction) {
@@ -70,7 +68,7 @@ struct WindowLayout {
         layout.return_partitions = return_partitions;
         layout.return_capacity = return_capacity;
         layout.payload_offset = align(checked_add(layout.count_offset, count_bytes), kRegionAlignment);
-        // Entry barriers separate the readers and writers of successive phases.
+        // Reuse Send Buffer For Return Payload
         layout.return_offset = layout.payload_offset;
         layout.num_bytes = align(checked_add(layout.payload_offset, std::max(payload_bytes, return_bytes)), kRegionAlignment);
         return layout;

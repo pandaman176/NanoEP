@@ -17,7 +17,7 @@ received = buffer.dispatch(
 )
 ```
 
-Inputs must be contiguous on the local GPU: `x[T,H]` is FP32/BF16, `indices[T,K]` is int64 and optional `weights[T,K]` is FP32. Indices are global expert IDs or `-1`; valid expert IDs in each token must be distinct. Empty source ranks are supported and must participate. All ranks agree on payload dtype, weight presence and collective order.
+Inputs must be contiguous on the local GPU: `x[T,H]` is BF16, `indices[T,K]` is int64 and optional `weights[T,K]` is FP32. Indices are global expert IDs or `-1`; valid expert IDs in each token must be distinct. Empty source ranks are supported and must participate. All ranks agree on payload dtype, weight presence and collective order.
 
 Compact output has `x[N,H]`, local `topk_idx[N,K]`, and optional weights `[N,K]`. A source token appears once per destination rank, even if it selects several local experts. Nonlocal/masked IDs are `-1`; weights retain the complete original row.
 
@@ -46,11 +46,11 @@ result = buffer.combine(
 )
 ```
 
-The caller computes experts and applies gate weights. Compact `expert_x[N,H]` must already contain the sum of the local weighted expert outputs. Expanded `expert_x[C,H]` contains one output per assignment; padding is ignored. FP32/BF16 output dtype may differ from dispatch, but must agree across ranks.
+The caller computes experts and applies gate weights. Compact `expert_x[N,H]` must already contain the sum of the local weighted expert outputs. Expanded `expert_x[C,H]` contains one output per assignment; padding is ignored. Expert outputs are BF16 on every rank; FP32 EP inputs are not supported.
 
 Optional FP32 `weights` uses the receive layout and is returned independently as `result.topk_weights[T,K]`, with masked positions zero; it never multiplies `expert_x`. With no weight payload, the result field is `None`. Optional source-local `bias[T,H]` has the expert-output dtype and is added once.
 
-`result.x[T,H]` accumulates FP32 then casts to the expert-output dtype. Default `allow_multiple_reduction=False` keeps expanded contributions separate until final reduction. True permits FP32 local reduction before source reduction. Compact inputs have already been locally reduced by the caller. Grouping and client BF16 rounding can change numerical results between modes/layouts; no bitwise equivalence is promised.
+`result.x[T,H]` accumulates FP32 then casts to the expert-output dtype. Default `allow_multiple_reduction=False` keeps expanded contributions separate until final reduction. True permits FP32 local reduction, BF16 communication storage, then FP32 source reduction. Compact inputs have already been locally reduced by the caller. Grouping and client BF16 rounding can change numerical results between modes/layouts; no bitwise equivalence is promised.
 
 ## Events and lifetime
 
@@ -64,3 +64,9 @@ received.event.current_stream_wait()
 `previous_event` is an optional native `torch.cuda.Event` for an input producer on another stream. Otherwise the communication stream waits for the caller's current stream. The returned event tracks tensor ownership on the consumer stream. Keep the current device set to this process's GPU and do not mutate inputs until communication completes. Exact receive-count readback can block the host; asynchronous mode does not imply CUDA Graph compatibility.
 
 Close collectively after consumers finish, preferably with `with CudaBuffer(...)`. Closing drains GPU work, coordinates unmapping across ranks, then frees allocations. Do not use handles after close or across buffers. Fatal rank failure relies on the process-group/launcher timeout.
+
+## BF16 communication contract
+
+CUDA EP dispatch/combine x and bias now use BF16 exclusively; weights and accumulators remain FP32. Dispatch transfers BF16 directly. Expanded local reductions accumulate in FP32 and round their partials to BF16 before communication; the source sums partials in FP32 and casts once. Independent row operators retain their existing dtype support.
+
+This changes the communication byte ABI and removes FP32 EP inputs. Recompile the extension, recreate buffers, and update old callers. Regions still use 256-byte alignment and rows use 16-byte alignment in this revision. Dispatch row stride is align16(16+12K+2H); return row stride is align16(align4(2H)+4K).

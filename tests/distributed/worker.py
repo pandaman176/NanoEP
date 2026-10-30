@@ -95,7 +95,7 @@ def expert_output(received):
     y = (
         torch.full_like(received.x, float("nan"))
         if handle.do_expand
-        else torch.zeros_like(received.x)
+        else torch.zeros_like(received.x, dtype=torch.float32)
     )
     for row in range(layout.recv_count):
         for k, expert in enumerate(layout.local_topk_idx[row].tolist()):
@@ -108,25 +108,39 @@ def expert_output(received):
                 else received.topk_weights[row, k]
             )
             contribution = (
-                received.x[slot] * (handle.rank * local_experts + expert + 1) + 0.5
+                received.x[slot].float() * (handle.rank * local_experts + expert + 1)
+                + 0.5
             ) * weight
+            contribution = contribution.to(received.x.dtype)
             if handle.do_expand:
                 y[slot] = contribution
             else:
-                y[row] += contribution
-    return y
+                y[row] += contribution.float()
+    return y.to(received.x.dtype)
 
 
-def source_reference(case, rank):
-    """Source assignment reference, independent of receive ordering and layouts."""
-    expected = torch.zeros_like(case.xs[rank])
+def source_reference(case, rank, expand, multiple, bias):
+    """Reproduce client BF16 arithmetic and each communication rounding boundary."""
+    x = case.xs[rank]
+    result = torch.zeros(x.shape, dtype=torch.float32)
+    local_experts = case.num_experts // len(case.xs)
     for token, choices in enumerate(case.indices[rank].tolist()):
+        groups = {}
         for k, expert in enumerate(choices):
             if expert >= 0:
-                expected[token] += (
-                    case.xs[rank][token] * (expert + 1) + 0.5
-                ) * case.weights[rank][token, k]
-    return expected
+                key = k if expand and not multiple else expert // local_experts
+                groups.setdefault(key, []).append(k)
+        for ks in groups.values():
+            partial = torch.zeros(x.shape[1], dtype=torch.float32)
+            for k in ks:
+                value = (x[token].float() * (choices[k] + 1) + 0.5) * case.weights[
+                    rank
+                ][token, k]
+                partial += value.bfloat16().float()
+            result[token] += partial.bfloat16().float()
+    if bias is not None:
+        result += bias.float()
+    return result.bfloat16()
 
 
 def delayed_backend(native):
@@ -170,11 +184,9 @@ def combine_experts(buffer, received, bias, *, explicit_event, asynchronous):
     return result, consumer
 
 
-def assert_combined(result, case, rank, bias):
-    expected = source_reference(case, rank)
-    if bias is not None:
-        expected += bias
-    torch.testing.assert_close(result.x.cpu(), expected, rtol=2e-5, atol=2e-5)
+def assert_combined(result, case, rank, bias, expand, multiple):
+    expected = source_reference(case, rank, expand, multiple, bias)
+    torch.testing.assert_close(result.x.cpu(), expected, rtol=0, atol=0)
     torch.testing.assert_close(
         result.topk_weights.cpu(),
         case.weights[rank].masked_fill(case.indices[rank] == -1, 0),
@@ -206,7 +218,9 @@ def run():
             buffer._backend = delayed_backend(buffer._backend)
             for expand in (False, True):
                 for kind in ("mixed", "empty", "masked", "skew"):
-                    c = make_case(size, kind=kind, seed=lifetime + 7)
+                    c = make_case(
+                        size, kind=kind, seed=lifetime + 7, dtype=torch.bfloat16
+                    )
                     c.xs = [x.repeat(1, 32) for x in c.xs]
                     expected = reference_dispatch(
                         c.xs,
@@ -256,7 +270,7 @@ def run():
                     with torch.cuda.stream(consumer):
                         if asynchronous:
                             result.event.current_stream_wait()
-                        assert_combined(result, c, rank, bias)
+                        assert_combined(result, c, rank, bias, expand, bool(lifetime))
                         saved_result = (
                             result.x.cpu().clone(),
                             result.topk_weights.cpu().clone(),
@@ -294,7 +308,14 @@ def run():
                     with torch.cuda.stream(consumer):
                         if asynchronous:
                             combined_replay.event.current_stream_wait()
-                        assert_combined(combined_replay, replay_case, rank, bias)
+                        assert_combined(
+                            combined_replay,
+                            replay_case,
+                            rank,
+                            bias,
+                            expand,
+                            bool(lifetime),
+                        )
                         torch.testing.assert_close(
                             result.x.cpu(), saved_result[0], rtol=0, atol=0
                         )
@@ -343,19 +364,12 @@ def run():
                 )
                 torch.testing.assert_close(combined.x.cpu(), expected, rtol=0, atol=0)
                 assert combined.topk_weights is None
-                promoted = buffer.combine(
-                    received.x.float(),
-                    received.handle,
-                    bias=torch.ones_like(x_cpu, dtype=torch.float32, device="cuda"),
-                    async_op=True,
-                )
-                promoted.event.current_stream_wait()
-                assert (
-                    promoted.x.dtype == torch.float32 and promoted.topk_weights is None
-                )
-                torch.testing.assert_close(
-                    promoted.x.cpu(), expected.float(), rtol=0, atol=0
-                )
+                try:
+                    buffer.combine(received.x.float(), received.handle)
+                except ValueError as error:
+                    assert "bfloat16" in str(error)
+                else:
+                    raise AssertionError("FP32 expert outputs must be rejected")
             buffer.close()
             buffer.close()
             try:

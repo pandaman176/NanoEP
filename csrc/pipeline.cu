@@ -1,4 +1,3 @@
-#include <ATen/Dispatch.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -25,7 +24,7 @@ void check_payload_inputs(const torch::Tensor& window,
                           int64_t max_tokens) {
     TORCH_CHECK(x.device() == window.device() && x.dim() == 2 && x.is_contiguous(),
                 "x must be contiguous CUDA [T,H] on the runtime device");
-    TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kBFloat16, "payload x must be float32 or bfloat16");
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "dispatch x must be bfloat16");
     TORCH_CHECK(indices.device() == x.device() && indices.scalar_type() == torch::kInt64 && indices.dim() == 2 &&
                     indices.size(0) == x.size(0) && indices.is_contiguous(),
                 "indices must be contiguous CUDA int64 [T,K] on the x device");
@@ -180,7 +179,7 @@ __global__ void reserve_and_put_kernel(const int64_t* peer_addresses,
         auto* row_src_token = reinterpret_cast<int64_t*>(row + 8);
         auto* row_topk = reinterpret_cast<int64_t*>(row + 16);
         auto* row_weights = reinterpret_cast<float*>(row + 16 + 8 * num_topk);
-        auto* row_x = reinterpret_cast<float*>(row + 16 + 12 * num_topk);
+        auto* row_x = reinterpret_cast<data_t*>(row + 16 + 12 * num_topk);
 
         if (lane == 0) {
             row_src_rank[0] = rank;
@@ -193,7 +192,7 @@ __global__ void reserve_and_put_kernel(const int64_t* peer_addresses,
             }
         }
         for (int64_t h = lane; h < hidden; h += 32) {
-            row_x[h] = static_cast<float>(x[token * hidden + h]);
+            row_x[h] = x[token * hidden + h];
         }
 
         // clear the first sender
@@ -220,7 +219,7 @@ __global__ void build_receive_metadata_kernel(const uint8_t* stage_buffer,
 
     // ┌──────────┬───────────┬───────────┬────────────┬─────────┬─────────┐
     // │ src_rank │ src_token │ topk IDs  │ weights    │ x       │ padding │
-    // │ int64    │ int64     │ int64[K]  │ float32[K] │ FP32[H] │         │
+    // │ int64    │ int64     │ int64[K]  │ fp32[K]    │ bf16[H] │         │
     // └──────────┴───────────┴───────────┴────────────┴─────────┴─────────┘
     const auto* payload = stage_buffer + row * row_bytes;
     const auto* provenance = reinterpret_cast<const int64_t*>(payload);
@@ -275,7 +274,7 @@ __global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,    //
 
     const auto* payload = stage_buffer + row * row_bytes;
     const auto* weights = reinterpret_cast<const float*>(payload + 16 + 8 * num_topk);
-    const auto* x = reinterpret_cast<const float*>(payload + 16 + 12 * num_topk);
+    const auto* x = reinterpret_cast<const output_t*>(payload + 16 + 12 * num_topk);
 
     if constexpr (kExpand) {
         for (int64_t k = 0; k < num_topk; ++k) {
@@ -291,7 +290,7 @@ __global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,    //
             }
 
             for (int64_t h = lane; h < hidden; h += warp_size) {
-                recv_x[slot * hidden + h] = static_cast<output_t>(x[h]);
+                recv_x[slot * hidden + h] = x[h];
             }
         }
     } else {
@@ -302,13 +301,54 @@ __global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,    //
             }
         }
         for (int64_t h = lane; h < hidden; h += warp_size) {
-            recv_x[row * hidden + h] = static_cast<output_t>(x[h]);
+            recv_x[row * hidden + h] = x[h];
         }
     }
 }
 
-template <typename output_t, bool kExpand, bool kAllowMultipleReduction, bool kWithWeights>
-__global__ void combine_reduce_epilogue_kernel(const uint8_t* stage_buffer,  // [P,Tmax,row_bytes], FP32 x[H] then weights[K]
+template <int kNumPartitionsInLayout, typename FetchPartition>
+__device__ __forceinline__ void compute_partition_slots(int (&partition_slot_idx)[kNumPartitionsInLayout],
+                                                        unsigned representatives,
+                                                        const FetchPartition& fetch_partition) {
+    // all lanes scan set bits in ascending order and fetch each partition
+    // once. Compact valid partitions to the front and fill remaining entries
+    // with -1. fetch_partition may contain a full-warp shuffle.
+#pragma unroll
+    for (int i = 0; i < kNumPartitionsInLayout; ++i)
+        if (representatives != 0) {
+            const int representative = __ffs(representatives) - 1;
+            partition_slot_idx[i] = fetch_partition(representative);
+            representatives &= representatives - 1;  // clear the first representative
+
+        } else {
+            partition_slot_idx[i] = -1;
+        }
+}
+
+__device__ __forceinline__ void restore_weights(const uint8_t* stage_buffer,  // [P,Tmax,row_bytes]
+                                                float* combined_weights,      // [T,K], including masked zeros
+                                                int lane,
+                                                int partition,  // this lane's return partition, or -1
+                                                int64_t row,
+                                                int64_t hidden,
+                                                int64_t num_topk,
+                                                int64_t max_tokens,
+                                                int64_t return_row_bytes) {
+    // Each top-k lane reads its weight from the selected partition; masked
+    // lanes write zero without accessing the return buffer.
+    if (lane < num_topk) {
+        float weight = 0.0f;
+        if (partition >= 0) {
+            const auto* return_row = stage_buffer + (partition * max_tokens + row) * return_row_bytes;
+            const auto* weights = reinterpret_cast<const float*>(return_row + ((hidden + 1) / 2) * sizeof(float));
+            weight = weights[lane];
+        }
+        combined_weights[row * num_topk + lane] = weight;
+    }
+}
+
+template <typename output_t, bool kExpand, bool kAllowMultipleReduction, bool kWithWeights, int kNumPartitionsInLayout>
+__global__ void combine_reduce_epilogue_kernel(const uint8_t* stage_buffer,  // [P,Tmax,row_bytes], BF16 x[H], aligned FP32 weights[K]
                                                const int64_t* source_topk,   // [T,K], global expert IDs, masked = -1
                                                const output_t* bias,         // [T,H], or nullptr
                                                output_t* combined_x,         // [T,H], write every element
@@ -332,13 +372,10 @@ __global__ void combine_reduce_epilogue_kernel(const uint8_t* stage_buffer,  // 
     // as combine_return_kernel does. Never read unpublished rows or weight fields.
     // Accumulate x in FP32, add optional bias once, then cast once to output_t.
     // Restore valid weights independently at their original k; write masked zeros.
+    int partition_slot_idx[kNumPartitionsInLayout];
 
     if constexpr (kAllowMultipleReduction || !kExpand) {
         const int64_t expert = lane < num_topk ? source_topk[row * num_topk + lane] : -1;
-        if constexpr (kWithWeights) {
-            if (lane < num_topk && expert < 0)
-                combined_weights[row * num_topk + lane] = 0.0f;
-        }
         const int destination = expert >= 0 ? static_cast<int>(expert / experts_per_rank) : -1;
         const unsigned same_destination = __match_any_sync(0xffffffffu, destination);
         const int first_k = __ffs(same_destination) - 1;
@@ -346,77 +383,66 @@ __global__ void combine_reduce_epilogue_kernel(const uint8_t* stage_buffer,  // 
         // finding all first valid k for each rank
         const unsigned representatives = __ballot_sync(0xffffffffu, is_first_valid_k);
 
-        for (int64_t base = 0; base < hidden; base += 32) {
-            const int64_t h = base + lane;
-            float accum = 0.0f;
-            unsigned pending = representatives;
-            while (pending != 0) {
-                const int representative = __ffs(pending) - 1;
-                const int dst_rank = __shfl_sync(0xffffffffu, destination, representative);
-                const int partition = kAllowMultipleReduction && world_size <= num_topk ? dst_rank : representative;
+        // Compute the slot indices for each partition.
+        const bool use_rank_layout = kAllowMultipleReduction && world_size <= num_topk;
+        compute_partition_slots(partition_slot_idx, representatives, [=](int representative) {
+            const int dst_rank = __shfl_sync(0xffffffffu, destination, representative);
+            return use_rank_layout ? dst_rank : representative;
+        });
 
-                const auto* return_row = stage_buffer + (partition * max_tokens + row) * return_row_bytes;
-                const auto* returned_x = reinterpret_cast<const float*>(return_row);
-                if (h < hidden) {
-                    accum += returned_x[h];
-                }
-                const auto* weights = reinterpret_cast<const float*>(return_row + hidden * sizeof(float));
-                if constexpr (kWithWeights) {
-                    // 从该返回行的 weights[lane] 恢复自己的权重。
-                    if (base == 0 && lane < num_topk && destination >= 0 && destination == dst_rank) {
-                        combined_weights[row * num_topk + lane] = weights[lane];
-                    }
-                }
-                pending &= pending - 1;  // clear the first representative
-            }
-
-            if (h < hidden) {
-                if (bias != nullptr)
-                    accum += static_cast<float>(bias[row * hidden + h]);
-                combined_x[row * hidden + h] = static_cast<output_t>(accum);
-            }
+        if constexpr (kWithWeights) {
+            const int partition = destination >= 0 ? (use_rank_layout ? destination : first_k) : -1;
+            restore_weights(stage_buffer, combined_weights, lane, partition, row, hidden, num_topk, max_tokens, return_row_bytes);
         }
+
     } else {
         // kExpand && !kAllowMultipleReduction [K, T]布局
 
         const int64_t expert = lane < num_topk ? source_topk[row * num_topk + lane] : -1;
-        if constexpr (kWithWeights) {
-            if (lane < num_topk && expert < 0)
-                combined_weights[row * num_topk + lane] = 0.0f;
-        }
         // finding all valid k
         const unsigned valid_ks = __ballot_sync(0xffffffffu, expert >= 0);
 
-        for (int64_t base = 0; base < hidden; base += 32) {
-            const int64_t h = base + lane;
-            float accum = 0.0f;
-            unsigned pending = valid_ks;
-            while (pending != 0) {
-                const int k = __ffs(pending) - 1;
-                const int partition = k;
+        compute_partition_slots(partition_slot_idx, valid_ks, [](int k) { return k; });
 
-                const auto* return_row = stage_buffer + (partition * max_tokens + row) * return_row_bytes;
-                const auto* returned_x = reinterpret_cast<const float*>(return_row);
-                if (h < hidden) {
-                    accum += returned_x[h];
-                }
-                const auto* weights = reinterpret_cast<const float*>(return_row + hidden * sizeof(float));
-                if constexpr (kWithWeights) {
-                    // 从该返回行的 weights[lane] 恢复自己的权重。
-                    if (base == 0 && lane == k) {
-                        combined_weights[row * num_topk + lane] = weights[lane];
-                    }
-                }
-                pending &= pending - 1;  // clear the first valid k
-            }
+        if constexpr (kWithWeights) {
+            const int partition = expert >= 0 ? lane : -1;
+            restore_weights(stage_buffer, combined_weights, lane, partition, row, hidden, num_topk, max_tokens, return_row_bytes);
+        }
+    }
 
+    for (int64_t base = 0; base < hidden; base += 32) {
+        const int64_t h = base + lane;
+        float accum = 0.0f;
+
+#pragma unroll
+        for (int i = 0; i < kNumPartitionsInLayout; ++i) {
+            const int partition_slot = partition_slot_idx[i];
+            if (partition_slot < 0)
+                break;
+
+            const auto* return_row = stage_buffer + (partition_slot * max_tokens + row) * return_row_bytes;
+            const auto* returned_x = reinterpret_cast<const at::BFloat16*>(return_row);
             if (h < hidden) {
-                if (bias != nullptr)
-                    accum += static_cast<float>(bias[row * hidden + h]);
-
-                combined_x[row * hidden + h] = static_cast<output_t>(accum);
+                accum += static_cast<float>(returned_x[h]);
             }
         }
+
+        if (h < hidden) {
+            if (bias != nullptr)
+                accum += static_cast<float>(bias[row * hidden + h]);
+            combined_x[row * hidden + h] = static_cast<output_t>(accum);
+        }
+    }
+}
+
+template <int kNumPartitionsInLayout = 1, typename Launch>
+void dispatch_combine_partitions(int64_t num_partitions, const Launch& launch) {
+    if (num_partitions == kNumPartitionsInLayout) {
+        launch.template operator()<kNumPartitionsInLayout>();
+    } else if constexpr (kNumPartitionsInLayout < 32) {
+        dispatch_combine_partitions<kNumPartitionsInLayout + 1>(num_partitions, launch);
+    } else {
+        TORCH_CHECK(false, "combine return partition count must be in [1,32], got ", num_partitions);
     }
 }
 
@@ -442,9 +468,11 @@ void launch_combine_reduce_epilogue(const torch::Tensor& stage_buffer,
     constexpr int warps_per_block = threads / 32;
     const int64_t blocks = (num_tokens + warps_per_block - 1) / warps_per_block;
 
-    AT_DISPATCH_FLOATING_TYPES_AND(at::ScalarType::BFloat16, combined_x.scalar_type(), "nano_ep::combine_reduce_epilogue", [&] {
-        const auto launch = [&]<bool kExpand, bool kAllowMultipleReduction, bool kWithWeights>() {
-            combine_reduce_epilogue_kernel<scalar_t, kExpand, kAllowMultipleReduction, kWithWeights>
+    using scalar_t = at::BFloat16;
+
+    const auto launch = [&]<bool kExpand, bool kAllowMultipleReduction, bool kWithWeights>() {
+        dispatch_combine_partitions(stage_buffer.size(0), [&]<int kNumPartitionsInLayout>() {
+            combine_reduce_epilogue_kernel<scalar_t, kExpand, kAllowMultipleReduction, kWithWeights, kNumPartitionsInLayout>
                 <<<blocks, threads, 0, stream>>>(stage_buffer.data_ptr<uint8_t>(),
                                                  source_topk.data_ptr<int64_t>(),
                                                  bias.has_value() ? bias->data_ptr<scalar_t>() : nullptr,
@@ -457,25 +485,25 @@ void launch_combine_reduce_epilogue(const torch::Tensor& stage_buffer,
                                                  world_size,
                                                  max_tokens,
                                                  stage_buffer.size(2));
-        };
-        const auto launch_with_weights = [&]<bool kExpand, bool kAllowMultipleReduction>() {
-            if (with_weights)
-                launch.template operator()<kExpand, kAllowMultipleReduction, true>();
-            else
-                launch.template operator()<kExpand, kAllowMultipleReduction, false>();
-        };
-        if (expand) {
-            if (allow_multiple_reduction)
-                launch_with_weights.template operator()<true, true>();
-            else
-                launch_with_weights.template operator()<true, false>();
-        } else {
-            if (allow_multiple_reduction)
-                launch_with_weights.template operator()<false, true>();
-            else
-                launch_with_weights.template operator()<false, false>();
-        }
-    });
+        });
+    };
+    const auto launch_with_weights = [&]<bool kExpand, bool kAllowMultipleReduction>() {
+        if (with_weights)
+            launch.template operator()<kExpand, kAllowMultipleReduction, true>();
+        else
+            launch.template operator()<kExpand, kAllowMultipleReduction, false>();
+    };
+    if (expand) {
+        if (allow_multiple_reduction)
+            launch_with_weights.template operator()<true, true>();
+        else
+            launch_with_weights.template operator()<true, false>();
+    } else {
+        if (allow_multiple_reduction)
+            launch_with_weights.template operator()<false, true>();
+        else
+            launch_with_weights.template operator()<false, false>();
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -548,12 +576,12 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,  // [R], in
             const int64_t slot = expanded_slots[row * num_topk + k];
             const int64_t peer_idx = k * max_tokens + src_token;
             auto* peer_row = peer_window + return_offset + peer_idx * return_row_bytes;
-            auto* peer_x = reinterpret_cast<float*>(peer_row);
+            auto* peer_x = reinterpret_cast<at::BFloat16*>(peer_row);
             for (int64_t h = lane; h < hidden; h += warp_size)
-                peer_x[h] = static_cast<float>(x[slot * hidden + h]);
+                peer_x[h] = x[slot * hidden + h];
             if constexpr (kWithWeights) {
                 if (lane == 0) {
-                    auto* peer_weights = reinterpret_cast<float*>(peer_row + sizeof(float) * hidden);
+                    auto* peer_weights = reinterpret_cast<float*>(peer_row + ((hidden + 1) / 2) * sizeof(float));
                     peer_weights[k] = weights[slot];
                 }
             }
@@ -565,7 +593,7 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,  // [R], in
         const int partition = use_rank_layout ? rank : first_valid_k;
         const int64_t peer_idx = partition * max_tokens + src_token;
         auto* peer_row = peer_window + return_offset + peer_idx * return_row_bytes;
-        auto* peer_x = reinterpret_cast<float*>(peer_row);
+        auto* peer_x = reinterpret_cast<at::BFloat16*>(peer_row);
         if constexpr (kExpand) {
             for (int64_t h = lane; h < hidden; h += warp_size) {
                 float accum = 0.0f;
@@ -575,16 +603,16 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,  // [R], in
                         accum += static_cast<float>(x[slot * hidden + h]);
                     }
                 }
-                peer_x[h] = accum;
+                peer_x[h] = static_cast<at::BFloat16>(accum);
             }
         } else {
             for (int64_t h = lane; h < hidden; h += warp_size)
-                peer_x[h] = static_cast<float>(x[row * hidden + h]);
+                peer_x[h] = x[row * hidden + h];
         }
         if constexpr (kWithWeights) {
             // One lane writes each original top-k position in the same return row.
             if (valid_k) {
-                auto* peer_weights = reinterpret_cast<float*>(peer_row + sizeof(float) * hidden);
+                auto* peer_weights = reinterpret_cast<float*>(peer_row + ((hidden + 1) / 2) * sizeof(float));
                 const int64_t weight_idx = kExpand ? expanded_slots[row * num_topk + lane] : row * num_topk + lane;
                 peer_weights[lane] = weights[weight_idx];
             }
@@ -614,44 +642,44 @@ void launch_combine_return(const torch::Tensor& addresses,
     constexpr int warps_per_block = threads / 32;
     const int64_t blocks = (recv_count + warps_per_block - 1) / warps_per_block;
 
-    AT_DISPATCH_FLOATING_TYPES_AND(at::ScalarType::BFloat16, x.scalar_type(), "nano_ep::combine_return", [&] {
-        const auto launch = [&]<bool kExpand, bool kAllowMultipleReduction, bool kWithWeights>() {
-            combine_return_kernel<scalar_t, kExpand, kAllowMultipleReduction, kWithWeights>
-                <<<blocks, threads, 0, stream>>>(addresses.data_ptr<int64_t>(),
-                                                 x.data_ptr<scalar_t>(),
-                                                 weight_ptr,
-                                                 metadata[0].data_ptr<int64_t>(),
-                                                 metadata[1].data_ptr<int64_t>(),
-                                                 metadata[2].data_ptr<int64_t>(),
-                                                 kExpand ? metadata[5].data_ptr<int64_t>() : nullptr,
-                                                 rank,
-                                                 world_size,
-                                                 recv_count,
-                                                 x.size(0),
-                                                 hidden,
-                                                 num_topk,
-                                                 max_tokens,
-                                                 layout.return_offset,
-                                                 WindowLayout::return_row_bytes(hidden, num_topk));
-        };
-        const auto launch_with_weights = [&]<bool kExpand, bool kAllowMultipleReduction>() {
-            if (weights.has_value())
-                launch.template operator()<kExpand, kAllowMultipleReduction, true>();
-            else
-                launch.template operator()<kExpand, kAllowMultipleReduction, false>();
-        };
-        if (expand) {
-            if (allow_multiple_reduction)
-                launch_with_weights.template operator()<true, true>();
-            else
-                launch_with_weights.template operator()<true, false>();
-        } else {
-            if (allow_multiple_reduction)
-                launch_with_weights.template operator()<false, true>();
-            else
-                launch_with_weights.template operator()<false, false>();
-        }
-    });
+    using scalar_t = at::BFloat16;
+
+    const auto launch = [&]<bool kExpand, bool kAllowMultipleReduction, bool kWithWeights>() {
+        combine_return_kernel<scalar_t, kExpand, kAllowMultipleReduction, kWithWeights>
+            <<<blocks, threads, 0, stream>>>(addresses.data_ptr<int64_t>(),
+                                             x.data_ptr<scalar_t>(),
+                                             weight_ptr,
+                                             metadata[0].data_ptr<int64_t>(),
+                                             metadata[1].data_ptr<int64_t>(),
+                                             metadata[2].data_ptr<int64_t>(),
+                                             kExpand ? metadata[5].data_ptr<int64_t>() : nullptr,
+                                             rank,
+                                             world_size,
+                                             recv_count,
+                                             x.size(0),
+                                             hidden,
+                                             num_topk,
+                                             max_tokens,
+                                             layout.return_offset,
+                                             WindowLayout::return_row_bytes(hidden, num_topk));
+    };
+    const auto launch_with_weights = [&]<bool kExpand, bool kAllowMultipleReduction>() {
+        if (weights.has_value())
+            launch.template operator()<kExpand, kAllowMultipleReduction, true>();
+        else
+            launch.template operator()<kExpand, kAllowMultipleReduction, false>();
+    };
+    if (expand) {
+        if (allow_multiple_reduction)
+            launch_with_weights.template operator()<true, true>();
+        else
+            launch_with_weights.template operator()<true, false>();
+    } else {
+        if (allow_multiple_reduction)
+            launch_with_weights.template operator()<false, true>();
+        else
+            launch_with_weights.template operator()<false, false>();
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -742,41 +770,41 @@ torch::Tensor reserve_and_put(PeerRuntime& runtime,
     const int64_t blocks = (num_tokens + warps_per_block - 1) / warps_per_block;
 
     if (reuse_slots) {
-        AT_DISPATCH_FLOATING_TYPES_AND(at::ScalarType::BFloat16, x.scalar_type(), "nano_ep::reserve_and_put", [&] {
-            reserve_and_put_kernel<scalar_t, true><<<blocks, threads, 0, stream.stream()>>>(addresses.data_ptr<int64_t>(),
-                                                                                            x.data_ptr<scalar_t>(),
-                                                                                            indices.data_ptr<int64_t>(),
-                                                                                            weight_ptr,
-                                                                                            dst_slots.data_ptr<int64_t>(),
-                                                                                            rank,
-                                                                                            world_size,
-                                                                                            num_tokens,
-                                                                                            hidden,
-                                                                                            num_topk,
-                                                                                            experts_per_rank,
-                                                                                            max_tokens,
-                                                                                            recv_next_offset,
-                                                                                            layout.payload_offset,
-                                                                                            row_bytes);
-        });
+        using scalar_t = at::BFloat16;
+
+        reserve_and_put_kernel<scalar_t, true><<<blocks, threads, 0, stream.stream()>>>(addresses.data_ptr<int64_t>(),
+                                                                                        x.data_ptr<scalar_t>(),
+                                                                                        indices.data_ptr<int64_t>(),
+                                                                                        weight_ptr,
+                                                                                        dst_slots.data_ptr<int64_t>(),
+                                                                                        rank,
+                                                                                        world_size,
+                                                                                        num_tokens,
+                                                                                        hidden,
+                                                                                        num_topk,
+                                                                                        experts_per_rank,
+                                                                                        max_tokens,
+                                                                                        recv_next_offset,
+                                                                                        layout.payload_offset,
+                                                                                        row_bytes);
     } else {
-        AT_DISPATCH_FLOATING_TYPES_AND(at::ScalarType::BFloat16, x.scalar_type(), "nano_ep::reserve_and_put", [&] {
-            reserve_and_put_kernel<scalar_t, false><<<blocks, threads, 0, stream.stream()>>>(addresses.data_ptr<int64_t>(),
-                                                                                             x.data_ptr<scalar_t>(),
-                                                                                             indices.data_ptr<int64_t>(),
-                                                                                             weight_ptr,
-                                                                                             dst_slots.data_ptr<int64_t>(),
-                                                                                             rank,
-                                                                                             world_size,
-                                                                                             num_tokens,
-                                                                                             hidden,
-                                                                                             num_topk,
-                                                                                             experts_per_rank,
-                                                                                             max_tokens,
-                                                                                             recv_next_offset,
-                                                                                             layout.payload_offset,
-                                                                                             row_bytes);
-        });
+        using scalar_t = at::BFloat16;
+
+        reserve_and_put_kernel<scalar_t, false><<<blocks, threads, 0, stream.stream()>>>(addresses.data_ptr<int64_t>(),
+                                                                                         x.data_ptr<scalar_t>(),
+                                                                                         indices.data_ptr<int64_t>(),
+                                                                                         weight_ptr,
+                                                                                         dst_slots.data_ptr<int64_t>(),
+                                                                                         rank,
+                                                                                         world_size,
+                                                                                         num_tokens,
+                                                                                         hidden,
+                                                                                         num_topk,
+                                                                                         experts_per_rank,
+                                                                                         max_tokens,
+                                                                                         recv_next_offset,
+                                                                                         layout.payload_offset,
+                                                                                         row_bytes);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return dst_slots;
@@ -794,7 +822,7 @@ std::vector<torch::Tensor> build_receive_metadata(
                 "expert_offsets must be contiguous CUDA int64 [experts_per_rank+1] on the stage_buffer device");
     const int64_t recv_count = stage_buffer.size(0);
     const int64_t row_bytes = stage_buffer.size(1);
-    TORCH_CHECK(row_bytes >= 16 + 12 * num_topk + 4 && row_bytes % WindowLayout::kRowAlignment == 0 &&
+    TORCH_CHECK(row_bytes >= 16 + 12 * num_topk + 2 && row_bytes % WindowLayout::kRowAlignment == 0 &&
                     reinterpret_cast<uintptr_t>(stage_buffer.data_ptr<uint8_t>()) % alignof(int64_t) == 0,
                 "stage_buffer must contain aligned full dispatch payload rows");
 
@@ -950,6 +978,7 @@ DispatchState dispatch_main(PeerRuntime& runtime,
 std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool expand, bool with_weights, bool zero_padding) {
     TORCH_CHECK(state.metadata.size() == (state.metadata_prepared ? 9 : 5) && state.stage_buffer.is_cuda(),
                 "dispatch_epilogue requires a native dispatch state");
+    TORCH_CHECK(state.x_dtype == torch::kBFloat16, "dispatch output dtype must be bfloat16");
     c10::cuda::CUDAGuard guard(state.stage_buffer.device());
     if (!state.metadata_prepared) {
         const int64_t local_experts = state.metadata[0].numel();
@@ -1003,32 +1032,32 @@ std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool expand, 
     constexpr int warps_per_block = threads / 32;
     const int64_t blocks = (N + warps_per_block - 1) / warps_per_block;
 
-    AT_DISPATCH_FLOATING_TYPES_AND(at::ScalarType::BFloat16, state.x_dtype, "nano_ep::dispatch_copy_epilogue", [&] {
-        const auto launch = [&]<bool kExpand, bool kWithWeights>() {
-            dispatch_copy_epilogue_kernel<scalar_t, kExpand, kWithWeights>
-                <<<blocks, threads, 0, stream.stream()>>>(state.stage_buffer.data_ptr<uint8_t>(),
-                                                          state.metadata[2].data_ptr<int64_t>(),
-                                                          state.metadata[5].data_ptr<int64_t>(),
-                                                          x.data_ptr<scalar_t>(),
-                                                          kExpand ? nullptr : local_indices.data_ptr<int64_t>(),
-                                                          kWithWeights ? weights.data_ptr<float>() : nullptr,
-                                                          N,
-                                                          state.stage_buffer.size(1),
-                                                          H,
-                                                          K);
-        };
-        if (expand) {
-            if (with_weights)
-                launch.template operator()<true, true>();
-            else
-                launch.template operator()<true, false>();
-        } else {
-            if (with_weights)
-                launch.template operator()<false, true>();
-            else
-                launch.template operator()<false, false>();
-        }
-    });
+    using scalar_t = at::BFloat16;
+
+    const auto launch = [&]<bool kExpand, bool kWithWeights>() {
+        dispatch_copy_epilogue_kernel<scalar_t, kExpand, kWithWeights>
+            <<<blocks, threads, 0, stream.stream()>>>(state.stage_buffer.data_ptr<uint8_t>(),
+                                                      state.metadata[2].data_ptr<int64_t>(),
+                                                      state.metadata[5].data_ptr<int64_t>(),
+                                                      x.data_ptr<scalar_t>(),
+                                                      kExpand ? nullptr : local_indices.data_ptr<int64_t>(),
+                                                      kWithWeights ? weights.data_ptr<float>() : nullptr,
+                                                      N,
+                                                      state.stage_buffer.size(1),
+                                                      H,
+                                                      K);
+    };
+    if (expand) {
+        if (with_weights)
+            launch.template operator()<true, true>();
+        else
+            launch.template operator()<true, false>();
+    } else {
+        if (with_weights)
+            launch.template operator()<false, true>();
+        else
+            launch.template operator()<false, false>();
+    }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -1057,7 +1086,7 @@ torch::Tensor combine_main(PeerRuntime& runtime,
     TORCH_CHECK(metadata.size() == 9, "combine requires nine prepared metadata tensors from dispatch_epilogue");
     TORCH_CHECK(x.device() == window.device() && x.dim() == 2 && x.is_contiguous() && x.size(1) > 0,
                 "combine x must be contiguous CUDA [N,H] or [C,H] on the runtime device");
-    TORCH_CHECK(x.scalar_type() == torch::kFloat32 || x.scalar_type() == torch::kBFloat16, "combine x must be float32 or bfloat16");
+    TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "combine x must be bfloat16");
     TORCH_CHECK(metadata[8].dim() == 2 && metadata[3].dim() == 1 && metadata[3].numel() > 0,
                 "combine metadata requires a [T,K] source snapshot and [L] expert counts");
 
@@ -1126,7 +1155,7 @@ std::vector<torch::Tensor> combine_epilogue(const torch::Tensor& stage_buffer,
     TORCH_CHECK(source_topk_snapshot.device() == stage_buffer.device() && source_topk_snapshot.scalar_type() == torch::kInt64 &&
                     source_topk_snapshot.dim() == 2 && source_topk_snapshot.is_contiguous(),
                 "source_topk_snapshot must be contiguous CUDA int64 [T,K] on the stage_buffer device");
-    TORCH_CHECK(x_dtype == torch::kFloat32 || x_dtype == torch::kBFloat16, "combine output dtype must be float32 or bfloat16");
+    TORCH_CHECK(x_dtype == torch::kBFloat16, "combine output dtype must be bfloat16");
     TORCH_CHECK(world_size > 0 && world_size <= 32 && num_experts > 0 && num_experts % world_size == 0,
                 "combine requires world_size in [1,32] and positive num_experts divisible by world_size");
     const int64_t num_tokens = source_topk_snapshot.size(0);

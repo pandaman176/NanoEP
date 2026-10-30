@@ -30,8 +30,10 @@ def test_window_layout_binding_and_allocation(
     total = align(
         payload
         + max(
-            ranks * tokens * ((16 + 12 * topk + 4 * hidden + 15) // 16 * 16),
-            partitions * tokens * ((4 * hidden + 4 * topk + 15) // 16 * 16),
+            ranks * tokens * ((16 + 12 * topk + 2 * hidden + 15) // 16 * 16),
+            partitions
+            * tokens
+            * (((2 * hidden + 3) // 4 * 4 + 4 * topk + 15) // 16 * 16),
         )
     )
     assert layout == [0, 256, payload, returned, total]

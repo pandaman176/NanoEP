@@ -15,17 +15,17 @@ pytestmark = [pytest.mark.distributed]
 
 # name, layout, dtype, tokens, hidden, topk, pattern, iterations, async/cached
 PROFILES = [
-    ("compact-fp32", "compact", "fp32", 17, 128, 3, "mixed", 3, False),
+    ("compact-bf16", "compact", "bf16", 17, 128, 3, "mixed", 3, False),
     ("expanded-bf16", "expanded", "bf16", 17, 128, 3, "mixed", 3, False),
-    ("large-compact", "compact", "fp32", 256, 4096, 8, "mixed", 4, True),
+    ("large-compact", "compact", "bf16", 256, 4096, 8, "mixed", 4, True),
     ("large-expanded", "expanded", "bf16", 256, 7168, 8, "mixed", 8, True),
     ("skew-compact", "compact", "bf16", 129, 1024, 3, "skew", 16, True),
-    ("skew-expanded", "expanded", "fp32", 129, 1024, 3, "skew", 16, True),
-    ("empty-compact", "compact", "fp32", 0, 128, 3, "mixed", 4, True),
+    ("skew-expanded", "expanded", "bf16", 129, 1024, 3, "skew", 16, True),
+    ("empty-compact", "compact", "bf16", 0, 128, 3, "mixed", 4, True),
     ("empty-expanded", "expanded", "bf16", 0, 128, 3, "mixed", 4, True),
     ("masked-compact", "compact", "bf16", 33, 128, 3, "masked", 4, True),
-    ("masked-expanded", "expanded", "fp32", 33, 128, 3, "masked", 4, True),
-    ("uneven-compact", "compact", "fp32", 65, 1024, 3, "uneven", 8, True),
+    ("masked-expanded", "expanded", "bf16", 33, 128, 3, "masked", 4, True),
+    ("uneven-compact", "compact", "bf16", 65, 1024, 3, "uneven", 8, True),
     ("uneven-expanded", "expanded", "bf16", 65, 1024, 3, "uneven", 8, True),
 ]
 
