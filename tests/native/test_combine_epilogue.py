@@ -4,7 +4,11 @@ import pytest
 import torch
 from torch.utils import deterministic
 
-from nano_ep.backends._build import load_extension, prepare_combine_epilogue
+from nano_ep.backends._build import (
+    load_extension,
+    prepare_combine_epilogue,
+    prepare_combine_main,
+)
 from nano_ep.testing.native_combine import (
     assert_combined_output,
     expert_inputs,
@@ -379,6 +383,9 @@ def test_main_to_epilogue_self_reuses_window(native, dtype, expand, mode, weight
     combine_epilogue = prepare_combine_epilogue(
         case.hidden, case.topk, 1, case.num_experts, case.capacity
     ).combine_epilogue
+    combine_main_launcher = prepare_combine_main(
+        case.hidden, case.topk, 1, case.num_experts, case.capacity
+    ).launcher
     layout = native.window_layout(
         1, case.capacity, case.hidden, case.topk, case.num_experts, mode
     )
@@ -406,6 +413,7 @@ def test_main_to_epilogue_self_reuses_window(native, dtype, expand, mode, weight
                     case.capacity,
                     expand,
                     mode,
+                    launcher=combine_main_launcher,
                 )
                 outputs = combine_epilogue(
                     returned,

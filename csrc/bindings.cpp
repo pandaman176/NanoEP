@@ -61,15 +61,29 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         py::arg("cached_dst_slots") = py::none(),
         py::arg("allow_multiple_reduction") = false);
     module.def("dispatch_epilogue", &nano_ep::dispatch_epilogue);
-    module.def("combine_main",
-               &nano_ep::combine_main,
-               py::arg("runtime"),
-               py::arg("x"),
-               py::arg("metadata"),
-               py::arg("weights"),
-               py::arg("max_tokens"),
-               py::arg("expand"),
-               py::arg("allow_multiple_reduction"));
+    module.def(
+        "combine_main",
+        [](nano_ep::PeerRuntime& runtime,
+           const torch::Tensor& x,
+           const std::vector<torch::Tensor>& metadata,
+           const c10::optional<torch::Tensor>& weights,
+           int64_t max_tokens,
+           bool expand,
+           bool allow_multiple_reduction,
+           const py::capsule& launcher) {
+            if (!PyCapsule_IsValid(launcher.ptr(), "nano_ep.CombineMainSpecialization"))
+                throw py::value_error("expected a combine main specialization launcher");
+            const auto* specialization = static_cast<const nano_ep::CombineMainSpecialization*>(launcher.get_pointer());
+            return nano_ep::combine_main(runtime, x, metadata, weights, max_tokens, expand, allow_multiple_reduction, *specialization);
+        },
+        py::arg("runtime"),
+        py::arg("x"),
+        py::arg("metadata"),
+        py::arg("weights"),
+        py::arg("max_tokens"),
+        py::arg("expand"),
+        py::arg("allow_multiple_reduction"),
+        py::arg("launcher"));
     module.def(
         "window_layout",
         [](int ranks, int64_t tokens, int hidden, int topk, int64_t num_experts, bool allow_multiple_reduction) {

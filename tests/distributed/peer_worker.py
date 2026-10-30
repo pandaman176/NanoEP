@@ -10,7 +10,11 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from nano_ep.backends._build import load_extension, prepare_combine_epilogue
+from nano_ep.backends._build import (
+    load_extension,
+    prepare_combine_epilogue,
+    prepare_combine_main,
+)
 from nano_ep.testing.wire import dispatch_offsets, dispatch_row_bytes
 
 
@@ -585,6 +589,7 @@ def check_combine_main(native, rank):
     )
 
     combine_epilogue = prepare_combine_epilogue(256, 3, 2, 3, 5).combine_epilogue
+    combine_main_launcher = prepare_combine_main(256, 3, 2, 3, 5).launcher
     for mode in (False, True):
         layout = native.window_layout(2, 5, 256, 3, 6, mode)
         runtime = native.PeerRuntime(rank, 2, layout[-1])
@@ -613,6 +618,7 @@ def check_combine_main(native, rank):
                     case.capacity,
                     expand,
                     mode,
+                    launcher=combine_main_launcher,
                 )
                 assert_return_packets(returned, case, rank, expand, mode, weighted)
                 bias = (

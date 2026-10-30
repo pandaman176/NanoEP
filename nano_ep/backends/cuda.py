@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.distributed as dist
 
-from nano_ep.backends._build import invoke, load_extension, prepare_combine_epilogue
+from nano_ep.backends._build import invoke, load_extension, prepare_combine_epilogue, prepare_combine_main
 from nano_ep.config import EPConfig
 
 
@@ -93,6 +93,7 @@ class CudaBuffer:
         self._runtime = None
         self._dispatch_epilogue = None
         self._combine_epilogue = None
+        self._combine_main_module = None
         self._comm_stream = None
         self._closed = True
         if dist.get_backend(group) != "gloo":
@@ -173,6 +174,13 @@ class CudaBuffer:
                 config.num_experts // self._world_size,
                 config.num_max_tokens_per_rank,
             ).combine_epilogue
+            self._combine_main_module = prepare_combine_main(
+                config.hidden,
+                config.num_topk,
+                self._world_size,
+                config.num_experts // self._world_size,
+                config.num_max_tokens_per_rank,
+            )
             self._runtime = invoke(self._backend.PeerRuntime, self._rank, self._world_size, self._num_bytes)
             # All-one bytes represent int64 -1; recv_next and barrier signals stay zero.
             window = invoke(self._runtime.local_window)
@@ -451,6 +459,7 @@ class CudaBuffer:
                     self._config.num_max_tokens_per_rank,
                     handle.do_expand,
                     self._allow_multiple_reduction,
+                    self._combine_main_module.launcher,
                 )
                 outputs = invoke(
                     self._combine_epilogue,

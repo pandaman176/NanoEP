@@ -86,6 +86,7 @@ def combine_runtime(dispatch_runtime):
         return calls.outputs
 
     r.buffer._backend.combine_main = main
+    r.buffer._combine_main_module = SimpleNamespace(launcher=object())
     r.buffer._combine_epilogue = epilogue
     return SimpleNamespace(**vars(r), handle=handle, combine_calls=calls)
 
@@ -137,7 +138,16 @@ def test_combine_wires_native_reverse_path(
     )
     calls = r.combine_calls
     metadata = handle_metadata(r.handle)
-    assert calls.main == (r.buffer._runtime, x, metadata, weights, 5, expand, mode)
+    assert calls.main == (
+        r.buffer._runtime,
+        x,
+        metadata,
+        weights,
+        5,
+        expand,
+        mode,
+        r.buffer._combine_main_module.launcher,
+    )
     assert calls.epilogue == (
         calls.window,
         r.handle.topk_idx,

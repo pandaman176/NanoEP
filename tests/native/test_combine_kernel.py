@@ -1,6 +1,7 @@
 """Actual CUDA return code with logical peer windows on one physical GPU."""
 
 import os
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
@@ -28,28 +29,31 @@ def probe(request, tmp_path_factory):
     if not torch.cuda.is_available():
         pytest.fail("CUDA tests requested but NVIDIA CUDA is unavailable")
     source_dir = native_source_dir()
-    code = (source_dir / "pipeline.cu").read_text()
-    start = code.index(
-        "template <typename data_t, bool kExpand, bool kAllowMultipleReduction, bool kWithWeights>"
-    )
-    end = code.index("\n}  // namespace", start)
-    directory = tmp_path_factory.mktemp("combine-kernel")
-    # Compile the production kernel and launcher, with no duplicate implementation.
-    (directory / "combine_kernel_under_test.cuh").write_text(
-        '#include "layout.hpp"\nnamespace nano_ep {\n' + code[start:end] + "\n}\n"
-    )
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0")
-    return load(
-        name="nano_ep_combine_probe",
-        sources=[str(Path(__file__).with_name("combine_probe.cu"))],
-        extra_include_paths=[str(directory), str(source_dir)],
-        extra_cflags=["-O2", "-std=c++20"],
-        extra_cuda_cflags=["-O2", "-std=c++20"],
-    )
+
+    @lru_cache(maxsize=None)
+    def prepare(hidden, topk, ranks, capacity):
+        geometry = (hidden, topk, ranks, capacity)
+        defines = [
+            f"-DNANO_EP_{name}={value}"
+            for name, value in zip(
+                ("HIDDEN", "TOPK", "WORLD_SIZE", "MAX_TOKENS"), geometry, strict=True
+            )
+        ]
+        return load(
+            name="nano_ep_combine_probe_" + "_".join(map(str, geometry)),
+            sources=[str(Path(__file__).with_name("combine_probe.cu"))],
+            extra_include_paths=[str(source_dir)],
+            extra_cflags=["-O2", "-std=c++20"],
+            extra_cuda_cflags=["-O2", "-std=c++20", *defines],
+        )
+
+    return prepare
 
 
 def check_kernel(probe, case, expand, mode, weighted):
     ranks = len(case.indices)
+    probe = probe(case.hidden, case.topk, ranks, case.capacity)
     offset, total = probe.layout(ranks, case.capacity, case.hidden, case.topk, mode)
     partitions = min(ranks, case.topk) if mode else case.topk
     stride = return_row_bytes(case.hidden, case.topk)

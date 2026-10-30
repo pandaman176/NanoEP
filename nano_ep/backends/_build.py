@@ -61,5 +61,34 @@ def prepare_combine_epilogue(hidden: int, topk: int, world_size: int, experts_pe
     )
 
 
+@cache
+def prepare_combine_main(hidden: int, topk: int, world_size: int, experts_per_rank: int, max_tokens: int):
+    """Compile one geometry; CudaBuffer prewarms it before IPC collectives."""
+    from torch.utils.cpp_extension import load
+
+    if (
+        hidden <= 0
+        or hidden > 2**31 - 1
+        or hidden % 256
+        or not 1 <= topk <= 32
+        or not 1 <= world_size <= 32
+        or experts_per_rank <= 0
+        or max_tokens <= 0
+    ):
+        raise RuntimeError("invalid combine main geometry: H must be a positive multiple of 256, K/R in [1,32], L/Tmax positive")
+    source = native_source_dir()
+    geometry = (hidden, topk, world_size, experts_per_rank, max_tokens)
+    names = ("HIDDEN", "TOPK", "WORLD_SIZE", "EXPERTS_PER_RANK", "MAX_TOKENS")
+    defines = [f"-DNANO_EP_{name}={value}" for name, value in zip(names, geometry, strict=True)]
+    return load(
+        name="nano_ep_combine_main_" + "_".join(map(str, geometry)),
+        sources=[str(source / "combine_main.cu")],
+        extra_include_paths=[str(source / "include")],
+        extra_cflags=["-O2", "-std=c++20"],
+        extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo", *defines],
+        verbose=os.environ.get("NANO_EP_BUILD_VERBOSE") == "1",
+    )
+
+
 def invoke(function, *args):
     return function(*args)

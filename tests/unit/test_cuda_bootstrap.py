@@ -156,6 +156,13 @@ def bootstrap(monkeypatch):
         return SimpleNamespace(combine_epilogue=combine_epilogue)
 
     monkeypatch.setattr(cuda, "prepare_combine_epilogue", prepare)
+
+    def prepare_main(hidden, topk, ranks, experts_per_rank, capacity):
+        operation("main_specialization")
+        assert (hidden, topk, ranks, experts_per_rank, capacity) == (256, 2, 2, 2, 8)
+        return SimpleNamespace(launcher="main-launcher")
+
+    monkeypatch.setattr(cuda, "prepare_combine_main", prepare_main)
     monkeypatch.setattr(cuda.torch.cuda, "Stream", stream)
     monkeypatch.setattr(
         cuda.torch.cuda,
@@ -184,6 +191,7 @@ def bootstrap(monkeypatch):
                 )
                 assert buffer._dispatch_epilogue is dispatch_epilogue
                 assert buffer._combine_epilogue is combine_epilogue
+                assert buffer._combine_main_module.launcher == "main-launcher"
                 if close:
                     buffer.close()
                     buffer.close()
@@ -241,6 +249,7 @@ def test_bootstrap_and_collective_close(bootstrap, allow_multiple_reduction):
         "extension",
         "layout",
         "specialization",
+        "main_specialization",
         "allocate",
         "initialize",
         "window_ready",
@@ -260,6 +269,7 @@ def test_one_rank_failure_reaches_both_ranks(bootstrap, failure):
         "extension",
         "layout",
         "specialization",
+        "main_specialization",
         "allocate",
         "initialize",
         "window_ready",

@@ -6,7 +6,7 @@
 
 #include <cstdio>
 
-#include "combine_kernel_under_test.cuh"
+#include "combine_main.cuh"
 #include "layout.hpp"
 
 // Logical peers use distinct allocations on one physical GPU. This probe tests
@@ -26,8 +26,11 @@ void run_return_kernel(const std::vector<torch::Tensor>& windows,
     for (int peer = 0; peer < ranks; ++peer)
         addresses.data_ptr<int64_t>()[peer] = reinterpret_cast<int64_t>(windows[peer].data_ptr<uint8_t>());
     addresses = addresses.to(x.device());
-    nano_ep::launch_combine_return(
-        addresses, x, metadata, weights, rank, ranks, capacity, layout, expand, mode, c10::cuda::getCurrentCUDAStream().stream());
+    TORCH_CHECK(
+        x.size(1) == NANO_EP_HIDDEN && metadata[8].size(1) == NANO_EP_TOPK && ranks == NANO_EP_WORLD_SIZE && capacity == NANO_EP_MAX_TOKENS,
+        "probe inputs do not match the compiled geometry");
+    nano_ep::launch_combine_return<NANO_EP_HIDDEN, NANO_EP_TOPK, NANO_EP_WORLD_SIZE, NANO_EP_MAX_TOKENS>(
+        addresses, x, metadata, weights, rank, layout, expand, mode, c10::cuda::getCurrentCUDAStream().stream());
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {

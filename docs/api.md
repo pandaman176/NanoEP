@@ -75,4 +75,8 @@ The combine epilogue is compiled separately for `(H,K,R,experts_per_rank,Tmax)` 
 
 The kernel derives P from R/K/reduction mode and derives return-row bytes from H/K. It uses 16-byte int4 loads/stores, an unroll factor chosen from H at compile time, and ordered FP32 accumulation followed by one BF16 cast. Bias is added after the partial sums, and routing weights remain an independent FP32 payload. There is no hidden tail path. This does not implement TMA or guarantee equality with every DeepEP rounding recipe.
 
-Only combine epilogue specializes these geometry dimensions. Dispatch main, dispatch copy epilogue and combine main continue to use runtime dimensions; their existing boolean layout/reduction specializations are unchanged.
+Combine main also specializes `(H,K,R,experts_per_rank,Tmax)`. `CudaBuffer` prepares and retains its module before allocating/exporting IPC windows. The core extension keeps validation, runtime ownership and entry/exit barriers; it calls the compiled host launcher directly through a named capsule. Geometry mismatches fail before entering either barrier. `experts_per_rank` validates metadata geometry; the return kernel does not divide expert IDs.
+
+H/K/R/Tmax and the derived return-row stride are compile-time constants; actual N and input row capacity remain runtime values. The kernel retains scalar BF16 copies, ascending-K FP32 local reduction, 256-thread blocks and `ceil(N/8)` blocks. This change adds no vectorization, slot caching, single-assignment fast path, SM-sized main grid, barrier fusion, TMA or PDL. Dispatch main and dispatch copy epilogue still use runtime geometry.
+
+Low-level `native.combine_main(...)` now requires `launcher=prepare_combine_main(H,K,R,experts_per_rank,Tmax).launcher`. Keep the module alive while using the launcher and rebuild the core extension together with specialized modules. Public `CudaBuffer.combine` arguments and output layouts are unchanged.

@@ -5,7 +5,7 @@ from contextlib import contextmanager
 import pytest
 import torch
 
-from nano_ep.backends._build import load_extension
+from nano_ep.backends._build import load_extension, prepare_combine_main
 from nano_ep.testing.native_combine import (
     assert_return_packets,
     expert_inputs,
@@ -25,6 +25,11 @@ def native(request):
     if not torch.cuda.is_available():
         pytest.fail("CUDA tests requested but NVIDIA CUDA is unavailable")
     return load_extension()
+
+
+@pytest.fixture
+def launcher(native):
+    return prepare_combine_main(256, 3, 1, 3, 5).launcher
 
 
 @contextmanager
@@ -59,12 +64,36 @@ def empty_inputs(native, mode=False, dtype=torch.bfloat16, tokens=2):
 
 
 @pytest.mark.parametrize("hidden", [1, 33, 128, 255, 257])
-def test_combine_hidden_constraint_precedes_barrier(native, hidden):
+def test_combine_hidden_constraint_precedes_barrier(native, launcher, hidden):
     with empty_inputs(native) as (runtime, window, _, _, metadata):
         x = torch.empty((0, hidden), dtype=torch.bfloat16, device="cuda")
         before = window.clone()
         with pytest.raises(RuntimeError, match="multiple of 256"):
-            native.combine_main(runtime, x, metadata, None, 5, False, False)
+            native.combine_main(
+                runtime, x, metadata, None, 5, False, False, launcher=launcher
+            )
+        torch.testing.assert_close(window, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dimension,value", [(0, 512), (1, 2), (2, 2), (3, 4), (4, 6)])
+def test_compiled_geometry_mismatch_precedes_barrier(native, dimension, value):
+    geometry = [256, 3, 1, 3, 5]
+    geometry[dimension] = value
+    specialized = prepare_combine_main(*geometry)
+    assert specialized.geometry == tuple(geometry)
+    with empty_inputs(native) as (runtime, window, _, x, metadata):
+        before = window.clone()
+        with pytest.raises(RuntimeError, match="compiled geometry"):
+            native.combine_main(
+                runtime,
+                x,
+                metadata,
+                None,
+                5,
+                False,
+                False,
+                launcher=specialized.launcher,
+            )
         torch.testing.assert_close(window, before, rtol=0, atol=0)
 
 
@@ -74,7 +103,7 @@ def test_combine_hidden_constraint_precedes_barrier(native, hidden):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("tokens", [0, 2])
 def test_empty_combine_barriers_and_borrowed_return_view(
-    native, mode, expand, weighted, dtype, tokens
+    native, launcher, mode, expand, weighted, dtype, tokens
 ):
     with empty_inputs(native, mode, dtype, tokens) as (
         runtime,
@@ -90,7 +119,7 @@ def test_empty_combine_barriers_and_borrowed_return_view(
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             returned = native.combine_main(
-                runtime, x, metadata, weights, 5, expand, mode
+                runtime, x, metadata, weights, 5, expand, mode, launcher=launcher
             )
         stream.synchronize()
         partitions = 1 if mode else 3
@@ -101,7 +130,9 @@ def test_empty_combine_barriers_and_borrowed_return_view(
         assert torch.all(returned == 165).item()
         assert window[:8].view(torch.int64).item() == 2
         with torch.cuda.stream(stream):
-            replay = native.combine_main(runtime, x, metadata, weights, 5, expand, mode)
+            replay = native.combine_main(
+                runtime, x, metadata, weights, 5, expand, mode, launcher=launcher
+            )
         stream.synchronize()
         assert replay.data_ptr() == returned.data_ptr()
         assert window[:8].view(torch.int64).item() == 4
@@ -113,7 +144,9 @@ def test_empty_combine_barriers_and_borrowed_return_view(
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_nonempty_combine_self_return_packets(native, mode, expand, weighted, dtype):
+def test_nonempty_combine_self_return_packets(
+    native, launcher, mode, expand, weighted, dtype
+):
     case = make_return_case(1, 3, 256, dtype)
     layout = native.window_layout(
         1, case.capacity, case.hidden, case.topk, case.num_experts, mode
@@ -138,6 +171,7 @@ def test_nonempty_combine_self_return_packets(native, mode, expand, weighted, dt
                     case.capacity,
                     expand,
                     mode,
+                    launcher=launcher,
                 )
                 assert_return_packets(received, case, 0, expand, mode, weighted)
         stream.synchronize()
@@ -172,7 +206,7 @@ def test_nonempty_combine_self_return_packets(native, mode, expand, weighted, dt
         "window",
     ],
 )
-def test_invalid_combine_storage_precedes_barrier(native, kind):
+def test_invalid_combine_storage_precedes_barrier(native, launcher, kind):
     with empty_inputs(native) as (runtime, window, _, x, metadata):
         capacity, expand, weights = 5, False, None
         if kind == "metadata_count":
@@ -225,5 +259,14 @@ def test_invalid_combine_storage_precedes_barrier(native, kind):
             capacity = 500
         before = window.cpu().clone()
         with pytest.raises((RuntimeError, ValueError)):
-            native.combine_main(runtime, x, metadata, weights, capacity, expand, False)
+            native.combine_main(
+                runtime,
+                x,
+                metadata,
+                weights,
+                capacity,
+                expand,
+                False,
+                launcher=launcher,
+            )
         torch.testing.assert_close(window.cpu(), before, rtol=0, atol=0)

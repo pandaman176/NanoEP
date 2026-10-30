@@ -7,6 +7,21 @@ namespace nano_ep {
 
 struct WindowLayout;
 
+// Geometry-specific modules share this host launcher contract with the core
+// extension. Keep the module alive while its launcher is bound to a buffer.
+struct CombineMainSpecialization {
+    int64_t hidden, topk, world_size, experts_per_rank, max_tokens;
+    void (*launch)(const torch::Tensor& addresses,
+                   const torch::Tensor& x,
+                   const std::vector<torch::Tensor>& metadata,
+                   const c10::optional<torch::Tensor>& weights,
+                   int rank,
+                   const WindowLayout& layout,
+                   bool expand,
+                   bool allow_multiple_reduction,
+                   cudaStream_t stream);
+};
+
 // metadata tensors are on the caller's GPU. Fresh main returns five inputs:
 // expert_counts, expert_offsets, dst_slots, send_counts, source_topk_snapshot.
 // After the epilogue prepares receive metadata (and on cached states), it is:
@@ -108,12 +123,14 @@ std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool expand, 
 // capacity are handle preconditions. No routing scan or GPU scalar readback is
 // added. The device kernel asserts provenance and expanded-slot bounds. Empty
 // ranks still participate in both barriers and return the borrowed view.
+// The specialization must match H/K/R/E-per-rank/Tmax before either barrier.
 torch::Tensor combine_main(PeerRuntime& runtime,
                            const torch::Tensor& x,
                            const std::vector<torch::Tensor>& metadata,
                            const c10::optional<torch::Tensor>& weights,
                            int64_t max_tokens,
                            bool expand,
-                           bool allow_multiple_reduction);
+                           bool allow_multiple_reduction,
+                           const CombineMainSpecialization& specialization);
 
 }  // namespace nano_ep
