@@ -85,85 +85,88 @@ __global__ void combine_reduce_epilogue_kernel(const uint8_t* stage_buffer,  // 
     static_assert(kTopk > 0 && kTopk <= 32 && kWorldSize > 0 && kWorldSize <= 32);
     static_assert(kExpertsPerRank > 0 && kMaxTokens > 0);
 
-    // one warp owns one source token; lanes stride over hidden coordinates in int4 vectors.
+    // Each warp processes one source token per iteration; lanes stride over hidden coordinates in int4 vectors.
     const int lane = threadIdx.x % kWarpSize;
-    const int64_t row = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / kWarpSize;
-    if (row >= num_tokens)
-        return;
+    const int warp_idx = threadIdx.x / kWarpSize;
+    // Distribute the first tokens across blocks before assigning another warp to each block.
+    const int64_t global_warp_idx = static_cast<int64_t>(warp_idx) * gridDim.x + blockIdx.x;
+    const int64_t token_stride = static_cast<int64_t>(blockDim.x / kWarpSize) * gridDim.x;
 
-    // Expanded without local reduction reads each valid k partition. Otherwise
-    // deduplicate destination ranks, selecting rank or first-k partitions exactly
-    // as combine_return_kernel does. Never read unpublished rows or weight fields.
-    // Accumulate x in FP32, add optional bias once, then cast once to BF16.
-    // Restore valid weights independently at their original k; write masked zeros.
-    const int64_t expert = lane < kTopk ? source_topk[row * kTopk + lane] : -1;
-    const int destination = expert >= 0 ? static_cast<int>(expert / kExpertsPerRank) : -1;
-    int partitions[kNumPartitionsInLayout];
-    int weight_partition = -1;
-    if constexpr (kAllowMultipleReduction || !kExpand) {
-        const unsigned same_destination = __match_any_sync(0xffffffffu, destination);
-        const int first_k = __ffs(same_destination) - 1;
-        // finding all first valid k for each rank
-        const unsigned representatives = __ballot_sync(0xffffffffu, destination >= 0 && lane == first_k);
+    for (int64_t row = global_warp_idx; row < num_tokens; row += token_stride) {
+        // Expanded without local reduction reads each valid k partition. Otherwise
+        // deduplicate destination ranks, selecting rank or first-k partitions exactly
+        // as combine_return_kernel does. Never read unpublished rows or weight fields.
+        // Accumulate x in FP32, add optional bias once, then cast once to BF16.
+        // Restore valid weights independently at their original k; write masked zeros.
+        const int64_t expert = lane < kTopk ? source_topk[row * kTopk + lane] : -1;
+        const int destination = expert >= 0 ? static_cast<int>(expert / kExpertsPerRank) : -1;
+        int partitions[kNumPartitionsInLayout];
+        int weight_partition = -1;
+        if constexpr (kAllowMultipleReduction || !kExpand) {
+            const unsigned same_destination = __match_any_sync(0xffffffffu, destination);
+            const int first_k = __ffs(same_destination) - 1;
+            // finding all first valid k for each rank
+            const unsigned representatives = __ballot_sync(0xffffffffu, destination >= 0 && lane == first_k);
 
-        // Compute the slot indices for each partition.
-        compute_partition_slots(partitions, representatives, [=](int representative) {
-            const int owner = __shfl_sync(0xffffffffu, destination, representative);
-            return kRankLayout ? owner : representative;
-        });
-        weight_partition = destination >= 0 ? (kRankLayout ? destination : first_k) : -1;
-    } else {
-        // kExpand && !kAllowMultipleReduction: [K,Tmax] layout.
-        // finding all valid k
-        const unsigned valid_ks = __ballot_sync(0xffffffffu, expert >= 0);
-        compute_partition_slots(partitions, valid_ks, [](int k) { return k; });
-        weight_partition = expert >= 0 ? lane : -1;
-    }
+            // Compute the slot indices for each partition.
+            compute_partition_slots(partitions, representatives, [=](int representative) {
+                const int owner = __shfl_sync(0xffffffffu, destination, representative);
+                return kRankLayout ? owner : representative;
+            });
+            weight_partition = destination >= 0 ? (kRankLayout ? destination : first_k) : -1;
+        } else {
+            // kExpand && !kAllowMultipleReduction: [K,Tmax] layout.
+            // finding all valid k
+            const unsigned valid_ks = __ballot_sync(0xffffffffu, expert >= 0);
+            compute_partition_slots(partitions, valid_ks, [](int k) { return k; });
+            weight_partition = expert >= 0 ? lane : -1;
+        }
 
-    // Restore weights once, outside the hidden-coordinate loop.
-    if constexpr (kWithWeights) {
-        restore_weights(stage_buffer, combined_weights, lane, weight_partition, row, kHidden, kTopk, kMaxTokens, kReturnRowBytes);
-    }
+        // Restore weights once, outside the hidden-coordinate loop.
+        if constexpr (kWithWeights) {
+            restore_weights(stage_buffer, combined_weights, lane, weight_partition, row, kHidden, kTopk, kMaxTokens, kReturnRowBytes);
+        }
 
-    // Each int4 covers eight BF16 coordinates; H % 256 == 0 leaves no hidden tail.
-    auto* output_vectors = reinterpret_cast<int4*>(combined_x + row * kHidden);
-    for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
-        float2 accum[kUnrollFactor][kElemsPerVector / 2] = {};
+        // Each int4 covers eight BF16 coordinates; H % 256 == 0 leaves no hidden tail.
+        auto* output_vectors = reinterpret_cast<int4*>(combined_x + row * kHidden);
+        for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
+            float2 accum[kUnrollFactor][kElemsPerVector / 2] = {};
 #pragma unroll
-        for (int p = 0; p < kNumPartitionsInLayout; ++p) {
-            const int partition = partitions[p];
-            if (partition < 0)
-                break;
-            const auto* record = stage_buffer + (partition * kMaxTokens + row) * kReturnRowBytes;
-            const auto* input_vectors = reinterpret_cast<const int4*>(record);
+            for (int p = 0; p < kNumPartitionsInLayout; ++p) {
+                const int partition = partitions[p];
+                if (partition < 0)
+                    break;
+                const auto* record = stage_buffer + (partition * kMaxTokens + row) * kReturnRowBytes;
+                const auto* input_vectors = reinterpret_cast<const int4*>(record);
+#pragma unroll
+                for (int u = 0; u < kUnrollFactor; ++u) {
+                    const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
+                    // Load 16bytes, treated as 8 2byte bits: value.bits[0..7]
+                    const auto value = cuda::std::bit_cast<PackedBf16>(input_vectors[index]);
+#pragma unroll
+                    for (int j = 0; j < kElemsPerVector / 2; ++j) {
+                        accum[u][j].x += __bfloat162float(__ushort_as_bfloat16(value.bits[2 * j]));
+                        accum[u][j].y += __bfloat162float(__ushort_as_bfloat16(value.bits[2 * j + 1]));
+                    }
+                }
+            }
 #pragma unroll
             for (int u = 0; u < kUnrollFactor; ++u) {
                 const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
-                // Load 16bytes, treated as 8 2byte bits: value.bits[0..7]
-                const auto value = cuda::std::bit_cast<PackedBf16>(input_vectors[index]);
+                PackedBf16 value;
 #pragma unroll
                 for (int j = 0; j < kElemsPerVector / 2; ++j) {
-                    accum[u][j].x += __bfloat162float(__ushort_as_bfloat16(value.bits[2 * j]));
-                    accum[u][j].y += __bfloat162float(__ushort_as_bfloat16(value.bits[2 * j + 1]));
+                    if (bias != nullptr) {
+                        const int64_t h = row * kHidden + index * kElemsPerVector + j * 2;
+                        accum[u][j].x += __bfloat162float(bias[h]);
+                        accum[u][j].y += __bfloat162float(bias[h + 1]);
+                    }
+                    const auto rounded = __float22bfloat162_rn(accum[u][j]);
+                    value.bits[2 * j] = __bfloat16_as_ushort(__low2bfloat16(rounded));
+                    value.bits[2 * j + 1] = __bfloat16_as_ushort(__high2bfloat16(rounded));
                 }
+                output_vectors[index] = cuda::std::bit_cast<int4>(value);
             }
-        }
-#pragma unroll
-        for (int u = 0; u < kUnrollFactor; ++u) {
-            const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
-            PackedBf16 value;
-#pragma unroll
-            for (int j = 0; j < kElemsPerVector / 2; ++j) {
-                if (bias != nullptr) {
-                    const int64_t h = row * kHidden + index * kElemsPerVector + j * 2;
-                    accum[u][j].x += __bfloat162float(bias[h]);
-                    accum[u][j].y += __bfloat162float(bias[h + 1]);
-                }
-                const auto rounded = __float22bfloat162_rn(accum[u][j]);
-                value.bits[2 * j] = __bfloat16_as_ushort(__low2bfloat16(rounded));
-                value.bits[2 * j + 1] = __bfloat16_as_ushort(__high2bfloat16(rounded));
-            }
-            output_vectors[index] = cuda::std::bit_cast<int4>(value);
         }
     }
 }

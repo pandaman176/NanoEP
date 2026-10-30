@@ -1,3 +1,4 @@
+#include <ATen/cuda/CUDAContextLight.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -74,7 +75,7 @@ static std::vector<torch::Tensor> combine_epilogue(const torch::Tensor& stage_bu
 
     if (num_tokens != 0) {
         constexpr int threads = 256;
-        const int64_t blocks = (num_tokens + threads / 32 - 1) / (threads / 32);
+        const int blocks = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
         const auto launch = [&]<bool kExpand, bool kMultiple, bool kWeights>() {
             combine_reduce_epilogue_kernel<NANO_EP_HIDDEN,
                                            NANO_EP_TOPK,

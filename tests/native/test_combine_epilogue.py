@@ -303,6 +303,41 @@ def test_source_reduction_edges(
 
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("mode", [False, True])
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize(
+    "boundary", ["sm", "wave_minus_one", "wave", "wave_plus_one", "multiple_waves"]
+)
+def test_source_reduction_across_sm_grid_iterations(
+    cuda_device, expand, mode, weighted, boundary
+):
+    sms = torch.cuda.get_device_properties(cuda_device).multi_processor_count
+    wave = sms * 8
+    counts = {
+        "sm": sms + 1,
+        "wave_minus_one": wave - 1,
+        "wave": wave,
+        "wave_plus_one": wave + 1,
+        "multiple_waves": 2 * wave + 17,
+    }
+    tokens = counts[boundary]
+    case = make_return_case(2, 3, 256, torch.bfloat16, tokens=tokens)
+    case.capacity = 2 * wave + 23
+    source = 1
+    # Vary routing between iterations so a warp must refresh masks and partitions.
+    for start in range(wave, tokens, wave):
+        routing = case.indices[source][start : start + wave]
+        routing.copy_(routing.roll(shifts=start // wave, dims=0))
+    masked = case.indices[source] < 0
+    case.values[source][masked] = float("nan")
+    case.weights[source][masked] = float("nan")
+    bias = (
+        (torch.arange(tokens * case.hidden).reshape(tokens, case.hidden) % 17 - 8) / 8
+    ).bfloat16()
+    check_epilogue(case, source, expand, mode, weighted, bias)
+
+
+@pytest.mark.parametrize("expand", [False, True])
+@pytest.mark.parametrize("mode", [False, True])
 def test_fp32_accumulation_and_bias_before_final_cast(expand, mode):
     case = make_return_case(3, 3, 256, torch.bfloat16, tokens=1)
     case.capacity += 3
