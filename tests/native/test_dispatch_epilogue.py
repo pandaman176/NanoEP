@@ -141,7 +141,7 @@ def check_fresh_and_cached(
         )
         outputs = epilogues[False](state, expand, weighted, zero_padding)
         assert_dispatch_state(
-            state, case, 0, alignment, case.weights if weighted else None
+            state, case, 0, alignment, case.weights if weighted else None, expand=expand
         )
         assert_dispatch_output(
             state,
@@ -390,7 +390,9 @@ def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighte
                 cached,
             )
             outputs = epilogues[replay](state, expand, weighted, expand)
-            assert_dispatch_state(state, case, 0, 4, case.weights if weighted else None)
+            assert_dispatch_state(
+                state, case, 0, 4, case.weights if weighted else None, expand=expand
+            )
             assert_dispatch_output(
                 state,
                 outputs,
@@ -533,8 +535,8 @@ def test_wrong_jit_cache_mode_preserves_state(native, prepared):
 
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("topk", [3, 32])
-@pytest.mark.parametrize("tokens", [1, 257])
-def test_prepared_state_switches_layout_without_reserving_again(
+@pytest.mark.parametrize("tokens", [0, 1, 257])
+def test_prepared_state_retains_layout_without_reserving_again(
     native, expand, topk, tokens
 ):
     hidden, alignment = 256, 128
@@ -571,7 +573,7 @@ def test_prepared_state_switches_layout_without_reserving_again(
         assert not state.metadata_prepared
         initial_offsets = state.metadata[1].clone()
         outputs = epilogues[False](state, expand, True, True)
-        assert_dispatch_state(state, case, 0, alignment, case.weights)
+        assert_dispatch_state(state, case, 0, alignment, case.weights, expand=expand)
         assert_dispatch_output(
             state,
             outputs,
@@ -586,8 +588,7 @@ def test_prepared_state_switches_layout_without_reserving_again(
         pointers = [tensor.data_ptr() for tensor in state.metadata]
         saved_outputs = [tensor.clone() for tensor in outputs]
 
-        # Both layouts must retain the full mapping, including slots not used by compact copy.
-        replay_outputs = epilogues[True](state, not expand, False, True)
+        replay_outputs = epilogues[True](state, expand, False, True)
         assert_dispatch_output(
             state,
             replay_outputs,
@@ -595,9 +596,11 @@ def test_prepared_state_switches_layout_without_reserving_again(
             0,
             alignment,
             None,
-            expand=not expand,
+            expand=expand,
             zero_padding=True,
         )
+        with pytest.raises(RuntimeError, match="retain the handle layout"):
+            epilogues[True](state, not expand, False, True)
         assert [tensor.data_ptr() for tensor in state.metadata] == pointers
         for actual, expected in zip(state.metadata, saved, strict=True):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)

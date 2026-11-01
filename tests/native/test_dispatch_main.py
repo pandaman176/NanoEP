@@ -89,7 +89,7 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
         pointers = [tensor.data_ptr() for tensor in state.metadata]
         prepare_dispatch_metadata(state)
         assert [tensor.data_ptr() for tensor in state.metadata] == pointers
-        assert_dispatch_state(state, case, 0, alignment, case.weights)
+        assert_dispatch_state(state, case, 0, alignment, case.weights, expand=False)
         torch.testing.assert_close(x.cpu(), case.xs[0])
         torch.testing.assert_close(indices.cpu(), case.indices[0])
         torch.testing.assert_close(weights.cpu(), case.weights[0])
@@ -105,7 +105,7 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
             runtime, x, masked.indices[0].cuda(), None, 3, 5, 1, []
         )
         prepare_dispatch_metadata(fresh)
-        assert_dispatch_state(fresh, masked, 0, 1, None)
+        assert_dispatch_state(fresh, masked, 0, 1, None, expand=False)
         assert (
             runtime.local_window()[layout[1] + 32 : layout[1] + 40]
             .view(torch.int64)
@@ -119,7 +119,7 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
         )
         assert replay.metadata_prepared
         prepare_dispatch_metadata(replay)
-        assert_dispatch_state(replay, replay_case, 0, alignment, None)
+        assert_dispatch_state(replay, replay_case, 0, alignment, None, expand=False)
         for before, after, saved in zip(
             state.metadata, replay.metadata, saved_metadata, strict=True
         ):
@@ -137,7 +137,9 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
             runtime, x * 3, indices, weights * 4, 3, 5, alignment, state.metadata
         )
         prepare_dispatch_metadata(replay)
-        assert_dispatch_state(replay, replay_case, 0, alignment, replay_case.weights)
+        assert_dispatch_state(
+            replay, replay_case, 0, alignment, replay_case.weights, expand=False
+        )
         # Metadata from the intervening fresh call must survive subsequent writes.
         torch.testing.assert_close(fresh.metadata[8].cpu(), masked.indices[0])
 
@@ -152,7 +154,7 @@ def test_nonfinite_payload_is_preserved(native, runtime, dtype):
         runtime, case.xs[0].cuda(), case.indices[0].cuda(), None, 3, 5, 4, []
     )
     prepare_dispatch_metadata(state)
-    assert_dispatch_state(state, case, 0, 4, None)
+    assert_dispatch_state(state, case, 0, 4, None, expand=False)
 
 
 @pytest.mark.parametrize(
@@ -177,6 +179,7 @@ def test_nonfinite_payload_is_preserved(native, runtime, dtype):
         "window",
         "cache_length",
         "cache_shape",
+        "cache_slots",
         "cache_unprepared",
     ],
 )
@@ -226,11 +229,13 @@ def test_invalid_input_precedes_communication(native, runtime, kind):
         state = native.dispatch_main(
             runtime, x, indices, weights, experts, capacity, alignment, []
         )
-        if kind == "cache_shape":
+        if kind in ("cache_shape", "cache_slots"):
             prepare_dispatch_metadata(state)
         cached = state.metadata
         if kind == "cache_shape":
             cached[6] = torch.zeros((2, 2), device="cuda", dtype=torch.int64)
+        elif kind == "cache_slots":
+            cached[5] = torch.zeros(1, device="cuda", dtype=torch.int64)
     before = runtime.local_window().cpu().clone()
     with pytest.raises((RuntimeError, ValueError)):
         native.dispatch_main(

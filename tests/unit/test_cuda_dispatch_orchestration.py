@@ -141,7 +141,8 @@ def dispatch_runtime(monkeypatch):
                 counts,
                 offsets,
                 integers(
-                    "expanded_slots", [[0, alignment, -1], [-1, -1, 2 * alignment]]
+                    "expanded_slots",
+                    [[0, alignment, -1], [-1, -1, 2 * alignment]] if expand else [],
                 ),
                 dst,
                 sends,
@@ -240,6 +241,7 @@ def test_fresh_dispatch_wires_state_and_streams(
     expand = layout is True
     assert call.state.epilogue_args == (expand, weighted, True)
     metadata = call.state.metadata
+    assert metadata[5].shape == ((2, 3) if expand else (0,))
     h = got.handle
     assert h.owner is r.buffer and h.config == r.buffer._config
     assert (h.rank, h.world_size, h.x_dtype, h.do_expand, h.alignment) == (

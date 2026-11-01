@@ -41,17 +41,22 @@ static std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool e
     const int64_t C = counts[1];
 
     c10::cuda::CUDAGuard guard(state.stage_buffer.device());
+    if constexpr (kCachedMode) {
+        TORCH_CHECK(state.metadata[5].dim() == (expand ? 2 : 1), "cached dispatch must retain the handle layout");
+    }
     if constexpr (!kCachedMode) {
         const auto options = state.metadata[0].options();
-        std::vector<torch::Tensor> receive = {
-            torch::empty({N}, options), torch::empty({N}, options), torch::empty({N, kTopk}, options), torch::empty({N, kTopk}, options)};
+        std::vector<torch::Tensor> receive = {torch::empty({N}, options),
+                                              torch::empty({N}, options),
+                                              torch::empty({N, kTopk}, options),
+                                              expand ? torch::empty({N, kTopk}, options) : torch::empty({0}, options)};
         state.metadata = {
             receive[0],         // src_ranks
             receive[1],         // src_tokens
             receive[2],         // local_topk_idx
             state.metadata[0],  // expert_counts
             state.metadata[1],  // expert_offsets
-            receive[3],         // expanded_slots
+            receive[3],         // expanded_slots [N,K], compact [0]
             state.metadata[2],  // dst_slots
             state.metadata[3],  // send_counts
             state.metadata[4],  // source_topk_snapshot
@@ -74,10 +79,12 @@ static std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool e
     }
 
     const auto stream = c10::cuda::getCurrentCUDAStream();
-    // Private cursors preserve the immutable padded offsets used by cached replay.
+    // Expanded reservation uses private cursors, preserving immutable padded offsets.
     torch::Tensor expert_cursor;
-    if constexpr (!kCachedMode)
-        expert_cursor = state.metadata[4].narrow(0, 0, kExpertsPerRank).clone();
+    if constexpr (!kCachedMode) {
+        if (expand)
+            expert_cursor = state.metadata[4].narrow(0, 0, kExpertsPerRank).clone();
+    }
 
     constexpr int threads = 256;
     const int blocks = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
@@ -89,8 +96,8 @@ static std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool e
                 kCachedMode ? nullptr : state.metadata[0].data_ptr<int64_t>(),
                 kCachedMode ? nullptr : state.metadata[1].data_ptr<int64_t>(),
                 state.metadata[2].data_ptr<int64_t>(),
-                state.metadata[5].data_ptr<int64_t>(),
-                kCachedMode ? nullptr : reinterpret_cast<unsigned long long*>(expert_cursor.data_ptr<int64_t>()),
+                kExpand ? state.metadata[5].data_ptr<int64_t>() : nullptr,
+                (kCachedMode || !kExpand) ? nullptr : reinterpret_cast<unsigned long long*>(expert_cursor.data_ptr<int64_t>()),
                 state.metadata[3].data_ptr<int64_t>(),
                 state.metadata[4].data_ptr<int64_t>(),
                 x.data_ptr<at::BFloat16>(),

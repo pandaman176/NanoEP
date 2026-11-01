@@ -33,7 +33,7 @@ def launcher(native):
 
 
 @contextmanager
-def empty_inputs(native, mode=False, dtype=torch.bfloat16, tokens=2):
+def empty_inputs(native, mode=False, dtype=torch.bfloat16, tokens=2, *, expand=False):
     # A source may have tokens while receiving no assignments at all.
     capacity, hidden, topk, experts = 5, 256, 3, 3
     layout = native.window_layout(1, capacity, hidden, topk, experts, mode)
@@ -46,7 +46,7 @@ def empty_inputs(native, mode=False, dtype=torch.bfloat16, tokens=2):
         torch.empty((0, topk), dtype=torch.int64, device="cuda"),
         torch.zeros(experts, dtype=torch.int64, device="cuda"),
         torch.zeros(experts + 1, dtype=torch.int64, device="cuda"),
-        torch.empty((0, topk), dtype=torch.int64, device="cuda"),
+        torch.empty((0, topk) if expand else (0,), dtype=torch.int64, device="cuda"),
         torch.full((tokens, 1), -1, dtype=torch.int64, device="cuda"),
         torch.zeros(1, dtype=torch.int64, device="cuda"),
         torch.full((tokens, topk), -1, dtype=torch.int64, device="cuda"),
@@ -136,7 +136,7 @@ def test_compiled_geometry_mismatch_precedes_barrier(native, dimension, value):
 def test_empty_combine_barriers_and_borrowed_return_view(
     native, launcher, mode, expand, weighted, dtype, tokens
 ):
-    with empty_inputs(native, mode, dtype, tokens) as (
+    with empty_inputs(native, mode, dtype, tokens, expand=expand) as (
         runtime,
         window,
         layout,
@@ -264,6 +264,8 @@ def test_nonempty_combine_self_return_packets(
         "x_stride",
         "compact_rows",
         "expanded_rows",
+        "compact_slots",
+        "expanded_slots",
         "weight_dtype",
         "weight_device",
         "weight_shape",
@@ -305,6 +307,12 @@ def test_invalid_combine_storage_precedes_barrier(native, launcher, kind):
         elif kind in ("compact_rows", "expanded_rows"):
             x = torch.empty((1, 256), dtype=torch.bfloat16, device="cuda")
             expand = kind == "expanded_rows"
+            if expand:
+                metadata[5] = torch.empty((0, 3), dtype=torch.int64, device="cuda")
+        elif kind == "compact_slots":
+            metadata[5] = torch.empty((0, 3), dtype=torch.int64, device="cuda")
+        elif kind == "expanded_slots":
+            expand = True
         elif kind == "weight_dtype":
             weights = torch.empty((0, 3), dtype=torch.float64, device="cuda")
         elif kind == "weight_device":

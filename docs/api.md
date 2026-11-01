@@ -23,7 +23,9 @@ Compact output has `x[N,H]`, local `topk_idx[N,K]`, and optional weights `[N,K]`
 
 Expanded output has expert-major `x[C,H]`, `topk_idx=None`, and optional weights `[C]`. `C` includes per-expert alignment gaps. Padding is only initialized when `zero_padding=True`; otherwise do not read it. Receive order is unspecified.
 
-`received.handle.layout` contains CUDA int64 `src_ranks[N]`, `src_tokens[N]`, `local_topk_idx[N,K]`, `expert_counts[L]`, `expert_offsets[L+1]` and `expanded_slots[N,K]`, where `L=E/R`. Counts describe actual assignments; offsets include alignment. Invalid expanded slots are `-1`. Metadata rows remain rank-deduplicated in both layouts.
+`received.handle.layout` contains CUDA int64 `src_ranks[N]`, `src_tokens[N]`, `local_topk_idx[N,K]`, `expert_counts[L]`, `expert_offsets[L+1]` and `expanded_slots`, where `L=E/R`. Counts describe actual assignments; offsets include alignment. Expanded slots have shape `[N,K]`, with invalid entries set to `-1`; compact slots have shape `[0]`. Metadata rows remain rank-deduplicated in both layouts.
+
+Compact dispatch skips expanded slot allocation and expert cursor reservation. Code that inspected a compact handle's previous `[N,K]` expanded mapping must adapt to `[0]`. Prepared native states, including empty states, must retain their original compact/expanded layout on replay. Rebuild native core and epilogue modules together and restart the process.
 
 ## Cached routing
 
@@ -124,7 +126,7 @@ x, indices, weights = module.dispatch_epilogue(state, expand, with_weights, zero
 The old core `native.dispatch_epilogue` entry and all standalone
 `build_receive_metadata` entries are removed. Geometry mismatches fail before metadata preparation. Rebuild the
 core extension and restart the process; public `CudaBuffer.dispatch` arguments,
-wire layout, metadata snapshots and output ownership are unchanged. The internal
+wire layout, metadata ordering and output ownership are unchanged. The internal
 factory now requires keyword-only `cached_mode`; a mode mismatch is rejected
 before state mutation. Repeated epilogue calls on a prepared state use the
 cached module, including states originally created by a fresh dispatch.

@@ -367,7 +367,10 @@ DispatchState dispatch_main(PeerRuntime& runtime,
         check_cached_tensor(cached_meta_data[2], x, {recv_count, num_topk}, "local_topk_idx");
         check_cached_tensor(cached_meta_data[3], x, {local_experts}, "expert_counts");
         check_cached_tensor(cached_meta_data[4], x, {local_experts + 1}, "expert_offsets");
-        check_cached_tensor(cached_meta_data[5], x, {recv_count, num_topk}, "expanded_slots");
+        if (cached_meta_data[5].dim() == 1)
+            check_cached_tensor(cached_meta_data[5], x, {0}, "expanded_slots");
+        else
+            check_cached_tensor(cached_meta_data[5], x, {recv_count, num_topk}, "expanded_slots");
         check_cached_tensor(cached_meta_data[6], x, {x.size(0), world_size}, "dst_slots");
         check_cached_tensor(cached_meta_data[7], x, {world_size}, "send_counts");
     }
@@ -461,7 +464,7 @@ torch::Tensor combine_main(PeerRuntime& runtime,
     // metadata[2]  local_topk_idx      [N,K]
     // metadata[3]  expert_counts       [L]
     // metadata[4]  expert_offsets      [L+1]
-    // metadata[5]  expanded_slots      [N,K]
+    // metadata[5]  expanded_slots      expanded [N,K], compact [0]
     // metadata[6]  dst_slots           [T,R]
     // metadata[7]  send_counts         [R]
     // metadata[8]  source_topk_snapshot [T,K]
@@ -495,7 +498,10 @@ torch::Tensor combine_main(PeerRuntime& runtime,
     check_cached_tensor(metadata[2], x, {recv_count, num_topk}, "local_topk_idx");
     check_cached_tensor(metadata[3], x, {local_experts}, "expert_counts");
     check_cached_tensor(metadata[4], x, {local_experts + 1}, "expert_offsets");
-    check_cached_tensor(metadata[5], x, {recv_count, num_topk}, "expanded_slots");
+    if (expand)
+        check_cached_tensor(metadata[5], x, {recv_count, num_topk}, "expanded_slots");
+    else
+        check_cached_tensor(metadata[5], x, {0}, "expanded_slots");
     check_cached_tensor(metadata[6], x, {source_tokens, world_size}, "dst_slots");
     check_cached_tensor(metadata[7], x, {world_size}, "send_counts");
     check_cached_tensor(metadata[8], x, {source_tokens, num_topk}, "source_topk_snapshot");

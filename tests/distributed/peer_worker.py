@@ -504,7 +504,7 @@ def check_dispatch_main(native, rank):
             state = native.dispatch_main(runtime, x, indices, weights, 6, 5, 4, [])
             assert not state.metadata_prepared and state.rank == rank
             prepare_dispatch_metadata(state)
-            assert_dispatch_state(state, case, rank, 4, case.weights)
+            assert_dispatch_state(state, case, rank, 4, case.weights, expand=False)
             check_copy(state, case, case.weights)
             indices.fill_(99)
             torch.testing.assert_close(state.metadata[8].cpu(), case.indices[rank])
@@ -518,7 +518,7 @@ def check_dispatch_main(native, rank):
                 runtime, x, masked.indices[rank].cuda(), None, 6, 5, 1, []
             )
             prepare_dispatch_metadata(fresh)
-            assert_dispatch_state(fresh, masked, rank, 1, None)
+            assert_dispatch_state(fresh, masked, rank, 1, None, expand=False)
             check_copy(fresh, masked, None, alignment=1)
             replay_case = replace(case, xs=[x * 2 for x in case.xs])
             replay = native.dispatch_main(
@@ -526,7 +526,7 @@ def check_dispatch_main(native, rank):
             )
             assert replay.metadata_prepared
             prepare_dispatch_metadata(replay)
-            assert_dispatch_state(replay, replay_case, rank, 4, None)
+            assert_dispatch_state(replay, replay_case, rank, 4, None, expand=False)
             check_copy(replay, replay_case, None)
             replay_case = replace(
                 case, xs=[x * 3 for x in case.xs], weights=[w * 4 for w in case.weights]
@@ -535,7 +535,9 @@ def check_dispatch_main(native, rank):
                 runtime, x * 3, indices, weights * 4, 6, 5, 4, state.metadata
             )
             prepare_dispatch_metadata(replay)
-            assert_dispatch_state(replay, replay_case, rank, 4, replay_case.weights)
+            assert_dispatch_state(
+                replay, replay_case, rank, 4, replay_case.weights, expand=False
+            )
             check_copy(replay, replay_case, replay_case.weights)
             for actual, expected in zip(replay.metadata, saved_metadata, strict=True):
                 torch.testing.assert_close(actual.cpu(), expected)

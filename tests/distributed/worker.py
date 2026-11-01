@@ -66,6 +66,7 @@ def assert_dispatch(got, expected, config, rank):
         layout.expert_offsets.cpu(), expected.layout.expert_offsets
     )
     if not got.handle.do_expand:
+        assert layout.expanded_slots.shape == (0,)
         torch.testing.assert_close(got.x[perm].cpu(), expected.x, rtol=0, atol=0)
         torch.testing.assert_close(got.topk_idx[perm].cpu(), expected.topk_idx)
         torch.testing.assert_close(got.topk_weights[perm].cpu(), expected.topk_weights)

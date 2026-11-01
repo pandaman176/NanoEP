@@ -28,7 +28,7 @@ struct ReceiveAssignment {
 
 // Each lane retains its assignment for immediate payload copying. The stored
 // metadata owns the mapping used by combine and subsequent cached dispatches.
-template <int kTopk, int kExpertsPerRank>
+template <int kTopk, int kExpertsPerRank, bool kExpand>
 __device__ __forceinline__ ReceiveAssignment build_receive_metadata_row(const uint8_t* payload,
                                                                         int64_t* src_ranks,
                                                                         int64_t* src_tokens,
@@ -64,12 +64,14 @@ __device__ __forceinline__ ReceiveAssignment build_receive_metadata_row(const ui
     int64_t slot = -1;
     if (lane < kTopk) {
         const int64_t index = row * kTopk + lane;
-        if (in_range) {
-            // Each expert owns a disjoint segment; only its cursor needs an atomic update.
-            slot = static_cast<int64_t>(atomicAdd(expert_cursor + local_expert, 1ULL));
-        }
         local_topk_idx[index] = local_expert;
-        expanded_slots[index] = slot;
+        if constexpr (kExpand) {
+            if (in_range) {
+                // Each expert owns a disjoint segment; only its cursor needs an atomic update.
+                slot = static_cast<int64_t>(atomicAdd(expert_cursor + local_expert, 1ULL));
+            }
+            expanded_slots[index] = slot;
+        }
     }
     return {local_expert, slot};
 }
@@ -128,8 +130,8 @@ __global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,      
                                               int64_t* src_ranks,                 // [N], written only in fresh mode
                                               int64_t* src_tokens,                // [N], written only in fresh mode
                                               int64_t* local_topk_idx,            // [N,K]
-                                              int64_t* expanded_slots,            // [N,K], invalid = -1
-                                              unsigned long long* expert_cursor,  // [L], fresh mode only
+                                              int64_t* expanded_slots,            // expanded [N,K], compact nullptr
+                                              unsigned long long* expert_cursor,  // [L], fresh expanded mode only
                                               const int64_t* expert_counts,       // [L], actual assignment counts
                                               const int64_t* expert_offsets,      // [L+1], padded offsets
                                               at::BFloat16* recv_x,               // compact [N,H], expanded [C,H]
@@ -169,7 +171,7 @@ __global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,      
                     assignment.local_expert = local_topk_idx[row * kTopk + lane];
             }
         } else {
-            assignment = build_receive_metadata_row<kTopk, kExpertsPerRank>(
+            assignment = build_receive_metadata_row<kTopk, kExpertsPerRank, kExpand>(
                 payload, src_ranks, src_tokens, local_topk_idx, expanded_slots, expert_cursor, row, rank, lane);
         }
 

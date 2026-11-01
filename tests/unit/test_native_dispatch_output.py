@@ -42,7 +42,7 @@ def reordered_output(
             local,
             layout.expert_counts,
             layout.expert_offsets,
-            slots,
+            slots if expand else torch.empty(0, dtype=torch.int64),
         ],
     )
     out_weights = torch.empty(0, dtype=torch.float32)
@@ -96,14 +96,22 @@ def test_output_checker_accepts_reordered_assignments(
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize(
     "corruption",
-    ["payload", "weights", "indices", "missing_weights", "duplicate_source", "padding"],
+    [
+        "payload",
+        "weights",
+        "indices",
+        "missing_weights",
+        "duplicate_source",
+        "padding",
+        "slot_shape",
+    ],
 )
 def test_output_checker_rejects_incorrect_copy(expand, corruption):
     fixture = reordered_output(expand=expand, weighted=True, zero_padding=True)
     state, outputs, _, _, _, _, _ = fixture
     x, indices, weights = outputs
     valid = state.metadata[2] >= 0
-    slots = state.metadata[5][valid]
+    slots = state.metadata[5][valid] if expand else None
     row = int(slots[0]) if expand else 0
     if corruption == "payload":
         x[row, 0] += 1
@@ -124,6 +132,12 @@ def test_output_checker_rejects_incorrect_copy(expand, corruption):
     elif corruption == "duplicate_source":
         state.metadata[0][1] = state.metadata[0][0]
         state.metadata[1][1] = state.metadata[1][0]
+    elif corruption == "slot_shape":
+        state.metadata[5] = (
+            torch.empty(0, dtype=torch.int64)
+            if expand
+            else torch.full_like(state.metadata[2], -1)
+        )
     else:
         if expand:
             padding = torch.ones(len(x), dtype=torch.bool)

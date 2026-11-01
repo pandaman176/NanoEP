@@ -35,6 +35,7 @@ def assert_dispatch_output(state, outputs, case, rank, alignment, weights, *, ex
 
     if expand:
         assert actual_indices.shape == (0,)
+        assert state.metadata[5].shape == (layout.recv_count, case.num_topk)
         slots = state.metadata[5].cpu()[order]
         valid = layout.local_topk_idx >= 0
         assert (slots[~valid] == -1).all()
@@ -53,6 +54,7 @@ def assert_dispatch_output(state, outputs, case, rank, alignment, weights, *, ex
             if weights is not None:
                 torch.testing.assert_close(actual_weights[padding], torch.zeros_like(actual_weights[padding]), rtol=0, atol=0)
     else:
+        assert state.metadata[5].shape == (0,)
         torch.testing.assert_close(actual_x[order], expected.x, rtol=0, atol=0, equal_nan=True)
         torch.testing.assert_close(actual_indices, local)
         if weights is not None:
@@ -63,7 +65,7 @@ def assert_dispatch_output(state, outputs, case, rank, alignment, weights, *, ex
 
 
 def prepare_dispatch_metadata(state):
-    """Prepare and validate the complete dispatch receive metadata."""
+    """Prepare compact receive metadata with empty expanded slots."""
     experts = state.metadata[3 if state.metadata_prepared else 0].numel()
     topk = state.metadata[8 if state.metadata_prepared else 4].shape[1]
     epilogue = prepare_dispatch_epilogue(state.hidden, topk, experts, cached_mode=state.metadata_prepared).dispatch_epilogue
@@ -71,7 +73,7 @@ def prepare_dispatch_metadata(state):
     assert state.metadata_prepared
 
 
-def assert_dispatch_state(state, case, rank, alignment, weights):
+def assert_dispatch_state(state, case, rank, alignment, weights, *, expand):
     expected = reference_layout(case.indices, rank, case.num_experts, alignment)
     world_size = len(case.xs)
     local_experts = case.num_experts // world_size
@@ -91,7 +93,8 @@ def assert_dispatch_state(state, case, rank, alignment, weights):
         assert tensor.is_contiguous()
     src_ranks, src_tokens, local, counts, offsets, slots, dst_slots, sends, snapshot = [t.cpu() for t in state.metadata]
     assert src_ranks.shape == src_tokens.shape == (rows,)
-    assert local.shape == slots.shape == (rows, topk)
+    assert local.shape == (rows, topk)
+    assert slots.shape == ((rows, topk) if expand else (0,))
     keys = list(zip(src_ranks.tolist(), src_tokens.tolist(), strict=True))
     permutation = torch.tensor(sorted(range(rows), key=keys.__getitem__), dtype=torch.int64)
     torch.testing.assert_close(src_ranks[permutation], expected.src_ranks)
@@ -99,10 +102,11 @@ def assert_dispatch_state(state, case, rank, alignment, weights):
     torch.testing.assert_close(local[permutation], expected.local_topk_idx)
     torch.testing.assert_close(counts, expected.expert_counts)
     torch.testing.assert_close(offsets, expected.expert_offsets)
-    assert (slots[local < 0] == -1).all()
-    for expert in range(local_experts):
-        start, count = offsets[expert].item(), counts[expert].item()
-        torch.testing.assert_close(slots[local == expert].sort().values, torch.arange(start, start + count))
+    if expand:
+        assert (slots[local < 0] == -1).all()
+        for expert in range(local_experts):
+            start, count = offsets[expert].item(), counts[expert].item()
+            torch.testing.assert_close(slots[local == expert].sort().values, torch.arange(start, start + count))
     torch.testing.assert_close(snapshot, case.indices[rank])
     torch.testing.assert_close(sends, reference_plan(case.indices[rank], case.num_experts, world_size).send_counts)
     assert dst_slots.shape == (case.indices[rank].shape[0], world_size)

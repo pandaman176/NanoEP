@@ -96,7 +96,7 @@ def expert_inputs(case, rank, expand, *, alignment=4):
         local,
         layout.expert_counts,
         layout.expert_offsets,
-        slots,
+        slots if expand else torch.empty(0, dtype=torch.int64),
         dst_slots,
         reference_plan(case.indices[rank], case.num_experts, ranks).send_counts,
         case.indices[rank].clone(),

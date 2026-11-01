@@ -32,7 +32,7 @@ def combine_runtime(dispatch_runtime):
         local_topk_idx=integers("local_topk", [[0, 1, -1], [-1, -1, 2]]),
         expert_counts=integers("expert_counts", [1, 1, 1]),
         expert_offsets=integers("expert_offsets", [0, 4, 8, 12]),
-        expanded_slots=integers("expanded_slots", [[0, 4, -1], [-1, -1, 8]]),
+        expanded_slots=integers("expanded_slots", []),
         recv_count=2,
         expanded_capacity=12,
     )
@@ -118,6 +118,8 @@ def test_combine_wires_native_reverse_path(
 ):
     r = combine_runtime
     r.handle.do_expand = expand
+    if expand:
+        r.handle.layout.expanded_slots.payload = torch.tensor([[0, 4, -1], [-1, -1, 8]])
     r.buffer._allow_multiple_reduction = mode
     rows = 12 if expand else 2
     x = r.tensor("expert_output", torch.zeros((rows, 256), dtype=dtype))
@@ -292,6 +294,8 @@ def test_empty_source_still_returns_remote_expert_contributions(
 ):
     r = combine_runtime
     r.handle.do_expand = expand
+    if expand:
+        r.handle.layout.expanded_slots.payload = torch.tensor([[0, 4, -1], [-1, -1, 8]])
     r.handle.topk_idx = r.tensor(
         "empty_snapshot", torch.empty((0, 3), dtype=torch.int64)
     )

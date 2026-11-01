@@ -28,6 +28,8 @@ struct CombineMainSpecialization {
 // After the epilogue prepares receive metadata (and on cached states), it is:
 // src_ranks, src_tokens, local_topk_idx, expert_counts, expert_offsets,
 // expanded_slots, dst_slots, send_counts, source_topk_snapshot.
+// expanded_slots is int64 [N,K] for expanded layout and [0] for compact;
+// prepared metadata retains its original layout, including when N is zero.
 // counts is CPU int64 [2], containing (recv_count, expanded_capacity).
 // stage_buffer is borrowed uint8 [N,row_bytes] communication storage. Keep its
 // runtime alive and consume it on the same stream before the next dispatch or

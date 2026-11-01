@@ -13,6 +13,8 @@ from nano_ep.config import EPConfig
 
 @dataclass
 class NativeLayout:
+    """CUDA receive metadata; expanded_slots is [N,K] expanded or [0] compact."""
+
     src_ranks: torch.Tensor
     src_tokens: torch.Tensor
     local_topk_idx: torch.Tensor
