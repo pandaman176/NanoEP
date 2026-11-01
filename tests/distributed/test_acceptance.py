@@ -39,12 +39,13 @@ def test_delivery_profile(request, profile, tmp_path):
     nproc = request.config.getoption("--nproc")
     if nproc not in (1, 2, 4, 8) or torch.cuda.device_count() < nproc:
         pytest.fail(f"need {nproc} visible GPUs and nproc in 1/2/4/8")
-    from nano_ep.backends._build import load_extension
+    from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
 
     load_extension()
     name, layout, dtype, tokens, hidden, topk, pattern, iterations, asynchronous = (
         profile
     )
+    prepare_dispatch_epilogue(hidden, topk, 8)
     command = [
         sys.executable,
         "-m",

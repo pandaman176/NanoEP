@@ -82,17 +82,15 @@ def make_payloads(size, kind, dtype, hidden):
 
 
 def check_rounds(buffer, rank, size):
-    native = buffer._backend
+    dispatch_epilogue = buffer._dispatch_epilogue
     delay = [False]
 
     def epilogue(*args):
         if delay[0]:
             torch.cuda._sleep(20_000_000)
-        return native.dispatch_epilogue(*args)
+        return dispatch_epilogue(*args)
 
-    buffer._backend = SimpleNamespace(
-        dispatch_main=native.dispatch_main, dispatch_epilogue=epilogue
-    )
+    buffer._dispatch_epilogue = epilogue
     for expand, dtype, weighted, asynchronous, kind in product(
         (False, True),
         (torch.bfloat16,),

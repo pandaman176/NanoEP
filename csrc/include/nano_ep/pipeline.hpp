@@ -69,17 +69,6 @@ torch::Tensor reserve_and_put(PeerRuntime& runtime,
                               const WindowLayout& layout,
                               const c10::optional<torch::Tensor>& cached_dst_slots = c10::nullopt);
 
-// After the payload-completion barrier, decode uint8 [N,row_bytes] records.
-// expert_offsets is padded CUDA int64 [L+1], where L=experts_per_rank. Counts
-// and payload routing must agree. Return owned CUDA int64 tensors:
-// src_ranks [N], src_tokens [N], local_topk_idx [N,K], expanded_slots [N,K].
-// Rows retain physical receive-slot order. Nonlocal/masked choices become -1;
-// valid slots are unique within each expert segment, with unspecified order.
-// Inputs are read-only. The caller keeps the payload alive and unchanged until
-// this current-stream launch finishes; returned metadata does not alias it.
-std::vector<torch::Tensor> build_receive_metadata(
-    const torch::Tensor& stage_buffer, const torch::Tensor& expert_offsets, int64_t rank, int64_t experts_per_rank, int64_t num_topk);
-
 // All ranks use BF16 x, matching geometry and either fresh or cached mode.
 // Local storage checks precede window mutation and the entry barrier. Routing
 // values are a caller precondition: -1 or distinct valid experts per token.
@@ -101,14 +90,6 @@ DispatchState dispatch_main(PeerRuntime& runtime,
                             int64_t alignment,
                             const std::vector<torch::Tensor>& cached_metadata,
                             bool allow_multiple_reduction = false);
-
-// Return [recv_x, recv_topk_idx, recv_weights]. Absent optional tensors are
-// zero-length tensors; Python converts them using explicit mode/presence flags.
-// Fresh receive metadata is built once, before the independent copy kernel.
-// Cached/prepared states retain their mappings. Use the same communication
-// stream as dispatch_main; construct the Python handle after this call and
-// expose completion via its event.
-std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool expand, bool with_weights, bool zero_padding);
 
 // Collective on the current stream. Use the same reduction mode and capacity
 // as the owning allocation. Return borrowed uint8 [P,Tmax,row_bytes] storage,

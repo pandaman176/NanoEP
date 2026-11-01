@@ -8,7 +8,7 @@ import sys
 import pytest
 import torch
 
-from nano_ep.backends._build import load_extension
+from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
 from nano_ep.testing.launcher import run_logged
 
 pytestmark = [pytest.mark.distributed]
@@ -23,6 +23,8 @@ def test_public_cuda_dispatch(request):
             "public dispatch acceptance needs --nproc 1/2/4/8 and that many GPUs"
         )
     load_extension()
+    prepare_dispatch_epilogue(256, 3, 3)
+    prepare_dispatch_epilogue(512, 3, 3)
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["NANO_EP_EXPECTED_WORLD"] = str(nproc)

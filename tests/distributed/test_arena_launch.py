@@ -8,7 +8,7 @@ import sys
 import pytest
 import torch
 
-from nano_ep.backends._build import load_extension
+from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
 from nano_ep.testing.launcher import run_logged
 
 pytestmark = [pytest.mark.distributed]
@@ -25,6 +25,8 @@ def test_shared_arena_lifecycle(request):
     from peer_worker import load_probe
 
     load_extension()
+    prepare_dispatch_epilogue(256, 3, 8)
+    prepare_dispatch_epilogue(256, 8, 8)
     load_probe()
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()

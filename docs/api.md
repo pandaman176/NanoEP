@@ -71,14 +71,46 @@ Communication region starts, row strides and top-k/weights/x field starts are al
 
 CUDA EP requires BF16 x and a positive hidden size divisible by 256 (`32 * sizeof(int4) / sizeof(BF16)`). Independent row operators and the byte-layout arithmetic utility retain their existing hidden-size support.
 
-The combine epilogue is compiled separately for `(H,K,R,experts_per_rank,Tmax)` using the existing PyTorch C++/CUDA JIT. `CudaBuffer` prepares this module during collective initialization, before allocating/exporting IPC windows; initialization errors are gathered before peers continue. It binds `_dispatch_epilogue` to the native dispatch entry and `_combine_epilogue` to the specialized combine entry. Public calls invoke these callables directly. Low-level callers explicitly use `prepare_combine_epilogue(...).combine_epilogue`; the core native module does not expose a combine epilogue dispatcher. A new geometry incurs a cold compilation; reuse a fixed buffer configuration for steady-state calls.
+The combine epilogue is compiled separately for `(H,K,R,experts_per_rank,Tmax)` using the existing PyTorch C++/CUDA JIT. `CudaBuffer` prepares this module during collective initialization, before allocating/exporting IPC windows; initialization errors are gathered before peers continue. It binds `_dispatch_epilogue` and `_combine_epilogue` to their separately specialized module entries. Public calls invoke these callables directly. Low-level callers explicitly use `prepare_combine_epilogue(...).combine_epilogue`; the core native module does not expose a combine epilogue dispatcher. A new geometry incurs a cold compilation; reuse a fixed buffer configuration for steady-state calls.
 
 The kernel derives P from R/K/reduction mode and derives return-row bytes from H/K. It uses 16-byte int4 loads/stores, an unroll factor chosen from H at compile time, and ordered FP32 accumulation followed by one BF16 cast. Bias is added after the partial sums, and routing weights remain an independent FP32 payload. There is no hidden tail path. This does not implement TMA or guarantee equality with every DeepEP rounding recipe.
 
 Combine main also specializes `(H,K,R,experts_per_rank,Tmax)`. `CudaBuffer` prepares and retains its module before allocating/exporting IPC windows. The core extension keeps validation, runtime ownership and epoch allocation; it calls the compiled host launcher through a named capsule. One cooperative kernel performs both barriers and payload work. Geometry mismatches fail before entering either barrier. `experts_per_rank` validates metadata geometry; the return kernel does not divide expert IDs.
 
-H/K/R/Tmax and the derived return-row stride are compile-time constants; actual N and input row capacity remain runtime values. The kernel uses int4 BF16 transfers, ascending-K FP32 local reduction, 256-thread blocks and one block per reported SM. Warp `w` in block `b` starts at receive row `w * gridDim.x + b` and advances by `(blockDim.x / 32) * gridDim.x`, refreshing per-row metadata each iteration. The warp count remains fixed at eight per block; this grid does not pin blocks to physical SMs. Each valid lane loads its expanded slot once for validation and weight return. Warp shuffles compact slots in ascending original-k order before local reduction, or broadcast each assignment slot for cooperative copying. All lanes participate in the shuffles. Compact inputs and expanded rows with exactly one local assignment share a direct BF16 copy path. This bypass preserves payload bits, including signed zero and NaN payloads; rows with multiple local assignments retain ordered FP32 reduction. TMA and PDL are not implemented. Dispatch main and dispatch copy epilogue still use runtime geometry.
+H/K/R/Tmax and the derived return-row stride are compile-time constants; actual N and input row capacity remain runtime values. The kernel uses int4 BF16 transfers, ascending-K FP32 local reduction, 256-thread blocks and one block per reported SM. Warp `w` in block `b` starts at receive row `w * gridDim.x + b` and advances by `(blockDim.x / 32) * gridDim.x`, refreshing per-row metadata each iteration. The warp count remains fixed at eight per block; this grid does not pin blocks to physical SMs. Each valid lane loads its expanded slot once for validation and weight return. Warp shuffles compact slots in ascending original-k order before local reduction, or broadcast each assignment slot for cooperative copying. All lanes participate in the shuffles. Compact inputs and expanded rows with exactly one local assignment share a direct BF16 copy path. This bypass preserves payload bits, including signed zero and NaN payloads; rows with multiple local assignments retain ordered FP32 reduction. TMA and PDL are not implemented. Dispatch main still uses runtime geometry; dispatch epilogue specializes H/K/local-expert-count.
 
 CTA 0 exchanges entry epochs before a grid sync permits writes. Every thread executes a system fence after its payload work, then the grid synchronizes before CTA 0 exchanges completion epochs. No entry-side starting grid sync or exit-side ending grid sync is needed: earlier stream work has completed, and the separate epilogue waits for the entire cooperative kernel. Empty ranks still launch and participate. The launcher uses `has_pass` to check cooperative support and actual-kernel occupancy once per variant/host thread; each host thread must use a fixed GPU, since switching devices does not repeat the checks. It retains one block per SM. Each combine reserves two consecutive epochs in the same sequence and stream as standalone barriers. CUDA Graph replay still needs a device-side epoch protocol.
 
 Low-level `native.combine_main(...)` requires `launcher=prepare_combine_main(H,K,R,experts_per_rank,Tmax).launcher`. Keep the module alive while using the launcher. The cooperative launcher uses capsule name `nano_ep.CombineMainSpecialization`; rebuild the core extension together with specialized modules and restart the process. Public `CudaBuffer.combine` arguments, window byte layout and output layouts are unchanged.
+
+
+## Specialized dispatch epilogue
+
+`prepare_dispatch_epilogue(H, K, experts_per_rank)` compiles both receive metadata
+and payload copy kernels in a separate module. `CudaBuffer` prewarms this module
+before allocating/exporting IPC windows and reports build failures collectively.
+H/K/local-expert-count are compile-time constants; row bytes and field offsets
+are derived from H/K. Actual N/C and rank remain runtime values. R, Tmax and
+alignment are not specialization keys: the kernels use the existing padded
+expert offsets. Fresh dispatch still launches metadata and copy separately;
+cached dispatch reuses metadata. Payload copies use 16-byte `int4` loads/stores
+in both compact and expanded layouts, preserving eight BF16 bit patterns per
+vector. H%256 and the aligned communication fields cover complete warp vectors;
+CUDA-allocated outputs preserve row alignment. A compile-time unroll factor is
+the largest divisor up to four of H/256, matching combine's selection rule;
+the inner vector loop is explicitly unrolled in both layouts. The 256-thread blocks,
+`ceil(N/8)` grids and whole-output zero padding remain unchanged. No TMA is used.
+
+Low-level callers must load the core extension for `DispatchState` registration,
+then use the geometry module:
+
+```python
+module = prepare_dispatch_epilogue(H, K, experts_per_rank)
+x, indices, weights = module.dispatch_epilogue(state, expand, with_weights, zero_padding)
+src_ranks, src_tokens, local_ids, slots = module.build_receive_metadata(stage_buffer, expert_offsets, rank)
+```
+
+The old core `native.dispatch_epilogue` and `native.build_receive_metadata` entries
+are removed. Geometry mismatches fail before metadata preparation. Rebuild the
+core extension and restart the process; public `CudaBuffer.dispatch` arguments,
+wire layout, metadata snapshots and output ownership are unchanged.

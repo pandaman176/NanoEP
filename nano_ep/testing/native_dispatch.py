@@ -2,6 +2,8 @@
 
 import torch
 
+from nano_ep.backends._build import prepare_dispatch_epilogue
+
 from nano_ep.testing.wire import dispatch_offsets, dispatch_row_bytes
 
 from .oracle import reference_dispatch, reference_layout, reference_plan
@@ -60,9 +62,12 @@ def assert_dispatch_output(state, outputs, case, rank, alignment, weights, *, ex
         assert actual_weights.shape == (0,)
 
 
-def prepare_dispatch_metadata(native, state):
+def prepare_dispatch_metadata(state):
     """Prepare and validate the complete dispatch receive metadata."""
-    native.dispatch_epilogue(state, False, False, False)
+    experts = state.metadata[3 if state.metadata_prepared else 0].numel()
+    topk = state.metadata[8 if state.metadata_prepared else 4].shape[1]
+    epilogue = prepare_dispatch_epilogue(state.hidden, topk, experts).dispatch_epilogue
+    epilogue(state, False, False, False)
     assert state.metadata_prepared
 
 

@@ -5,13 +5,15 @@ import sys
 
 import torch
 
-from nano_ep.backends._build import load_extension
+from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
 from nano_ep.testing.native_dispatch import prepare_dispatch_metadata
 
 
 def run(stage, kind):
     torch.cuda.set_device(0)
     native = load_extension()
+    if stage == "dispatch_epilogue":
+        prepare_dispatch_epilogue(256, 3, 3)
     x = torch.ones((2, 256), dtype=torch.bfloat16, device="cuda")
     valid = torch.tensor([[0, 1, -1], [2, -1, 0]], device="cuda")
     if stage != "route_counts":
@@ -31,7 +33,7 @@ def run(stage, kind):
         else:
             state = native.dispatch_main(runtime, x, indices, None, 3, 2, 4, [])
             if stage == "dispatch_epilogue":
-                prepare_dispatch_metadata(native, state)
+                prepare_dispatch_metadata(state)
         torch.cuda.synchronize()
 
     # Build/import/storage failures must not be mistaken for a routing assertion.

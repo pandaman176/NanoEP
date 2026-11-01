@@ -88,3 +88,24 @@ def prepare_combine_main(hidden: int, topk: int, world_size: int, experts_per_ra
         extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo", *defines],
         verbose=os.environ.get("NANO_EP_BUILD_VERBOSE") == "1",
     )
+
+
+@cache
+def prepare_dispatch_epilogue(hidden: int, topk: int, experts_per_rank: int):
+    """Compile H/K/local-expert geometry before entering IPC collectives."""
+    from torch.utils.cpp_extension import load
+
+    if hidden <= 0 or hidden > 2**31 - 1 or hidden % 256 or not 1 <= topk <= 32 or experts_per_rank <= 0:
+        raise RuntimeError("invalid dispatch epilogue geometry: H must be a positive multiple of 256, K in [1,32], L positive")
+    source = native_source_dir()
+    geometry = (hidden, topk, experts_per_rank)
+    names = ("HIDDEN", "TOPK", "EXPERTS_PER_RANK")
+    defines = [f"-DNANO_EP_{name}={value}" for name, value in zip(names, geometry, strict=True)]
+    return load(
+        name="nano_ep_dispatch_epilogue_" + "_".join(map(str, geometry)),
+        sources=[str(source / "dispatch_epilogue.cu")],
+        extra_include_paths=[str(source / "include")],
+        extra_cflags=["-O2", "-std=c++20"],
+        extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo", *defines],
+        verbose=os.environ.get("NANO_EP_BUILD_VERBOSE") == "1",
+    )

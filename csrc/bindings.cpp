@@ -30,13 +30,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
                py::arg("cached_metadata"),
                py::arg("allow_multiple_reduction") = false);
     module.def("notify_counts", &nano_ep::notify_counts);
-    module.def("build_receive_metadata",
-               &nano_ep::build_receive_metadata,
-               py::arg("stage_buffer"),
-               py::arg("expert_offsets"),
-               py::arg("rank"),
-               py::arg("experts_per_rank"),
-               py::arg("num_topk"));
     module.def(
         "reserve_and_put",
         [](nano_ep::PeerRuntime& runtime,
@@ -60,7 +53,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         py::arg("max_tokens"),
         py::arg("cached_dst_slots") = py::none(),
         py::arg("allow_multiple_reduction") = false);
-    module.def("dispatch_epilogue", &nano_ep::dispatch_epilogue);
     module.def(
         "combine_main",
         [](nano_ep::PeerRuntime& runtime,

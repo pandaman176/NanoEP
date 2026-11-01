@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from nano_ep.backends._build import load_extension
+from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
 from nano_ep.testing.wire import dispatch_row_bytes
 
 pytestmark = [pytest.mark.cuda]
@@ -48,7 +48,7 @@ def make_records(rank, kind, alignment):
     # Keep provenance deliberately different from physical receive-row order.
     src_ranks = torch.arange(rows, dtype=torch.int64) % 4
     src_tokens = torch.arange(rows - 1, -1, -1, dtype=torch.int64) * 3 + 7
-    hidden = 7
+    hidden = 256
     row_bytes = dispatch_row_bytes(hidden, topk)
     stage = torch.full((rows, row_bytes), 165, dtype=torch.uint8)
     for row in range(rows):
@@ -79,15 +79,11 @@ def test_receive_metadata(native, rank, kind, alignment):
         rank, kind, alignment
     )
     local_experts, topk = counts.numel(), local.shape[1]
+    build = prepare_dispatch_epilogue(256, topk, local_experts).build_receive_metadata
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         device_stage, device_offsets = stage.cuda(), offsets.cuda()
-        results = [
-            native.build_receive_metadata(
-                device_stage, device_offsets, rank, local_experts, topk
-            )
-            for _ in range(2)
-        ]
+        results = [build(device_stage, device_offsets, rank) for _ in range(2)]
         torch.testing.assert_close(device_stage.cpu(), stage)
         torch.testing.assert_close(device_offsets.cpu(), offsets)
         # The returned tensors must own metadata after the communication window is reused.
@@ -114,12 +110,13 @@ def test_receive_metadata(native, rank, kind, alignment):
 
 
 @pytest.mark.parametrize(
-    "kind", ["cpu", "dtype", "stride", "alignment", "row_bytes", "offsets", "topk"]
+    "kind", ["cpu", "dtype", "stride", "alignment", "row_bytes", "offsets", "geometry"]
 )
 def test_invalid_receive_metadata_storage(native, kind):
     stage, offsets, _, _, local, counts = make_records(1, "mixed", 4)
     stage, offsets = stage.cuda(), offsets.cuda()
     topk = local.shape[1]
+    build = prepare_dispatch_epilogue(256, topk, counts.numel()).build_receive_metadata
     if kind == "cpu":
         stage = stage.cpu()
     elif kind == "dtype":
@@ -134,6 +131,6 @@ def test_invalid_receive_metadata_storage(native, kind):
     elif kind == "offsets":
         offsets = offsets[:-1]
     else:
-        topk = 33
-    with pytest.raises(RuntimeError, match="stage_buffer|expert_offsets|num_topk"):
-        native.build_receive_metadata(stage, offsets, 1, counts.numel(), topk)
+        stage = stage[:, :-32].contiguous()
+    with pytest.raises(RuntimeError, match="stage_buffer|expert_offsets"):
+        build(stage, offsets, 1)

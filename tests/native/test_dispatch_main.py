@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from nano_ep.backends._build import load_extension
+from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
 from nano_ep.testing.cases import make_case
 from nano_ep.testing.native_dispatch import (
     assert_dispatch_state,
@@ -43,7 +43,9 @@ def native(request):
         pytest.skip("opt in with --run-cuda or --run-distributed")
     if not torch.cuda.is_available():
         pytest.fail("CUDA tests requested but NVIDIA CUDA is unavailable")
-    return load_extension()
+    native = load_extension()
+    prepare_dispatch_epilogue(256, 3, 3)
+    return native
 
 
 @pytest.fixture
@@ -82,9 +84,9 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
         assert (
             state.rank == 0 and state.hidden == case.hidden and state.x_dtype == dtype
         )
-        prepare_dispatch_metadata(native, state)
+        prepare_dispatch_metadata(state)
         pointers = [tensor.data_ptr() for tensor in state.metadata]
-        prepare_dispatch_metadata(native, state)
+        prepare_dispatch_metadata(state)
         assert [tensor.data_ptr() for tensor in state.metadata] == pointers
         assert_dispatch_state(state, case, 0, alignment, case.weights)
         torch.testing.assert_close(x.cpu(), case.xs[0])
@@ -101,7 +103,7 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
         fresh = native.dispatch_main(
             runtime, x, masked.indices[0].cuda(), None, 3, 5, 1, []
         )
-        prepare_dispatch_metadata(native, fresh)
+        prepare_dispatch_metadata(fresh)
         assert_dispatch_state(fresh, masked, 0, 1, None)
         assert (
             runtime.local_window()[layout[1] + 32 : layout[1] + 40]
@@ -115,7 +117,7 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
             runtime, x * 2, indices, None, 3, 5, alignment, state.metadata
         )
         assert replay.metadata_prepared
-        prepare_dispatch_metadata(native, replay)
+        prepare_dispatch_metadata(replay)
         assert_dispatch_state(replay, replay_case, 0, alignment, None)
         for before, after, saved in zip(
             state.metadata, replay.metadata, saved_metadata, strict=True
@@ -133,7 +135,7 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
         replay = native.dispatch_main(
             runtime, x * 3, indices, weights * 4, 3, 5, alignment, state.metadata
         )
-        prepare_dispatch_metadata(native, replay)
+        prepare_dispatch_metadata(replay)
         assert_dispatch_state(replay, replay_case, 0, alignment, replay_case.weights)
         # Metadata from the intervening fresh call must survive subsequent writes.
         torch.testing.assert_close(fresh.metadata[8].cpu(), masked.indices[0])
@@ -148,7 +150,7 @@ def test_nonfinite_payload_is_preserved(native, runtime, dtype):
     state = native.dispatch_main(
         runtime, case.xs[0].cuda(), case.indices[0].cuda(), None, 3, 5, 4, []
     )
-    prepare_dispatch_metadata(native, state)
+    prepare_dispatch_metadata(state)
     assert_dispatch_state(state, case, 0, 4, None)
 
 
@@ -224,7 +226,7 @@ def test_invalid_input_precedes_communication(native, runtime, kind):
             runtime, x, indices, weights, experts, capacity, alignment, []
         )
         if kind == "cache_shape":
-            prepare_dispatch_metadata(native, state)
+            prepare_dispatch_metadata(state)
         cached = state.metadata
         if kind == "cache_shape":
             cached[6] = torch.zeros((2, 2), device="cuda", dtype=torch.int64)

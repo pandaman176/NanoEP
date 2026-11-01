@@ -6,7 +6,7 @@ import sys
 import pytest
 import torch
 
-from nano_ep.backends._build import load_extension
+from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
 from nano_ep.testing.launcher import run_logged
 
 pytestmark = [pytest.mark.distributed]
@@ -19,6 +19,7 @@ def test_cuda_buffer_bootstrap(request):
     if nproc < 1 or torch.cuda.device_count() < nproc:
         pytest.fail(f"bootstrap acceptance needs {nproc} visible CUDA GPUs")
     load_extension()
+    prepare_dispatch_epilogue(256, 2, 2)
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["NANO_EP_EXPECTED_WORLD"] = str(nproc)

@@ -136,7 +136,6 @@ def bootstrap(monkeypatch):
     native = SimpleNamespace(
         PeerRuntime=Runtime,
         window_layout=window_layout,
-        dispatch_epilogue=dispatch_epilogue,
     )
 
     def load():
@@ -154,6 +153,13 @@ def bootstrap(monkeypatch):
         operation("specialization")
         assert (hidden, topk, ranks, experts_per_rank, capacity) == (256, 2, 2, 2, 8)
         return SimpleNamespace(combine_epilogue=combine_epilogue)
+
+    def prepare_dispatch(hidden, topk, experts_per_rank):
+        operation("dispatch_specialization")
+        assert (hidden, topk, experts_per_rank) == (256, 2, 2)
+        return SimpleNamespace(dispatch_epilogue=dispatch_epilogue)
+
+    monkeypatch.setattr(cuda, "prepare_dispatch_epilogue", prepare_dispatch)
 
     monkeypatch.setattr(cuda, "prepare_combine_epilogue", prepare)
 
@@ -235,6 +241,9 @@ def test_bootstrap_and_collective_close(bootstrap, allow_multiple_reduction):
         operations = [
             name for name, actual_rank in bootstrap.events if actual_rank == rank
         ]
+        assert operations.index("dispatch_specialization") < operations.index(
+            "allocate"
+        )
         assert (
             operations.index("initialize")
             < operations.index("window_ready")
@@ -250,6 +259,7 @@ def test_bootstrap_and_collective_close(bootstrap, allow_multiple_reduction):
         "layout",
         "specialization",
         "main_specialization",
+        "dispatch_specialization",
         "allocate",
         "initialize",
         "window_ready",
@@ -270,6 +280,7 @@ def test_one_rank_failure_reaches_both_ranks(bootstrap, failure):
         "layout",
         "specialization",
         "main_specialization",
+        "dispatch_specialization",
         "allocate",
         "initialize",
         "window_ready",

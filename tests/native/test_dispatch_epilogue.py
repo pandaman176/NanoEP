@@ -7,7 +7,7 @@ import pytest
 import torch
 from torch.utils import deterministic
 
-from nano_ep.backends._build import load_extension
+from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
 from nano_ep.testing.cases import make_case
 from nano_ep.testing.native_dispatch import (
     assert_dispatch_output,
@@ -106,6 +106,9 @@ def check_fresh_and_cached(
     zero_padding,
     allow_multiple_reduction=False,
 ):
+    epilogue = prepare_dispatch_epilogue(
+        case.hidden, case.num_topk, case.num_experts
+    ).dispatch_epilogue
     stream = torch.cuda.Stream()
     with (
         local_runtime(native, case, allow_multiple_reduction) as (
@@ -133,7 +136,7 @@ def check_fresh_and_cached(
             [],
             allow_multiple_reduction,
         )
-        outputs = native.dispatch_epilogue(state, expand, weighted, zero_padding)
+        outputs = epilogue(state, expand, weighted, zero_padding)
         assert_dispatch_state(
             state, case, 0, alignment, case.weights if weighted else None
         )
@@ -178,9 +181,7 @@ def check_fresh_and_cached(
                 allow_multiple_reduction,
             )
             assert replay.metadata_prepared
-            replay_outputs = native.dispatch_epilogue(
-                replay, expand, replay_weighted, zero_padding
-            )
+            replay_outputs = epilogue(replay, expand, replay_weighted, zero_padding)
             assert_dispatch_output(
                 replay,
                 replay_outputs,
@@ -315,7 +316,9 @@ def test_dispatch_copy_nonfinite_payload(native, expand, zero_padding, dtype):
     check_fresh_and_cached(native, case, 4, expand, True, zero_padding)
 
 
-@pytest.mark.parametrize("topk,hidden", [(1, 256), (3, 512), (8, 4096), (32, 256)])
+@pytest.mark.parametrize(
+    "topk,hidden", [(1, 256), (3, 512), (3, 768), (8, 1280), (8, 4096), (32, 256)]
+)
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("weighted", [False, True])
 def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighted):
@@ -344,6 +347,9 @@ def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighte
         capacity=tokens,
         expert_matrices=torch.empty(0),
     )
+    epilogue = prepare_dispatch_epilogue(
+        hidden, topk, case.num_experts
+    ).dispatch_epilogue
     with local_runtime(native, case) as (runtime, window, layout):
         cached = []
         for replay in (False, True):
@@ -360,7 +366,7 @@ def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighte
                 4,
                 cached,
             )
-            outputs = native.dispatch_epilogue(state, expand, weighted, expand)
+            outputs = epilogue(state, expand, weighted, expand)
             assert_dispatch_state(state, case, 0, 4, case.weights if weighted else None)
             assert_dispatch_output(
                 state,
@@ -380,7 +386,16 @@ def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighte
                 (state.stage_buffer.data_ptr() + offset) % 32 == 0
                 for offset in dispatch_offsets(topk)
             )
+            output_bits = outputs[0].view(torch.int16).cpu()
+            source_bits = case.xs[0].view(torch.int16)
+            expanded_slots = state.metadata[5].cpu()
             for row, token in enumerate(state.metadata[1].tolist()):
+                destinations = expanded_slots[row].tolist() if expand else [row]
+                for slot in destinations:
+                    if slot >= 0:
+                        torch.testing.assert_close(
+                            output_bits[slot], source_bits[token], rtol=0, atol=0
+                        )
                 torch.testing.assert_close(
                     records[row, start : start + 2 * hidden],
                     case.xs[0][token].view(torch.uint8),
@@ -388,3 +403,32 @@ def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighte
                 assert (records[row, start + 2 * hidden :] == 165).all()
             assert (window[layout[2] + records.numel() :].cpu() == 165).all()
             cached = state.metadata
+
+
+@pytest.mark.parametrize("geometry", [(512, 3, 3), (256, 2, 3), (256, 3, 4)])
+@pytest.mark.parametrize("prepared", [False, True])
+def test_dispatch_geometry_mismatch_preserves_state(native, geometry, prepared):
+    correct = prepare_dispatch_epilogue(256, 3, 3).dispatch_epilogue
+    wrong = prepare_dispatch_epilogue(*geometry).dispatch_epilogue
+    case = copy_case("mixed", torch.bfloat16, 256)
+    with local_runtime(native, case) as (runtime, window, layout):
+        state = native.dispatch_main(
+            runtime,
+            case.xs[0].cuda(),
+            case.indices[0].cuda(),
+            None,
+            case.num_experts,
+            case.capacity,
+            4,
+            [],
+        )
+        if prepared:
+            correct(state, False, False, False)
+        tensors = [tensor.clone() for tensor in state.metadata]
+        pointers = [tensor.data_ptr() for tensor in state.metadata]
+        with pytest.raises(RuntimeError, match="compiled geometry"):
+            wrong(state, False, False, False)
+        assert state.metadata_prepared is prepared
+        assert [tensor.data_ptr() for tensor in state.metadata] == pointers
+        for actual, expected in zip(state.metadata, tensors, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)

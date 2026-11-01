@@ -7,7 +7,7 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.distributed as dist
 
-from nano_ep.backends._build import load_extension, prepare_combine_epilogue, prepare_combine_main
+from nano_ep.backends._build import load_extension, prepare_combine_epilogue, prepare_combine_main, prepare_dispatch_epilogue
 from nano_ep.config import EPConfig
 
 
@@ -151,7 +151,9 @@ class CudaBuffer:
         allocation = {"handle": None, "error": None}
         try:
             self._backend = load_extension()
-            self._dispatch_epilogue = self._backend.dispatch_epilogue
+            self._dispatch_epilogue = prepare_dispatch_epilogue(
+                config.hidden, config.num_topk, config.num_experts // self._world_size
+            ).dispatch_epilogue
             (
                 self._signal_offset,
                 self._count_offset,

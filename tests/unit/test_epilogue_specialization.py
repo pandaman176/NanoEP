@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import pytest
 import torch.utils.cpp_extension
 
-from nano_ep.backends._build import prepare_combine_epilogue, prepare_combine_main
+from nano_ep.backends._build import (
+    prepare_combine_epilogue,
+    prepare_combine_main,
+    prepare_dispatch_epilogue,
+)
 
 
 
@@ -19,10 +23,12 @@ def builds(monkeypatch):
 
     prepare_combine_epilogue.cache_clear()
     prepare_combine_main.cache_clear()
+    prepare_dispatch_epilogue.cache_clear()
     monkeypatch.setattr(torch.utils.cpp_extension, "load", load)
     yield calls
     prepare_combine_epilogue.cache_clear()
     prepare_combine_main.cache_clear()
+    prepare_dispatch_epilogue.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -65,3 +71,44 @@ def test_main_and_epilogue_use_distinct_build_modules(builds):
     epilogue = prepare_combine_epilogue(*geometry)
     assert main.name != epilogue.name
     assert builds[0]["extra_include_paths"][0].endswith("include")
+
+
+def test_dispatch_geometry_specializes_only_consumed_dimensions(builds):
+    geometry = (256, 3, 5)
+    first = prepare_dispatch_epilogue(*geometry)
+    assert prepare_dispatch_epilogue(*geometry) is first
+    for position, value in enumerate((512, 8, 40)):
+        changed = list(geometry)
+        changed[position] = value
+        assert prepare_dispatch_epilogue(*changed) is not first
+    assert len(builds) == 4
+    assert len({entry["name"] for entry in builds}) == 4
+    assert builds[0]["sources"][0].endswith("dispatch_epilogue.cu")
+    assert builds[0]["extra_include_paths"][0].endswith("include")
+    assert [arg for arg in builds[0]["extra_cuda_cflags"] if arg.startswith("-D")] == [
+        "-DNANO_EP_HIDDEN=256",
+        "-DNANO_EP_TOPK=3",
+        "-DNANO_EP_EXPERTS_PER_RANK=5",
+    ]
+    assert first.name not in {
+        prepare_combine_main(256, 3, 2, 5, 7).name,
+        prepare_combine_epilogue(256, 3, 2, 5, 7).name,
+    }
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        (0, 3, 5),
+        (128, 3, 5),
+        (257, 3, 5),
+        (2**31, 3, 5),
+        (256, 0, 5),
+        (256, 33, 5),
+        (256, 3, 0),
+    ],
+)
+def test_invalid_dispatch_geometry_never_compiles(builds, geometry):
+    with pytest.raises(RuntimeError, match="invalid dispatch epilogue geometry"):
+        prepare_dispatch_epilogue(*geometry)
+    assert not builds

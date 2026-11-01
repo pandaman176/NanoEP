@@ -14,6 +14,7 @@ from nano_ep.backends._build import (
     load_extension,
     prepare_combine_epilogue,
     prepare_combine_main,
+    prepare_dispatch_epilogue,
 )
 from nano_ep.testing.wire import dispatch_offsets, dispatch_row_bytes
 
@@ -256,6 +257,8 @@ def check_notify(native, rank):
 
 def check_payload(native, rank):
     hidden, topk, capacity = 256, 3, 11
+    metadata_builder = prepare_dispatch_epilogue(hidden, topk, 2).build_receive_metadata
+    dist.barrier()
     layout = native.window_layout(2, capacity, hidden, topk, 4)
     runtime = native.PeerRuntime(rank, 2, layout[-1])
     window = runtime.local_window()
@@ -424,9 +427,7 @@ def check_payload(native, rank):
             stage_buffer = window.narrow(0, layout[2], expected_count * row_bytes).view(
                 expected_count, row_bytes
             )
-            metadata = native.build_receive_metadata(
-                stage_buffer, offsets, rank, 2, topk
-            )
+            metadata = metadata_builder(stage_buffer, offsets, rank)
             metadata_cpu = [tensor.cpu() for tensor in metadata]
             offsets_cpu = offsets.cpu()
         assert (
@@ -485,11 +486,12 @@ def check_dispatch_main(native, rank):
         prepare_dispatch_metadata,
     )
 
+    epilogue = prepare_dispatch_epilogue(256, 3, 3).dispatch_epilogue
+    dist.barrier()
+
     def check_copy(state, case, weights, alignment=4):
         for expand, zero_padding in ((False, False), (True, False), (True, True)):
-            outputs = native.dispatch_epilogue(
-                state, expand, weights is not None, zero_padding
-            )
+            outputs = epilogue(state, expand, weights is not None, zero_padding)
             assert_dispatch_output(
                 state,
                 outputs,
@@ -526,7 +528,7 @@ def check_dispatch_main(native, rank):
             )
             state = native.dispatch_main(runtime, x, indices, weights, 6, 5, 4, [])
             assert not state.metadata_prepared and state.rank == rank
-            prepare_dispatch_metadata(native, state)
+            prepare_dispatch_metadata(state)
             assert_dispatch_state(state, case, rank, 4, case.weights)
             check_copy(state, case, case.weights)
             indices.fill_(99)
@@ -540,7 +542,7 @@ def check_dispatch_main(native, rank):
             fresh = native.dispatch_main(
                 runtime, x, masked.indices[rank].cuda(), None, 6, 5, 1, []
             )
-            prepare_dispatch_metadata(native, fresh)
+            prepare_dispatch_metadata(fresh)
             assert_dispatch_state(fresh, masked, rank, 1, None)
             check_copy(fresh, masked, None, alignment=1)
             replay_case = replace(case, xs=[x * 2 for x in case.xs])
@@ -548,7 +550,7 @@ def check_dispatch_main(native, rank):
                 runtime, x * 2, indices, None, 6, 5, 4, state.metadata
             )
             assert replay.metadata_prepared
-            prepare_dispatch_metadata(native, replay)
+            prepare_dispatch_metadata(replay)
             assert_dispatch_state(replay, replay_case, rank, 4, None)
             check_copy(replay, replay_case, None)
             replay_case = replace(
@@ -557,7 +559,7 @@ def check_dispatch_main(native, rank):
             replay = native.dispatch_main(
                 runtime, x * 3, indices, weights * 4, 6, 5, 4, state.metadata
             )
-            prepare_dispatch_metadata(native, replay)
+            prepare_dispatch_metadata(replay)
             assert_dispatch_state(replay, replay_case, rank, 4, replay_case.weights)
             check_copy(replay, replay_case, replay_case.weights)
             for actual, expected in zip(replay.metadata, saved_metadata, strict=True):
