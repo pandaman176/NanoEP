@@ -63,7 +63,9 @@ received = buffer.dispatch(x, topk_idx=indices, async_op=True)
 received.event.current_stream_wait()
 ```
 
-`previous_event` is an optional native `torch.cuda.Event` for an input producer on another stream. Otherwise the communication stream waits for the caller's current stream. The returned event tracks tensor ownership on the consumer stream. Keep the current device set to this process's GPU and do not mutate inputs until communication completes. Exact receive-count readback can block the host; asynchronous mode does not imply CUDA Graph compatibility.
+`previous_event` is an optional native `torch.cuda.Event` for an input producer on another stream. Otherwise the communication stream waits for the caller's current stream. The returned event tracks tensor ownership on the consumer stream. Keep the current device set to this process's GPU and do not mutate inputs until communication completes. Fresh exact receive-count readback can block the host. Cached dispatch uses metadata shape for N and the handle's saved host C, without reading GPU offsets back. Asynchronous mode does not imply CUDA Graph compatibility.
+
+Native `dispatch_main` requires `cached_expanded_capacity` immediately after `cached_metadata`: fresh calls pass `0` (ignored), cached calls pass the original handle's C. The nine metadata tensors remain on the GPU, with unchanged ordering. Direct native callers must update this argument, rebuild core and restart the process; public `CudaBuffer.dispatch` arguments are unchanged.
 
 Close collectively after consumers finish, preferably with `with CudaBuffer(...)`. Closing drains GPU work, coordinates unmapping across ranks, then frees allocations. Do not use handles after close or across buffers. Fatal rank failure relies on the process-group/launcher timeout.
 

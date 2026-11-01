@@ -76,10 +76,12 @@ torch::Tensor reserve_and_put(PeerRuntime& runtime,
 // values are a caller precondition: -1 or distinct valid experts per token.
 // Existing kernels assert bounds/uniqueness on device, without a validation
 // launch or status readback. Device failures are asynchronous and can invalidate
-// the CUDA context; exact receive-count allocation still reads back N/C.
+// the CUDA context; fresh exact receive-count allocation reads back N/C.
 // Cached metadata is the unmodified vector prepared by dispatch_epilogue on this
 // runtime with the same H/K/E/capacity/alignment; the Python handle checks this
-// ownership/configuration contract. A local failure is not a collective error
+// ownership/configuration contract. cached_expanded_capacity is the host capacity
+// saved with that metadata; fresh calls ignore it. Cached N comes from tensor shape.
+// A local failure is not a collective error
 // exchange: the distributed launcher must terminate peers on rank failure.
 // Pass the allocation's allow_multiple_reduction mode even though dispatch
 // payloads are unchanged: the total window capacity check includes returns.
@@ -91,6 +93,7 @@ DispatchState dispatch_main(PeerRuntime& runtime,
                             int64_t max_tokens,
                             int64_t alignment,
                             const std::vector<torch::Tensor>& cached_metadata,
+                            int64_t cached_expanded_capacity,
                             bool allow_multiple_reduction = false);
 
 // Collective on the current stream. Use the same reduction mode and capacity

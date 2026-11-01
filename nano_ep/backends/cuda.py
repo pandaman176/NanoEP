@@ -305,10 +305,12 @@ class CudaBuffer:
             expand = False if do_expand is None else do_expand
             expert_alignment = 1 if alignment is None else alignment
             cached_metadata = []
+            cached_expanded_capacity = 0
         else:
             expand = handle.do_expand
             expert_alignment = handle.alignment
             layout = handle.layout
+            cached_expanded_capacity = layout.expanded_capacity
             cached_metadata = [
                 layout.src_ranks,
                 layout.src_tokens,
@@ -343,6 +345,7 @@ class CudaBuffer:
                     self._config.num_max_tokens_per_rank,
                     expert_alignment,
                     cached_metadata,
+                    cached_expanded_capacity,
                     self._allow_multiple_reduction,
                 )
                 outputs = self._dispatch_epilogues[state.metadata_prepared](state, expand, weights is not None, zero_padding)

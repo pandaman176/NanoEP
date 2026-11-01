@@ -9,6 +9,7 @@ import torch
 from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
 from nano_ep.testing.cases import make_case
 from nano_ep.testing.native_dispatch import (
+    assert_dispatch_output,
     assert_dispatch_state,
     prepare_dispatch_metadata,
 )
@@ -28,7 +29,7 @@ def test_hidden_constraint_precedes_communication(
     before = peer.local_window().clone()
     with pytest.raises(RuntimeError, match="multiple of 256"):
         if stage == "dispatch_main":
-            native.dispatch_main(peer, x, indices, None, 3, 5, 1, [])
+            native.dispatch_main(peer, x, indices, None, 3, 5, 1, [], 0)
         else:
             native.reserve_and_put(peer, x, indices, None, 3, 5)
     torch.testing.assert_close(peer.local_window(), before, rtol=0, atol=0)
@@ -77,7 +78,9 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
             case.indices[0].cuda(),
             case.weights[0].cuda(),
         )
-        state = native.dispatch_main(runtime, x, indices, weights, 3, 5, alignment, [])
+        state = native.dispatch_main(
+            runtime, x, indices, weights, 3, 5, alignment, [], 0
+        )
         assert not state.metadata_prepared
         assert len(state.metadata) == 5
         assert all(isinstance(tensor, torch.Tensor) for tensor in state.metadata)
@@ -102,7 +105,7 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
         # A different fresh dispatch overwrites the window and resets recv_next.
         masked = replace(case, indices=[torch.full_like(case.indices[0], -1)])
         fresh = native.dispatch_main(
-            runtime, x, masked.indices[0].cuda(), None, 3, 5, 1, []
+            runtime, x, masked.indices[0].cuda(), None, 3, 5, 1, [], 0
         )
         prepare_dispatch_metadata(fresh)
         assert_dispatch_state(fresh, masked, 0, 1, None, expand=False)
@@ -115,7 +118,15 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
 
         replay_case = replace(case, xs=[case.xs[0] * 2])
         replay = native.dispatch_main(
-            runtime, x * 2, indices, None, 3, 5, alignment, state.metadata
+            runtime,
+            x * 2,
+            indices,
+            None,
+            3,
+            5,
+            alignment,
+            state.metadata,
+            int(state.counts[1]),
         )
         assert replay.metadata_prepared
         prepare_dispatch_metadata(replay)
@@ -134,7 +145,15 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
 
         replay_case = replace(case, xs=[case.xs[0] * 3], weights=[case.weights[0] * 4])
         replay = native.dispatch_main(
-            runtime, x * 3, indices, weights * 4, 3, 5, alignment, state.metadata
+            runtime,
+            x * 3,
+            indices,
+            weights * 4,
+            3,
+            5,
+            alignment,
+            state.metadata,
+            int(state.counts[1]),
         )
         prepare_dispatch_metadata(replay)
         assert_dispatch_state(
@@ -151,7 +170,7 @@ def test_nonfinite_payload_is_preserved(native, runtime, dtype):
     case.xs[0][0, 0] = float("nan")
     case.xs[0][1, 0] = float("inf")
     state = native.dispatch_main(
-        runtime, case.xs[0].cuda(), case.indices[0].cuda(), None, 3, 5, 4, []
+        runtime, case.xs[0].cuda(), case.indices[0].cuda(), None, 3, 5, 4, [], 0
     )
     prepare_dispatch_metadata(state)
     assert_dispatch_state(state, case, 0, 4, None, expand=False)
@@ -180,6 +199,7 @@ def test_nonfinite_payload_is_preserved(native, runtime, dtype):
         "cache_length",
         "cache_shape",
         "cache_slots",
+        "cache_capacity",
         "cache_unprepared",
     ],
 )
@@ -189,6 +209,7 @@ def test_invalid_input_precedes_communication(native, runtime, kind):
     indices = torch.tensor([[0, 1, -1], [2, -1, 0]], device="cuda")
     weights = torch.ones((2, 3), device="cuda")
     alignment, experts, capacity, cached = 4, 3, 5, []
+    cached_expanded_capacity = 0
     if kind == "x_cpu":
         x = x.cpu()
     elif kind == "x_dtype":
@@ -227,21 +248,74 @@ def test_invalid_input_precedes_communication(native, runtime, kind):
         cached = [indices]
     else:
         state = native.dispatch_main(
-            runtime, x, indices, weights, experts, capacity, alignment, []
+            runtime, x, indices, weights, experts, capacity, alignment, [], 0
         )
-        if kind in ("cache_shape", "cache_slots"):
+        if kind in ("cache_shape", "cache_slots", "cache_capacity"):
             prepare_dispatch_metadata(state)
         cached = state.metadata
+        cached_expanded_capacity = int(state.counts[1])
         if kind == "cache_shape":
             cached[6] = torch.zeros((2, 2), device="cuda", dtype=torch.int64)
         elif kind == "cache_slots":
             cached[5] = torch.zeros(1, device="cuda", dtype=torch.int64)
+        elif kind == "cache_capacity":
+            cached_expanded_capacity = -1
     before = runtime.local_window().cpu().clone()
     with pytest.raises((RuntimeError, ValueError)):
         native.dispatch_main(
-            runtime, x, indices, weights, experts, capacity, alignment, cached
+            runtime,
+            x,
+            indices,
+            weights,
+            experts,
+            capacity,
+            alignment,
+            cached,
+            cached_expanded_capacity,
         )
     torch.testing.assert_close(runtime.local_window().cpu(), before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("expand", [False, True])
+@pytest.mark.parametrize("kind", ["mixed", "empty", "masked"])
+def test_cached_capacity_without_gpu_scalar_readback(native, runtime, expand, kind):
+    peer, _ = runtime
+    case = make_case(1, kind=kind, dtype=torch.bfloat16, hidden=256)
+    x, indices, weights = (
+        case.xs[0].cuda(),
+        case.indices[0].cuda(),
+        case.weights[0].cuda(),
+    )
+    state = native.dispatch_main(peer, x, indices, weights, 3, 5, 16, [], 0)
+    fresh = prepare_dispatch_epilogue(256, 3, 3, cached_mode=False).dispatch_epilogue
+    cached = prepare_dispatch_epilogue(256, 3, 3, cached_mode=True).dispatch_epilogue
+    fresh(state, expand, True, expand)
+    capacity = int(state.counts[1])
+    replay_case = replace(case, xs=[case.xs[0] + 2])
+    replay_x = replay_case.xs[0].cuda()
+
+    # Limit profiling to the native cached call; oracle reads occur afterwards.
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as profile:
+        replay = native.dispatch_main(
+            peer, replay_x, indices, weights, 3, 5, 16, state.metadata, capacity
+        )
+    operations = {event.key for event in profile.key_averages()}
+    assert not operations & {"aten::item", "aten::_local_scalar_dense"}
+    assert replay.counts.tolist() == state.counts.tolist()
+    outputs = cached(replay, expand, True, expand)
+    assert_dispatch_state(replay, replay_case, 0, 16, case.weights, expand=expand)
+    assert_dispatch_output(
+        replay,
+        outputs,
+        replay_case,
+        0,
+        16,
+        case.weights,
+        expand=expand,
+        zero_padding=expand,
+    )
 
 
 @pytest.mark.parametrize(

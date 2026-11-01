@@ -28,6 +28,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
                py::arg("max_tokens"),
                py::arg("alignment"),
                py::arg("cached_metadata"),
+               py::arg("cached_expanded_capacity"),
                py::arg("allow_multiple_reduction") = false);
     module.def("notify_counts", &nano_ep::notify_counts);
     module.def(

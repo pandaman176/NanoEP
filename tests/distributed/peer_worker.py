@@ -501,7 +501,7 @@ def check_dispatch_main(native, rank):
                 case.indices[rank].cuda(),
                 case.weights[rank].cuda(),
             )
-            state = native.dispatch_main(runtime, x, indices, weights, 6, 5, 4, [])
+            state = native.dispatch_main(runtime, x, indices, weights, 6, 5, 4, [], 0)
             assert not state.metadata_prepared and state.rank == rank
             prepare_dispatch_metadata(state)
             assert_dispatch_state(state, case, rank, 4, case.weights, expand=False)
@@ -515,14 +515,22 @@ def check_dispatch_main(native, rank):
                 case, indices=[torch.full_like(idx, -1) for idx in case.indices]
             )
             fresh = native.dispatch_main(
-                runtime, x, masked.indices[rank].cuda(), None, 6, 5, 1, []
+                runtime, x, masked.indices[rank].cuda(), None, 6, 5, 1, [], 0
             )
             prepare_dispatch_metadata(fresh)
             assert_dispatch_state(fresh, masked, rank, 1, None, expand=False)
             check_copy(fresh, masked, None, alignment=1)
             replay_case = replace(case, xs=[x * 2 for x in case.xs])
             replay = native.dispatch_main(
-                runtime, x * 2, indices, None, 6, 5, 4, state.metadata
+                runtime,
+                x * 2,
+                indices,
+                None,
+                6,
+                5,
+                4,
+                state.metadata,
+                int(state.counts[1]),
             )
             assert replay.metadata_prepared
             prepare_dispatch_metadata(replay)
@@ -532,7 +540,15 @@ def check_dispatch_main(native, rank):
                 case, xs=[x * 3 for x in case.xs], weights=[w * 4 for w in case.weights]
             )
             replay = native.dispatch_main(
-                runtime, x * 3, indices, weights * 4, 6, 5, 4, state.metadata
+                runtime,
+                x * 3,
+                indices,
+                weights * 4,
+                6,
+                5,
+                4,
+                state.metadata,
+                int(state.counts[1]),
             )
             prepare_dispatch_metadata(replay)
             assert_dispatch_state(

@@ -339,6 +339,7 @@ DispatchState dispatch_main(PeerRuntime& runtime,
                             int64_t max_tokens,
                             int64_t alignment,
                             const std::vector<torch::Tensor>& cached_meta_data,
+                            int64_t cached_expanded_capacity,
                             bool allow_multiple_reduction) {
     TORCH_CHECK(alignment > 0, "alignment must be positive");
     const auto window = runtime.local_window();
@@ -359,6 +360,7 @@ DispatchState dispatch_main(PeerRuntime& runtime,
     const auto route_indices = fresh ? routing_input.clone() : routing_input;
 
     if (!fresh) {
+        TORCH_CHECK(cached_expanded_capacity >= 0, "cached expanded capacity must be nonnegative");
         const int64_t recv_count = cached_meta_data[0].numel();
         const int64_t local_experts = num_experts / world_size;
         TORCH_CHECK(recv_count <= world_size * max_tokens, "cached receive count exceeds capacity");
@@ -419,7 +421,7 @@ DispatchState dispatch_main(PeerRuntime& runtime,
 
     const int64_t recv_count = fresh ? recv_counts.sum().item<int64_t>() : cached_meta_data[0].numel();
     const int64_t local_experts = num_experts / world_size;
-    const int64_t expanded_capacity = expert_offsets[local_experts].item<int64_t>();
+    const int64_t expanded_capacity = fresh ? expert_offsets[local_experts].item<int64_t>() : cached_expanded_capacity;
     const int64_t row_bytes = WindowLayout::payload_row_bytes(x.size(1), num_topk);
 
     auto stage_buffer =

@@ -32,7 +32,7 @@ def run(stage, kind):
             window[layout[1] + 32 : layout[1] + 40].view(torch.int64).zero_()
             native.reserve_and_put(runtime, x, indices, None, 3, 2)
         else:
-            state = native.dispatch_main(runtime, x, indices, None, 3, 2, 4, [])
+            state = native.dispatch_main(runtime, x, indices, None, 3, 2, 4, [], 0)
             if stage == "dispatch_epilogue":
                 prepare_dispatch_metadata(state)
         torch.cuda.synchronize()

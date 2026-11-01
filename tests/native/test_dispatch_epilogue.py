@@ -137,6 +137,7 @@ def check_fresh_and_cached(
             case.capacity,
             alignment,
             [],
+            0,
             allow_multiple_reduction,
         )
         outputs = epilogues[False](state, expand, weighted, zero_padding)
@@ -181,6 +182,7 @@ def check_fresh_and_cached(
                 case.capacity,
                 alignment,
                 state.metadata,
+                int(state.counts[1]),
                 allow_multiple_reduction,
             )
             assert replay.metadata_prepared
@@ -375,6 +377,7 @@ def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighte
     )
     with local_runtime(native, case) as (runtime, window, layout):
         cached = []
+        cached_expanded_capacity = 0
         for replay in (False, True):
             if replay:
                 case = replace(case, xs=[x.flip(0).contiguous()], weights=[-weights])
@@ -388,6 +391,7 @@ def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighte
                 tokens,
                 4,
                 cached,
+                cached_expanded_capacity,
             )
             outputs = epilogues[replay](state, expand, weighted, expand)
             assert_dispatch_state(
@@ -428,6 +432,7 @@ def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighte
                 assert (records[row, start + 2 * hidden :] == 165).all()
             assert (window[layout[2] + records.numel() :].cpu() == 165).all()
             cached = state.metadata
+            cached_expanded_capacity = int(state.counts[1])
 
 
 @pytest.mark.parametrize("geometry", [(512, 3, 3), (256, 2, 3), (256, 3, 4)])
@@ -446,6 +451,7 @@ def test_dispatch_geometry_mismatch_preserves_state(native, geometry, prepared):
             case.capacity,
             4,
             [],
+            0,
         )
         if prepared:
             correct(state, False, False, False)
@@ -520,6 +526,7 @@ def test_wrong_jit_cache_mode_preserves_state(native, prepared):
             case.capacity,
             4,
             [],
+            0,
         )
         if prepared:
             epilogues[False](state, False, False, False)
@@ -569,6 +576,7 @@ def test_prepared_state_retains_layout_without_reserving_again(
             case.capacity,
             alignment,
             [],
+            0,
         )
         assert not state.metadata_prepared
         initial_offsets = state.metadata[1].clone()

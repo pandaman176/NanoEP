@@ -88,7 +88,16 @@ def dispatch_runtime(monkeypatch):
     runtime = object()
 
     def main(
-        actual_runtime, x, routing, weights, experts, capacity, alignment, cached, mode
+        actual_runtime,
+        x,
+        routing,
+        weights,
+        experts,
+        capacity,
+        alignment,
+        cached,
+        cached_expanded_capacity,
+        mode,
     ):
         assert actual_runtime is runtime and current[0] is comm
         assert (experts, capacity) == (6, 5)
@@ -109,7 +118,9 @@ def dispatch_runtime(monkeypatch):
             ]
         state = SimpleNamespace(
             metadata=metadata,
-            counts=torch.tensor([2, 3 * alignment]),
+            counts=torch.tensor(
+                [2, cached_expanded_capacity if cached else 3 * alignment]
+            ),
             metadata_prepared=bool(cached),
             dtype=x.dtype,
         )
@@ -120,6 +131,7 @@ def dispatch_runtime(monkeypatch):
                 weights=weights,
                 alignment=alignment,
                 cached=cached,
+                cached_expanded_capacity=cached_expanded_capacity,
                 mode=mode,
                 state=state,
             )
@@ -236,6 +248,7 @@ def test_fresh_dispatch_wires_state_and_streams(
     )
     call = r.calls[0]
     assert call.mode is mode and call.cached == []
+    assert call.cached_expanded_capacity == 0
     assert call.x is x and call.routing is r.indices and call.weights is weights
     assert call.alignment == (1 if alignment is None else alignment)
     expand = layout is True
@@ -330,6 +343,7 @@ def test_cached_dispatch_reuses_handle_with_new_payload(
         and call.weights is new_weights
     )
     assert call.cached == old_metadata and call.state.metadata == old_metadata
+    assert call.cached_expanded_capacity == first.handle.layout.expanded_capacity
     assert call.alignment == 4 and call.state.epilogue_args == (
         expand,
         not weighted,
