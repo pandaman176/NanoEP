@@ -17,8 +17,8 @@ from nano_ep.testing.wire import align32, dispatch_offsets
 
 pytestmark = [pytest.mark.cuda]
 
-LAYOUTS = [(False, False), (True, False), (True, True)]
-LAYOUT_IDS = ["compact", "expanded", "expanded-zero-padding"]
+LAYOUTS = [(False, False), (False, True), (True, False), (True, True)]
+LAYOUT_IDS = ["compact", "compact-padding-ignored", "expanded", "expanded-zero-padding"]
 
 
 @pytest.fixture
@@ -432,3 +432,46 @@ def test_dispatch_geometry_mismatch_preserves_state(native, geometry, prepared):
         assert [tensor.data_ptr() for tensor in state.metadata] == pointers
         for actual, expected in zip(state.metadata, tensors, strict=True):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("zero_padding", [False, True])
+@pytest.mark.parametrize(
+    "experts,tokens,alignment",
+    [
+        (3, 1, 128),
+        (40, 1, 16),
+        (65, 1, 128),
+        (65, 9, 4),
+        (40, 9, 1),
+    ],
+)
+def test_padding_gaps_across_expert_waves(
+    native, experts, tokens, alignment, weighted, zero_padding
+):
+    hidden = 256
+    selected = [2, 33, experts - 1] if experts > 32 else [0, 1, 2]
+    indices = torch.tensor([selected] * tokens, dtype=torch.int64)
+    if tokens > 1:
+        indices[::2, 1] = -1
+        indices[::3, 2] = -1
+    x = (torch.arange(tokens * hidden).reshape(tokens, hidden) % 31 + 1).to(
+        torch.bfloat16
+    )
+    x[0, :3] = torch.tensor(
+        [float("nan"), float("inf"), -float("inf")], dtype=torch.bfloat16
+    )
+    weights = torch.arange(tokens * 3, dtype=torch.float32).reshape(tokens, 3) + 0.5
+    case = replace(
+        make_case(1, dtype=torch.bfloat16),
+        xs=[x],
+        indices=[indices],
+        weights=[weights],
+        hidden=hidden,
+        num_experts=experts,
+        num_topk=3,
+        capacity=tokens,
+        expert_matrices=torch.empty(0),
+    )
+    # One receive row leaves seven idle copy warps; padding may require many rounds.
+    check_fresh_and_cached(native, case, alignment, True, weighted, zero_padding)

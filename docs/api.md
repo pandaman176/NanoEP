@@ -98,8 +98,13 @@ in both compact and expanded layouts, preserving eight BF16 bit patterns per
 vector. H%256 and the aligned communication fields cover complete warp vectors;
 CUDA-allocated outputs preserve row alignment. A compile-time unroll factor is
 the largest divisor up to four of H/256, matching combine's selection rule;
-the inner vector loop is explicitly unrolled in both layouts. The 256-thread blocks,
-`ceil(N/8)` grids and whole-output zero padding remain unchanged. No TMA is used.
+the inner vector loop is explicitly unrolled in both layouts. Outputs use `empty`.
+The `kExpand && kZeroPadding` variant clears only expert gaps, including
+optional weight gaps, in the same copy kernel. All warps participate even when
+they have no receive row. A warp scan over each wave of 32 experts maps padding
+ordinals to `[offset[e] + count[e], offset[e+1])`; immutable counts and offsets
+are retained for cached replay. Compact ignores zero padding. The 256-thread
+blocks and `ceil(N/8)` grids are unchanged. No TMA is used.
 
 Low-level callers must load the core extension for `DispatchState` registration,
 then use the geometry module:

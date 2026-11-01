@@ -99,23 +99,14 @@ static std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool e
     const int64_t N = counts[0];
     const int64_t C = counts[1];
 
-    torch::Tensor x;
     const auto x_options = state.stage_buffer.options().dtype(state.x_dtype);
     const auto weight_options = state.stage_buffer.options().dtype(torch::kFloat32);
-    auto local_indices = torch::empty({0}, state.metadata[2].options());
     auto weights = torch::empty({0}, weight_options);
 
-    if (expand) {
-        x = zero_padding ? torch::zeros({C, kHidden}, x_options) : torch::empty({C, kHidden}, x_options);
-        if (with_weights) {
-            weights = zero_padding ? torch::zeros({C}, weight_options) : torch::empty({C}, weight_options);
-        }
-    } else {
-        x = torch::empty({N, kHidden}, x_options);
-        local_indices = torch::empty({N, kTopk}, state.metadata[2].options());
-        if (with_weights) {
-            weights = torch::empty({N, kTopk}, weight_options);
-        }
+    auto local_indices = expand ? torch::empty({0}, state.metadata[2].options()) : torch::empty({N, kTopk}, state.metadata[2].options());
+    torch::Tensor x = expand ? torch::empty({C, kHidden}, x_options) : torch::empty({N, kHidden}, x_options);
+    if (with_weights) {
+        weights = expand ? torch::empty({C}, weight_options) : torch::empty({N, kTopk}, weight_options);
     }
 
     if (N == 0)
@@ -127,26 +118,31 @@ static std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool e
     constexpr int warps_per_block = threads / 32;
     const int64_t blocks = (N + warps_per_block - 1) / warps_per_block;
 
-    const auto launch = [&]<bool kExpand, bool kWithWeights>() {
-        dispatch_copy_epilogue_kernel<kHidden, kTopk, kExpand, kWithWeights>
+    const auto launch = [&]<bool kExpand, bool kWithWeights, bool kZeroPadding>() {
+        dispatch_copy_epilogue_kernel<kHidden, kTopk, kExpertsPerRank, kExpand, kWithWeights, kZeroPadding>
             <<<blocks, threads, 0, stream.stream()>>>(state.stage_buffer.data_ptr<uint8_t>(),
                                                       state.metadata[2].data_ptr<int64_t>(),
                                                       state.metadata[5].data_ptr<int64_t>(),
+                                                      state.metadata[3].data_ptr<int64_t>(),
+                                                      state.metadata[4].data_ptr<int64_t>(),
                                                       x.data_ptr<at::BFloat16>(),
                                                       kExpand ? nullptr : local_indices.data_ptr<int64_t>(),
                                                       kWithWeights ? weights.data_ptr<float>() : nullptr,
                                                       N);
     };
+    const auto weighted = [&]<bool kExpand, bool kZeroPadding>() {
+        if (with_weights)
+            launch.template operator()<kExpand, true, kZeroPadding>();
+        else
+            launch.template operator()<kExpand, false, kZeroPadding>();
+    };
     if (expand) {
-        if (with_weights)
-            launch.template operator()<true, true>();
+        if (zero_padding)
+            weighted.template operator()<true, true>();
         else
-            launch.template operator()<true, false>();
+            weighted.template operator()<true, false>();
     } else {
-        if (with_weights)
-            launch.template operator()<false, true>();
-        else
-            launch.template operator()<false, false>();
+        weighted.template operator()<false, false>();
     }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
