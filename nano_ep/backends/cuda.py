@@ -91,7 +91,7 @@ class CudaBuffer:
         self._world_size = dist.get_world_size(group=group)
         self._rank = dist.get_rank(group=group)
         self._runtime = None
-        self._dispatch_epilogue = None
+        self._dispatch_epilogues = None
         self._combine_epilogue = None
         self._combine_main_module = None
         self._comm_stream = None
@@ -151,9 +151,12 @@ class CudaBuffer:
         allocation = {"handle": None, "error": None}
         try:
             self._backend = load_extension()
-            self._dispatch_epilogue = prepare_dispatch_epilogue(
-                config.hidden, config.num_topk, config.num_experts // self._world_size
-            ).dispatch_epilogue
+            self._dispatch_epilogues = tuple(
+                prepare_dispatch_epilogue(
+                    config.hidden, config.num_topk, config.num_experts // self._world_size, cached_mode=cached_mode
+                ).dispatch_epilogue
+                for cached_mode in (False, True)
+            )
             (
                 self._signal_offset,
                 self._count_offset,
@@ -340,7 +343,7 @@ class CudaBuffer:
                     cached_metadata,
                     self._allow_multiple_reduction,
                 )
-                outputs = self._dispatch_epilogue(state, expand, weights is not None, zero_padding)
+                outputs = self._dispatch_epilogues[state.metadata_prepared](state, expand, weights is not None, zero_padding)
                 metadata = state.metadata
                 recv_count, expanded_capacity = state.counts.tolist()  # Native-owned CPU int64 [2].
 

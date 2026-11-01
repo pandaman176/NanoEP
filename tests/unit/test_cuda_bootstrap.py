@@ -154,8 +154,12 @@ def bootstrap(monkeypatch):
         assert (hidden, topk, ranks, experts_per_rank, capacity) == (256, 2, 2, 2, 8)
         return SimpleNamespace(combine_epilogue=combine_epilogue)
 
-    def prepare_dispatch(hidden, topk, experts_per_rank):
-        operation("dispatch_specialization")
+    def prepare_dispatch(hidden, topk, experts_per_rank, *, cached_mode):
+        operation(
+            "dispatch_cached_specialization"
+            if cached_mode
+            else "dispatch_specialization"
+        )
         assert (hidden, topk, experts_per_rank) == (256, 2, 2)
         return SimpleNamespace(dispatch_epilogue=dispatch_epilogue)
 
@@ -195,7 +199,10 @@ def bootstrap(monkeypatch):
                     EPConfig(experts, 2, settings["hidden"], 8),
                     allow_multiple_reduction=mode,
                 )
-                assert buffer._dispatch_epilogue is dispatch_epilogue
+                assert buffer._dispatch_epilogues == (
+                    dispatch_epilogue,
+                    dispatch_epilogue,
+                )
                 assert buffer._combine_epilogue is combine_epilogue
                 assert buffer._combine_main_module.launcher == "main-launcher"
                 if close:
@@ -244,6 +251,9 @@ def test_bootstrap_and_collective_close(bootstrap, allow_multiple_reduction):
         assert operations.index("dispatch_specialization") < operations.index(
             "allocate"
         )
+        assert operations.index("dispatch_cached_specialization") < operations.index(
+            "allocate"
+        )
         assert (
             operations.index("initialize")
             < operations.index("window_ready")
@@ -260,6 +270,7 @@ def test_bootstrap_and_collective_close(bootstrap, allow_multiple_reduction):
         "specialization",
         "main_specialization",
         "dispatch_specialization",
+        "dispatch_cached_specialization",
         "allocate",
         "initialize",
         "window_ready",
@@ -281,6 +292,7 @@ def test_one_rank_failure_reaches_both_ranks(bootstrap, failure):
         "specialization",
         "main_specialization",
         "dispatch_specialization",
+        "dispatch_cached_specialization",
         "allocate",
         "initialize",
         "window_ready",

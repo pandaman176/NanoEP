@@ -1,6 +1,7 @@
 """Independent PeerRuntime acceptance; never constructs CudaBuffer."""
 
 import json
+import importlib.util
 import os
 import time
 from datetime import timedelta
@@ -20,7 +21,8 @@ from nano_ep.testing.wire import dispatch_offsets, dispatch_row_bytes
 
 
 @lru_cache(maxsize=1)
-def load_probe():
+def build_probe():
+    """Build in the launcher before starting distributed workers."""
     from torch.utils.cpp_extension import load
 
     return load(
@@ -28,6 +30,16 @@ def load_probe():
         sources=[str(Path(__file__).with_name("peer_probe.cu"))],
         extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo"],
     )
+
+
+@lru_cache(maxsize=1)
+def load_probe():
+    """Load the launcher's binary without entering the extension build lock."""
+    binary = Path(os.environ["NANO_EP_PEER_PROBE_PATH"])
+    spec = importlib.util.spec_from_file_location(binary.name.split(".")[0], binary)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def delayed_barrier(runtime, window, stream, epoch, rank, waiter):
@@ -257,7 +269,6 @@ def check_notify(native, rank):
 
 def check_payload(native, rank):
     hidden, topk, capacity = 256, 3, 11
-    metadata_builder = prepare_dispatch_epilogue(hidden, topk, 2).build_receive_metadata
     dist.barrier()
     layout = native.window_layout(2, capacity, hidden, topk, 4)
     runtime = native.PeerRuntime(rank, 2, layout[-1])
@@ -361,35 +372,6 @@ def check_payload(native, rank):
         assert seen == set(expected)
         return len(expected)
 
-    def validate_metadata(metadata, received, expert_counts, offsets):
-        src_ranks, src_tokens, local_indices, expanded_slots = metadata
-        recv_count = src_ranks.numel()
-        assert src_tokens.shape == (recv_count,)
-        assert local_indices.shape == expanded_slots.shape == (recv_count, topk)
-        expected_local = torch.full((recv_count, topk), -1, dtype=torch.int64)
-        for slot in range(recv_count):
-            row = received[
-                layout[2] + slot * row_bytes : layout[2] + (slot + 1) * row_bytes
-            ]
-            assert [src_ranks[slot].item(), src_tokens[slot].item()] == row[:16].view(
-                torch.int64
-            ).tolist()
-            for k, expert in enumerate(
-                row[dispatch_offsets(topk)[0] : dispatch_offsets(topk)[0] + 8 * topk]
-                .view(torch.int64)
-                .tolist()
-            ):
-                if rank * 2 <= expert < (rank + 1) * 2:
-                    expected_local[slot, k] = expert - rank * 2
-        torch.testing.assert_close(local_indices, expected_local)
-        assert (expanded_slots[expected_local < 0] == -1).all()
-        for expert, count in enumerate(expert_counts):
-            start = offsets[expert].item()
-            torch.testing.assert_close(
-                expanded_slots[expected_local == expert].sort().values,
-                torch.arange(start, start + count),
-            )
-
     for round_id, (dtype, weighted) in enumerate(
         (
             (torch.bfloat16, False),
@@ -398,7 +380,6 @@ def check_payload(native, rank):
             (torch.bfloat16, True),
         )
     ):
-        row_bytes = dispatch_row_bytes(hidden, topk)
         sources = [inputs(source, round_id, dtype, weighted) for source in range(2)]
         source_x, source_indices, source_weights = sources[rank]
         with torch.cuda.stream(stream):
@@ -422,18 +403,9 @@ def check_payload(native, rank):
                 for expert in range(2)
             ]
             assert received_experts.tolist() == expected_experts
-            offsets = torch.zeros(3, dtype=torch.int64, device=x.device)
-            offsets[1:] = ((received_experts + 3) // 4 * 4).cumsum(0)
-            stage_buffer = window.narrow(0, layout[2], expected_count * row_bytes).view(
-                expected_count, row_bytes
-            )
-            metadata = metadata_builder(stage_buffer, offsets, rank)
-            metadata_cpu = [tensor.cpu() for tensor in metadata]
-            offsets_cpu = offsets.cpu()
         assert (
             validate_payload(received, slots_cpu, sources, weighted) == expected_count
         )
-        validate_metadata(metadata_cpu, received, expected_experts, offsets_cpu)
 
         # Keep the old routing/slots and replace payloads, toggling weights.
         cached_sources = [
@@ -456,7 +428,6 @@ def check_payload(native, rank):
             )
             runtime.barrier(stream.cuda_stream)
             cached_received, cached_slots = window.cpu(), reused.cpu()
-            metadata_cpu = [tensor.cpu() for tensor in metadata]
         assert reused.data_ptr() == slots.data_ptr()
         torch.testing.assert_close(cached_slots, slots_cpu)
         assert (
@@ -465,12 +436,11 @@ def check_payload(native, rank):
             )
             == expected_count
         )
-        validate_metadata(metadata_cpu, cached_received, expected_experts, offsets_cpu)
 
     torch.cuda.synchronize()
     dist.barrier()
     runtime.close_peer_mappings()
-    del stage_buffer, counts, recv_next, window
+    del counts, recv_next, window
     dist.barrier()
     runtime.close()
     print(f"NANO_EP_PAYLOAD_RANK_OK={rank}", flush=True)
@@ -486,12 +456,17 @@ def check_dispatch_main(native, rank):
         prepare_dispatch_metadata,
     )
 
-    epilogue = prepare_dispatch_epilogue(256, 3, 3).dispatch_epilogue
+    epilogues = tuple(
+        prepare_dispatch_epilogue(256, 3, 3, cached_mode=mode).dispatch_epilogue
+        for mode in (False, True)
+    )
     dist.barrier()
 
     def check_copy(state, case, weights, alignment=4):
         for expand, zero_padding in ((False, False), (True, False), (True, True)):
-            outputs = epilogue(state, expand, weights is not None, zero_padding)
+            outputs = epilogues[state.metadata_prepared](
+                state, expand, weights is not None, zero_padding
+            )
             assert_dispatch_output(
                 state,
                 outputs,

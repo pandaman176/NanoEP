@@ -73,14 +73,15 @@ def test_main_and_epilogue_use_distinct_build_modules(builds):
     assert builds[0]["extra_include_paths"][0].endswith("include")
 
 
-def test_dispatch_geometry_specializes_only_consumed_dimensions(builds):
+@pytest.mark.parametrize("cached_mode", [False, True])
+def test_dispatch_geometry_specializes_only_consumed_dimensions(builds, cached_mode):
     geometry = (256, 3, 5)
-    first = prepare_dispatch_epilogue(*geometry)
-    assert prepare_dispatch_epilogue(*geometry) is first
+    first = prepare_dispatch_epilogue(*geometry, cached_mode=cached_mode)
+    assert prepare_dispatch_epilogue(*geometry, cached_mode=cached_mode) is first
     for position, value in enumerate((512, 8, 40)):
         changed = list(geometry)
         changed[position] = value
-        assert prepare_dispatch_epilogue(*changed) is not first
+        assert prepare_dispatch_epilogue(*changed, cached_mode=cached_mode) is not first
     assert len(builds) == 4
     assert len({entry["name"] for entry in builds}) == 4
     assert builds[0]["sources"][0].endswith("dispatch_epilogue.cu")
@@ -89,6 +90,7 @@ def test_dispatch_geometry_specializes_only_consumed_dimensions(builds):
         "-DNANO_EP_HIDDEN=256",
         "-DNANO_EP_TOPK=3",
         "-DNANO_EP_EXPERTS_PER_RANK=5",
+        f"-DNANO_EP_CACHED_MODE={int(cached_mode)}",
     ]
     assert first.name not in {
         prepare_combine_main(256, 3, 2, 5, 7).name,
@@ -110,5 +112,16 @@ def test_dispatch_geometry_specializes_only_consumed_dimensions(builds):
 )
 def test_invalid_dispatch_geometry_never_compiles(builds, geometry):
     with pytest.raises(RuntimeError, match="invalid dispatch epilogue geometry"):
-        prepare_dispatch_epilogue(*geometry)
+        prepare_dispatch_epilogue(*geometry, cached_mode=False)
     assert not builds
+
+
+def test_dispatch_cache_modes_build_distinct_modules(builds):
+    fresh = prepare_dispatch_epilogue(256, 3, 5, cached_mode=False)
+    cached = prepare_dispatch_epilogue(256, 3, 5, cached_mode=True)
+    assert fresh is not cached and fresh.name != cached.name
+    assert prepare_dispatch_epilogue(256, 3, 5, cached_mode=False) is fresh
+    assert prepare_dispatch_epilogue(256, 3, 5, cached_mode=True) is cached
+    assert len(builds) == 2
+    assert "-DNANO_EP_CACHED_MODE=0" in builds[0]["extra_cuda_cflags"]
+    assert "-DNANO_EP_CACHED_MODE=1" in builds[1]["extra_cuda_cflags"]

@@ -23,8 +23,10 @@ def test_public_cuda_dispatch(request):
             "public dispatch acceptance needs --nproc 1/2/4/8 and that many GPUs"
         )
     load_extension()
-    prepare_dispatch_epilogue(256, 3, 3)
-    prepare_dispatch_epilogue(512, 3, 3)
+    for cached_mode in (False, True):
+        prepare_dispatch_epilogue(256, 3, 3, cached_mode=cached_mode)
+    for cached_mode in (False, True):
+        prepare_dispatch_epilogue(512, 3, 3, cached_mode=cached_mode)
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["NANO_EP_EXPECTED_WORLD"] = str(nproc)

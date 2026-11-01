@@ -121,7 +121,7 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
     other = make_case(size, topk, dtype, 1)
     config = EPConfig(original.num_experts, topk, original.hidden, original.capacity)
     with CudaBuffer(dist.group.WORLD, config, allow_multiple_reduction=mode) as buffer:
-        dispatch_copy = buffer._dispatch_epilogue
+        dispatch_copies = buffer._dispatch_epilogues
         combine_reduce = buffer._combine_epilogue
         assert buffer._payload_offset == buffer._return_offset
         payload_bytes = (
@@ -146,7 +146,7 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
             snapshots.append((before, after))
 
         def dispatch_epilogue(*args):
-            outputs = dispatch_copy(*args)
+            outputs = dispatch_copies[args[0].metadata_prepared](*args)
             if rank == 0 and not dispatch_gates:
                 # Keep an old arena reader pending until peer 1 attempts combine.
                 delay_reader(args[0].stage_buffer, 3)
@@ -161,7 +161,7 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
                 combine_gates.append(5)
             return outputs
 
-        buffer._dispatch_epilogue = dispatch_epilogue
+        buffer._dispatch_epilogues = (dispatch_epilogue, dispatch_epilogue)
         buffer._combine_epilogue = combine_epilogue
         with torch.cuda.stream(buffer._comm_stream):
             # All-one FP32 bytes are NaN. Unwritten records must never contribute.

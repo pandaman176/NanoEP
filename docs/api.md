@@ -86,14 +86,21 @@ Low-level `native.combine_main(...)` requires `launcher=prepare_combine_main(H,K
 
 ## Specialized dispatch epilogue
 
-`prepare_dispatch_epilogue(H, K, experts_per_rank)` compiles both receive metadata
-and payload copy kernels in a separate module. `CudaBuffer` prewarms this module
-before allocating/exporting IPC windows and reports build failures collectively.
+`prepare_dispatch_epilogue(H, K, experts_per_rank, cached_mode=...)` compiles a
+fused dispatch epilogue for one geometry and cache mode. `CudaBuffer` prewarms
+both fresh and cached modules before allocating/exporting IPC windows and
+reports build failures collectively.
 H/K/local-expert-count are compile-time constants; row bytes and field offsets
 are derived from H/K. Actual N/C and rank remain runtime values. R, Tmax and
 alignment are not specialization keys: the kernels use the existing padded
-expert offsets. Fresh dispatch still launches metadata and copy separately;
-cached dispatch reuses metadata. Payload copies use 16-byte `int4` loads/stores
+expert offsets. Fresh dispatch localizes IDs, reserves slots, saves all receive
+metadata and copies payloads in one kernel. Each lane retains its local ID and
+slot in registers; expanded copies broadcast slots with warp shuffles instead
+of rereading freshly written metadata. `NANO_EP_CACHED_MODE` fixes `kCachedMode`
+at JIT compilation; module names and cache keys distinguish both modes. The
+cached specialization reads existing mappings without allocating cursors or
+reserving slots. Host launchers do not dispatch between cache-mode templates.
+Payload copies use 16-byte `int4` loads/stores
 in both compact and expanded layouts, preserving eight BF16 bit patterns per
 vector. H%256 and the aligned communication fields cover complete warp vectors;
 CUDA-allocated outputs preserve row alignment. A compile-time unroll factor is
@@ -110,12 +117,14 @@ Low-level callers must load the core extension for `DispatchState` registration,
 then use the geometry module:
 
 ```python
-module = prepare_dispatch_epilogue(H, K, experts_per_rank)
+module = prepare_dispatch_epilogue(H, K, experts_per_rank, cached_mode=state.metadata_prepared)
 x, indices, weights = module.dispatch_epilogue(state, expand, with_weights, zero_padding)
-src_ranks, src_tokens, local_ids, slots = module.build_receive_metadata(stage_buffer, expert_offsets, rank)
 ```
 
-The old core `native.dispatch_epilogue` and `native.build_receive_metadata` entries
-are removed. Geometry mismatches fail before metadata preparation. Rebuild the
+The old core `native.dispatch_epilogue` entry and all standalone
+`build_receive_metadata` entries are removed. Geometry mismatches fail before metadata preparation. Rebuild the
 core extension and restart the process; public `CudaBuffer.dispatch` arguments,
-wire layout, metadata snapshots and output ownership are unchanged.
+wire layout, metadata snapshots and output ownership are unchanged. The internal
+factory now requires keyword-only `cached_mode`; a mode mismatch is rejected
+before state mutation. Repeated epilogue calls on a prepared state use the
+cached module, including states originally created by a fresh dispatch.

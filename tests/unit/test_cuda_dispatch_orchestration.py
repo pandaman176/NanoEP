@@ -183,7 +183,15 @@ def dispatch_runtime(monkeypatch):
     buffer._runtime = runtime
     buffer._comm_stream = comm
     buffer._backend = SimpleNamespace(dispatch_main=main)
-    buffer._dispatch_epilogue = epilogue
+
+    def mode_epilogue(cached_mode):
+        def bound(state, *args):
+            assert state.metadata_prepared is cached_mode
+            return epilogue(state, *args)
+
+        return bound
+
+    buffer._dispatch_epilogues = (mode_epilogue(False), mode_epilogue(True))
     buffer._allow_multiple_reduction = False
     return SimpleNamespace(
         buffer=buffer,

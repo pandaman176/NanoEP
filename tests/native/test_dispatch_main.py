@@ -44,7 +44,8 @@ def native(request):
     if not torch.cuda.is_available():
         pytest.fail("CUDA tests requested but NVIDIA CUDA is unavailable")
     native = load_extension()
-    prepare_dispatch_epilogue(256, 3, 3)
+    for cached_mode in (False, True):
+        prepare_dispatch_epilogue(256, 3, 3, cached_mode=cached_mode)
     return native
 
 

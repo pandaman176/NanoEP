@@ -82,15 +82,15 @@ def make_payloads(size, kind, dtype, hidden):
 
 
 def check_rounds(buffer, rank, size):
-    dispatch_epilogue = buffer._dispatch_epilogue
+    dispatch_epilogues = buffer._dispatch_epilogues
     delay = [False]
 
     def epilogue(*args):
         if delay[0]:
             torch.cuda._sleep(20_000_000)
-        return dispatch_epilogue(*args)
+        return dispatch_epilogues[args[0].metadata_prepared](*args)
 
-    buffer._dispatch_epilogue = epilogue
+    buffer._dispatch_epilogues = (epilogue, epilogue)
     for expand, dtype, weighted, asynchronous, kind in product(
         (False, True),
         (torch.bfloat16,),

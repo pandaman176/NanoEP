@@ -66,7 +66,7 @@ def prepare_dispatch_metadata(state):
     """Prepare and validate the complete dispatch receive metadata."""
     experts = state.metadata[3 if state.metadata_prepared else 0].numel()
     topk = state.metadata[8 if state.metadata_prepared else 4].shape[1]
-    epilogue = prepare_dispatch_epilogue(state.hidden, topk, experts).dispatch_epilogue
+    epilogue = prepare_dispatch_epilogue(state.hidden, topk, experts, cached_mode=state.metadata_prepared).dispatch_epilogue
     epilogue(state, False, False, False)
     assert state.metadata_prepared
 

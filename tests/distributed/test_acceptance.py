@@ -45,7 +45,8 @@ def test_delivery_profile(request, profile, tmp_path):
     name, layout, dtype, tokens, hidden, topk, pattern, iterations, asynchronous = (
         profile
     )
-    prepare_dispatch_epilogue(hidden, topk, 8)
+    for cached_mode in (False, True):
+        prepare_dispatch_epilogue(hidden, topk, 8, cached_mode=cached_mode)
     command = [
         sys.executable,
         "-m",

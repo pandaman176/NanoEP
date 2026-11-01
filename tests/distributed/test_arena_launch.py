@@ -22,14 +22,17 @@ def test_shared_arena_lifecycle(request):
         pytest.skip("delayed-reader arena checks require at least two peers")
     if nproc not in (2, 4, 8) or torch.cuda.device_count() < nproc:
         pytest.fail("shared arena acceptance requires nproc 2/4/8 and that many GPUs")
-    from peer_worker import load_probe
+    from peer_worker import build_probe
 
     load_extension()
-    prepare_dispatch_epilogue(256, 3, 8)
-    prepare_dispatch_epilogue(256, 8, 8)
-    load_probe()
+    for cached_mode in (False, True):
+        prepare_dispatch_epilogue(256, 3, 8, cached_mode=cached_mode)
+    for cached_mode in (False, True):
+        prepare_dispatch_epilogue(256, 8, 8, cached_mode=cached_mode)
+    probe = build_probe()
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
+    env["NANO_EP_PEER_PROBE_PATH"] = probe.__file__
     env.setdefault("OMP_NUM_THREADS", "1")
     logs = Path(env.get("NANO_EP_LOG_DIR", repo / ".nano_ep_logs"))
     logs.mkdir(parents=True, exist_ok=True)

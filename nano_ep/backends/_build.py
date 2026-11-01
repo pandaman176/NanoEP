@@ -91,8 +91,8 @@ def prepare_combine_main(hidden: int, topk: int, world_size: int, experts_per_ra
 
 
 @cache
-def prepare_dispatch_epilogue(hidden: int, topk: int, experts_per_rank: int):
-    """Compile H/K/local-expert geometry before entering IPC collectives."""
+def prepare_dispatch_epilogue(hidden: int, topk: int, experts_per_rank: int, *, cached_mode: bool):
+    """Compile one geometry and cache mode before entering IPC collectives."""
     from torch.utils.cpp_extension import load
 
     if hidden <= 0 or hidden > 2**31 - 1 or hidden % 256 or not 1 <= topk <= 32 or experts_per_rank <= 0:
@@ -101,8 +101,9 @@ def prepare_dispatch_epilogue(hidden: int, topk: int, experts_per_rank: int):
     geometry = (hidden, topk, experts_per_rank)
     names = ("HIDDEN", "TOPK", "EXPERTS_PER_RANK")
     defines = [f"-DNANO_EP_{name}={value}" for name, value in zip(names, geometry, strict=True)]
+    defines.append(f"-DNANO_EP_CACHED_MODE={int(cached_mode)}")
     return load(
-        name="nano_ep_dispatch_epilogue_" + "_".join(map(str, geometry)),
+        name="nano_ep_dispatch_epilogue_" + "_".join(map(str, geometry)) + f"_cached{int(cached_mode)}",
         sources=[str(source / "dispatch_epilogue.cu")],
         extra_include_paths=[str(source / "include")],
         extra_cflags=["-O2", "-std=c++20"],

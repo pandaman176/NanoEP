@@ -106,9 +106,12 @@ def check_fresh_and_cached(
     zero_padding,
     allow_multiple_reduction=False,
 ):
-    epilogue = prepare_dispatch_epilogue(
-        case.hidden, case.num_topk, case.num_experts
-    ).dispatch_epilogue
+    epilogues = tuple(
+        prepare_dispatch_epilogue(
+            case.hidden, case.num_topk, case.num_experts, cached_mode=mode
+        ).dispatch_epilogue
+        for mode in (False, True)
+    )
     stream = torch.cuda.Stream()
     with (
         local_runtime(native, case, allow_multiple_reduction) as (
@@ -136,7 +139,7 @@ def check_fresh_and_cached(
             [],
             allow_multiple_reduction,
         )
-        outputs = epilogue(state, expand, weighted, zero_padding)
+        outputs = epilogues[False](state, expand, weighted, zero_padding)
         assert_dispatch_state(
             state, case, 0, alignment, case.weights if weighted else None
         )
@@ -181,7 +184,9 @@ def check_fresh_and_cached(
                 allow_multiple_reduction,
             )
             assert replay.metadata_prepared
-            replay_outputs = epilogue(replay, expand, replay_weighted, zero_padding)
+            replay_outputs = epilogues[True](
+                replay, expand, replay_weighted, zero_padding
+            )
             assert_dispatch_output(
                 replay,
                 replay_outputs,
@@ -347,9 +352,12 @@ def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighte
         capacity=tokens,
         expert_matrices=torch.empty(0),
     )
-    epilogue = prepare_dispatch_epilogue(
-        hidden, topk, case.num_experts
-    ).dispatch_epilogue
+    epilogues = tuple(
+        prepare_dispatch_epilogue(
+            hidden, topk, case.num_experts, cached_mode=mode
+        ).dispatch_epilogue
+        for mode in (False, True)
+    )
     with local_runtime(native, case) as (runtime, window, layout):
         cached = []
         for replay in (False, True):
@@ -366,7 +374,7 @@ def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighte
                 4,
                 cached,
             )
-            outputs = epilogue(state, expand, weighted, expand)
+            outputs = epilogues[replay](state, expand, weighted, expand)
             assert_dispatch_state(state, case, 0, 4, case.weights if weighted else None)
             assert_dispatch_output(
                 state,
@@ -408,8 +416,8 @@ def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighte
 @pytest.mark.parametrize("geometry", [(512, 3, 3), (256, 2, 3), (256, 3, 4)])
 @pytest.mark.parametrize("prepared", [False, True])
 def test_dispatch_geometry_mismatch_preserves_state(native, geometry, prepared):
-    correct = prepare_dispatch_epilogue(256, 3, 3).dispatch_epilogue
-    wrong = prepare_dispatch_epilogue(*geometry).dispatch_epilogue
+    correct = prepare_dispatch_epilogue(256, 3, 3, cached_mode=False).dispatch_epilogue
+    wrong = prepare_dispatch_epilogue(*geometry, cached_mode=prepared).dispatch_epilogue
     case = copy_case("mixed", torch.bfloat16, 256)
     with local_runtime(native, case) as (runtime, window, layout):
         state = native.dispatch_main(
@@ -475,3 +483,108 @@ def test_padding_gaps_across_expert_waves(
     )
     # One receive row leaves seven idle copy warps; padding may require many rounds.
     check_fresh_and_cached(native, case, alignment, True, weighted, zero_padding)
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_wrong_jit_cache_mode_preserves_state(native, prepared):
+    epilogues = tuple(
+        prepare_dispatch_epilogue(256, 3, 3, cached_mode=mode).dispatch_epilogue
+        for mode in (False, True)
+    )
+    case = copy_case("mixed", torch.bfloat16, 256)
+    with local_runtime(native, case) as (runtime, window, layout):
+        state = native.dispatch_main(
+            runtime,
+            case.xs[0].cuda(),
+            case.indices[0].cuda(),
+            None,
+            case.num_experts,
+            case.capacity,
+            4,
+            [],
+        )
+        if prepared:
+            epilogues[False](state, False, False, False)
+        saved = [tensor.clone() for tensor in state.metadata]
+        pointers = [tensor.data_ptr() for tensor in state.metadata]
+        with pytest.raises(RuntimeError, match="cached_mode does not match"):
+            epilogues[not prepared](state, True, False, True)
+        assert state.metadata_prepared is prepared
+        assert [tensor.data_ptr() for tensor in state.metadata] == pointers
+        for actual, expected in zip(state.metadata, saved, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("expand", [False, True])
+@pytest.mark.parametrize("topk", [3, 32])
+@pytest.mark.parametrize("tokens", [1, 257])
+def test_prepared_state_switches_layout_without_reserving_again(
+    native, expand, topk, tokens
+):
+    hidden, alignment = 256, 128
+    indices = torch.arange(topk).repeat(tokens, 1)
+    indices[::2, 1::2] = -1
+    case = replace(
+        copy_case("mixed", torch.bfloat16, hidden, tokens=tokens),
+        indices=[indices],
+        weights=[torch.arange(tokens * topk).reshape(tokens, topk).float() + 0.5],
+        num_topk=topk,
+        num_experts=topk,
+    )
+    epilogues = tuple(
+        prepare_dispatch_epilogue(
+            hidden, topk, topk, cached_mode=mode
+        ).dispatch_epilogue
+        for mode in (False, True)
+    )
+    stream = torch.cuda.Stream()
+    with (
+        local_runtime(native, case) as (runtime, window, layout),
+        torch.cuda.stream(stream),
+    ):
+        state = native.dispatch_main(
+            runtime,
+            case.xs[0].cuda(),
+            case.indices[0].cuda(),
+            case.weights[0].cuda(),
+            topk,
+            case.capacity,
+            alignment,
+            [],
+        )
+        assert not state.metadata_prepared
+        initial_offsets = state.metadata[1].clone()
+        outputs = epilogues[False](state, expand, True, True)
+        assert_dispatch_state(state, case, 0, alignment, case.weights)
+        assert_dispatch_output(
+            state,
+            outputs,
+            case,
+            0,
+            alignment,
+            case.weights,
+            expand=expand,
+            zero_padding=True,
+        )
+        saved = [tensor.clone() for tensor in state.metadata]
+        pointers = [tensor.data_ptr() for tensor in state.metadata]
+        saved_outputs = [tensor.clone() for tensor in outputs]
+
+        # Both layouts must retain the full mapping, including slots not used by compact copy.
+        replay_outputs = epilogues[True](state, not expand, False, True)
+        assert_dispatch_output(
+            state,
+            replay_outputs,
+            case,
+            0,
+            alignment,
+            None,
+            expand=not expand,
+            zero_padding=True,
+        )
+        assert [tensor.data_ptr() for tensor in state.metadata] == pointers
+        for actual, expected in zip(state.metadata, saved, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(state.metadata[4], initial_offsets)
+        for actual, expected in zip(outputs, saved_outputs, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)

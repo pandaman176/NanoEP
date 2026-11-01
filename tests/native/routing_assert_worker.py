@@ -13,7 +13,8 @@ def run(stage, kind):
     torch.cuda.set_device(0)
     native = load_extension()
     if stage == "dispatch_epilogue":
-        prepare_dispatch_epilogue(256, 3, 3)
+        for cached_mode in (False, True):
+            prepare_dispatch_epilogue(256, 3, 3, cached_mode=cached_mode)
     x = torch.ones((2, 256), dtype=torch.bfloat16, device="cuda")
     valid = torch.tensor([[0, 1, -1], [2, -1, 0]], device="cuda")
     if stage != "route_counts":

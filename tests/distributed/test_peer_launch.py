@@ -19,14 +19,17 @@ def test_peer_runtime_two_ranks(request):
         pytest.skip("independent PeerRuntime acceptance targets --nproc 2")
     if torch.cuda.device_count() < 2:
         pytest.fail("PeerRuntime acceptance requires two visible CUDA GPUs")
-    from peer_worker import load_probe
+    from peer_worker import build_probe
 
     load_extension()
-    load_probe()  # Build before the worker timeout starts.
-    prepare_dispatch_epilogue(256, 3, 2)
-    prepare_dispatch_epilogue(256, 3, 3)
+    probe = build_probe()
+    for cached_mode in (False, True):
+        prepare_dispatch_epilogue(256, 3, 2, cached_mode=cached_mode)
+    for cached_mode in (False, True):
+        prepare_dispatch_epilogue(256, 3, 3, cached_mode=cached_mode)
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
+    env["NANO_EP_PEER_PROBE_PATH"] = probe.__file__
     env.setdefault("OMP_NUM_THREADS", "1")
     logs = Path(env.get("NANO_EP_LOG_DIR", repo / ".nano_ep_logs"))
     logs.mkdir(parents=True, exist_ok=True)

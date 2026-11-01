@@ -19,7 +19,8 @@ def test_cuda_buffer_bootstrap(request):
     if nproc < 1 or torch.cuda.device_count() < nproc:
         pytest.fail(f"bootstrap acceptance needs {nproc} visible CUDA GPUs")
     load_extension()
-    prepare_dispatch_epilogue(256, 2, 2)
+    for cached_mode in (False, True):
+        prepare_dispatch_epilogue(256, 2, 2, cached_mode=cached_mode)
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["NANO_EP_EXPECTED_WORLD"] = str(nproc)

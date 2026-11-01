@@ -22,13 +22,14 @@ def test_cooperative_combine_barriers(request):
         pytest.skip("cross-GPU combine barriers require at least two peers")
     if nproc not in (2, 4, 8) or torch.cuda.device_count() < nproc:
         pytest.fail("cooperative combine acceptance requires 2/4/8 visible GPUs")
-    from peer_worker import load_probe
+    from peer_worker import build_probe
 
     load_extension()
-    load_probe()
+    probe = build_probe()
     prepare_combine_main(256, 3, nproc, 3, 2153)
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
+    env["NANO_EP_PEER_PROBE_PATH"] = probe.__file__
     env.setdefault("OMP_NUM_THREADS", "1")
     logs = Path(env.get("NANO_EP_LOG_DIR", repo / ".nano_ep_logs"))
     logs.mkdir(parents=True, exist_ok=True)
