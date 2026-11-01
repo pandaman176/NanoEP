@@ -151,10 +151,12 @@ __global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,      
         return 1;
     }();
     const int lane = threadIdx.x % kWarpSize;
-    const int64_t row = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / kWarpSize;
+    const int warp_idx = threadIdx.x / kWarpSize;
+    // Distribute the first rows across blocks before assigning another warp to each block.
+    const int64_t global_warp_idx = static_cast<int64_t>(warp_idx) * gridDim.x + blockIdx.x;
     const int64_t total_warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / kWarpSize);
 
-    if (row < recv_count) {
+    for (int64_t row = global_warp_idx; row < recv_count; row += total_warps) {
         const auto* payload = stage_buffer + row * kRowBytes;
         const auto* weights = reinterpret_cast<const float*>(payload + WindowLayout::payload_weights_offset(kTopk));
         const auto* x_vectors = reinterpret_cast<const int4*>(payload + WindowLayout::payload_x_offset(kTopk));
@@ -220,7 +222,7 @@ __global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,      
 
     if constexpr (kExpand && kZeroPadding) {
         do_zero_padding<kHidden, kExpertsPerRank, kUnrollFactor, kWithWeights>(
-            expert_counts, expert_offsets, recv_x, recv_weights, row, total_warps, lane);
+            expert_counts, expert_offsets, recv_x, recv_weights, global_warp_idx, total_warps, lane);
     }
 }
 

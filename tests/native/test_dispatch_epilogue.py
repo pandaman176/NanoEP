@@ -248,6 +248,21 @@ def test_dispatch_copy_multiple_blocks(native, expand, zero_padding, dtype):
 
 
 @pytest.mark.parametrize("expand,zero_padding", LAYOUTS, ids=LAYOUT_IDS)
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("hidden", [512, 768])
+def test_dispatch_copy_multiple_grid_rounds(
+    native, expand, zero_padding, weighted, hidden
+):
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    total_warps = properties.multi_processor_count * 8
+    tokens = 2 * total_warps + 3
+    case = copy_case("skew", torch.bfloat16, hidden, tokens=tokens)
+    # Every source row arrives; later rounds also contain masked assignments.
+    case.indices[0][::2, 1:] = -1
+    check_fresh_and_cached(native, case, 128, expand, weighted, zero_padding)
+
+
+@pytest.mark.parametrize("expand,zero_padding", LAYOUTS, ids=LAYOUT_IDS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("allow_multiple_reduction", [False, True])
 def test_dispatch_uses_allocated_reduction_mode(
@@ -450,6 +465,7 @@ def test_dispatch_geometry_mismatch_preserves_state(native, geometry, prepared):
         (3, 1, 128),
         (40, 1, 16),
         (65, 1, 128),
+        (65, 1, 1024),
         (65, 9, 4),
         (40, 9, 1),
     ],
@@ -481,7 +497,7 @@ def test_padding_gaps_across_expert_waves(
         capacity=tokens,
         expert_matrices=torch.empty(0),
     )
-    # One receive row leaves seven idle copy warps; padding may require many rounds.
+    # One receive row leaves the other copy warps available for padding work.
     check_fresh_and_cached(native, case, alignment, True, weighted, zero_padding)
 
 

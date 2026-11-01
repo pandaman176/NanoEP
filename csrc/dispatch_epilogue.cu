@@ -80,8 +80,7 @@ static std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool e
         expert_cursor = state.metadata[4].narrow(0, 0, kExpertsPerRank).clone();
 
     constexpr int threads = 256;
-    constexpr int warps_per_block = threads / 32;
-    const int64_t blocks = (N + warps_per_block - 1) / warps_per_block;
+    const int blocks = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
     const auto launch = [&]<bool kExpand, bool kWithWeights, bool kZeroPadding>() {
         dispatch_copy_epilogue_kernel<kHidden, kTopk, kExpertsPerRank, kCachedMode, kExpand, kWithWeights, kZeroPadding>
