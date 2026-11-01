@@ -173,26 +173,32 @@ __global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,      
 
         if constexpr (kExpand) {
             // All lanes exchange register-held slots; no fresh metadata is reread.
-            unsigned remaining = __ballot_sync(0xffffffffu, assignment.slot >= 0);
-            while (remaining != 0) {
-                const int k = __ffs(remaining) - 1;
-                const int64_t slot = __shfl_sync(0xffffffffu, assignment.slot, k);
+            const unsigned remaining = __ballot_sync(0xffffffffu, assignment.slot >= 0);
 
-                if constexpr (kWithWeights) {
-                    if (lane == 0) {
-                        recv_weights[slot] = weights[k];
-                    }
+            if constexpr (kWithWeights) {
+                if (assignment.slot >= 0)
+                    recv_weights[assignment.slot] = weights[lane];
+            }
+
+            for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
+                unsigned pending = remaining;
+                int4 hidden_slices[kUnrollFactor];
+#pragma unroll
+                for (int u = 0; u < kUnrollFactor; ++u) {
+                    const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
+                    hidden_slices[u] = x_vectors[index];
                 }
-
-                auto* output_vectors = reinterpret_cast<int4*>(recv_x + slot * kHidden);
-                for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
+                while (pending != 0) {
+                    const int k = __ffs(pending) - 1;
+                    const int64_t slot = __shfl_sync(0xffffffffu, assignment.slot, k);
+                    auto* output_vectors = reinterpret_cast<int4*>(recv_x + slot * kHidden);
 #pragma unroll
                     for (int u = 0; u < kUnrollFactor; ++u) {
                         const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
-                        output_vectors[index] = x_vectors[index];
+                        output_vectors[index] = hidden_slices[u];
                     }
+                    pending &= pending - 1;
                 }
-                remaining &= remaining - 1;
             }
         } else {
             for (int64_t k = lane; k < kTopk; k += kWarpSize) {

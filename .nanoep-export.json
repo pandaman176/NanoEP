@@ -13,7 +13,7 @@
     "csrc/combine_main.cu": "a55a0708a7cf1290726bc4ab7389036f70ea9cccbeacf21054c6bcbfb018d6c0",
     "csrc/combine_main.cuh": "2c5867884026a2a7456b9a63ca97cf71797e58133d0d84a1130b02252de42398",
     "csrc/dispatch_epilogue.cu": "24f9a918fabd049b6656974a3fabb17296a548903e3fa7c76e427a27e2604207",
-    "csrc/dispatch_epilogue.cuh": "f553199b058b5c037108bcd267cd49ae0b31e11c24571b83bddb6c5e74db2c68",
+    "csrc/dispatch_epilogue.cuh": "e4e8d83c017651e91115817361de3a50d76d63e97aa064b3d10223b74472a062",
     "csrc/include/nano_ep/barrier.cuh": "15a1eaf7d8cfe185cfcdf9534ab4d4ea28238c71124e2ce68efd0f88f9ec7a7a",
     "csrc/include/nano_ep/ops.hpp": "c951ab742de14ee14c2cbb6665cc7e46421139b91107ce23398c23237d167e2e",
     "csrc/include/nano_ep/peer.hpp": "82354bffc31ba0a9aff998e2a3bebc75701cdb64a389e4cd6fa3a9184dbd0b69",
