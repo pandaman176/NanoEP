@@ -1,230 +1,96 @@
 # API
 
-`CudaBuffer(group, config, *, allow_multiple_reduction=False)` is a collective, single-node buffer. Use a Gloo group containing all local workers and one distinct GPU per process. Let `R` be the number of ranks, `E` the number of experts, `K` the top-k size, `H` the hidden dimension, and `Tmax` the source token capacity per rank. Expert placement is contiguous: rank `r` owns `[r * E/R, (r+1) * E/R)`. `EPConfig(E, K, H, Tmax)` requires positive dimensions, `E % R == 0`, `K <= min(32, E)` and source token count `T <= Tmax`.
+`CudaBuffer(group, config, *, allow_multiple_reduction=False)` collectively creates a single-node CUDA IPC buffer. Use a Gloo group, one GPU per process, and the same collective order on every rank. Keep each process on its assigned GPU.
+
+`EPConfig(num_experts=E, num_topk=K, hidden=H, num_max_tokens_per_rank=Tmax)` uses contiguous expert placement: rank `r` owns `[r * E/R, (r+1) * E/R)`, where `R` is the group size.
+
+- `R` is a power of two in `[1,32]`; `E > 0` and `E % R == 0`.
+- `1 <= K <= min(32,E)`; `H` is a positive multiple of 256; `Tmax > 0`.
+- Each source has `0 <= T <= Tmax`. Empty ranks still participate.
 
 ## Dispatch
 
 ```python
 received = buffer.dispatch(
-    x,
-    topk_idx=indices,
-    weights=weights,
-    do_expand=False,
-    alignment=1,
-    zero_padding=False,
-    previous_event=None,
-    async_op=False,
+    x, topk_idx=indices, weights=weights,
+    do_expand=False, alignment=1, zero_padding=False,
+    previous_event=None, async_op=False,
 )
 ```
 
-Inputs must be contiguous on the local GPU: `x[T,H]` is BF16, `indices[T,K]` is int64 and optional `weights[T,K]` is FP32. Indices are global expert IDs or `-1`; valid expert IDs in each token must be distinct. Empty source ranks are supported and must participate. All ranks agree on payload dtype, weight presence and collective order.
+Inputs are contiguous tensors on the local GPU: BF16 `x[T,H]`, int64 `indices[T,K]`, and optional FP32 `weights[T,K]`. Nonempty x must have a 16-byte-aligned data pointer; use `clone()` to realign an offset view. Indices are global expert IDs or `-1`; valid experts within each token must be distinct. All ranks agree on weight presence and collective settings. `alignment` is a positive integer.
 
-Compact output has `x[N,H]`, local `topk_idx[N,K]`, and optional weights `[N,K]`. A source token appears once per destination rank, even if it selects several local experts. Nonlocal/masked IDs are `-1`; weights retain the complete original row.
+`N` counts received `(source token, destination rank)` pairs; `C` is the padded assignment capacity. The same token is sent once to a rank even when it selects several experts there. Receive order is unspecified.
 
-Expanded output has expert-major `x[C,H]`, `topk_idx=None`, and optional weights `[C]`. `C` includes per-expert alignment gaps. Padding is only initialized when `zero_padding=True`; otherwise do not read it. Receive order is unspecified.
+| Result field | Compact | Expanded |
+| --- | --- | --- |
+| `x` | BF16 `[N,H]` | BF16 `[C,H]`, expert-major |
+| `topk_idx` | int64 `[N,K]`, local IDs or `-1` | `None` |
+| `topk_weights` | FP32 `[N,K]`, complete source rows | FP32 `[C]` |
 
-`received.handle.layout` contains CUDA int64 `src_ranks[N]`, `src_tokens[N]`, `local_topk_idx[N,K]`, `expert_counts[L]`, `expert_offsets[L+1]` and `expanded_slots`, where `L=E/R`. Counts describe actual assignments; offsets include alignment. Expanded slots have shape `[N,K]`, with invalid entries set to `-1`; compact slots have shape `[0]`. Metadata rows remain rank-deduplicated in both layouts.
+Without weights, `topk_weights` is `None`. In expanded layout, only `zero_padding=True` initializes expert gaps; otherwise do not read them. Compact ignores zero padding. Outputs own storage independently of the communication arena.
 
-Compact dispatch skips expanded slot allocation and expert cursor reservation. Code that inspected a compact handle's previous `[N,K]` expanded mapping must adapt to `[0]`. Prepared native states, including empty states, must retain their original compact/expanded layout on replay. Rebuild native core and epilogue modules together and restart the process.
-
-## Cached routing
+## Handles and cached routing
 
 ```python
 replay = buffer.dispatch(new_x, weights=new_weights, handle=received.handle)
 ```
 
-Omit `topk_idx`; reuse source token count, input dtype, routing, buffer, layout and alignment. Omitted layout/alignment settings inherit from the handle. All ranks replay corresponding handles. Handles snapshot routing and remain valid across subsequent calls on the same live buffer. Treat their contents as read-only. Outputs own storage independently of the communication arena.
+Omit `topk_idx`; preserve source token count, dtype, routing, buffer and receive layout. Omitted layout/alignment settings inherit from the handle. All ranks replay corresponding handles. Handles snapshot routing, remain valid across calls on the same live buffer, and must be treated as read-only.
+
+`handle.layout` contains CUDA int64 metadata, with `L=E/R`:
+
+| Field | Shape | Meaning |
+| --- | --- | --- |
+| `src_ranks`, `src_tokens` | `[N]` | Source of each deduplicated receive row |
+| `local_topk_idx` | `[N,K]` | Local expert IDs or `-1` |
+| `expert_counts` | `[L]` | Actual assignments per expert |
+| `expert_offsets` | `[L+1]` | Padded exclusive offsets, ending at C |
+| `expanded_slots` | Expanded `[N,K]`; compact `[0]` | Assignment slots or `-1` |
+| `recv_rank_prefix` | `[R]` | Inclusive receive-row count by source rank |
+
+`recv_count` and `expanded_capacity` are host integers N/C. Metadata rows remain deduplicated in both layouts.
 
 ## Combine
 
 ```python
 result = buffer.combine(
-    expert_x,
-    received.handle,
-    weights=None,
-    bias=None,
-    previous_event=None,
-    async_op=False,
+    expert_x, received.handle, weights=None, bias=None,
+    previous_event=None, async_op=False,
 )
 ```
 
-The caller computes experts and applies gate weights. Compact `expert_x[N,H]` must already contain the sum of the local weighted expert outputs. Expanded `expert_x[C,H]` contains one output per assignment; padding is ignored. Expert outputs are BF16 on every rank; FP32 EP inputs are not supported. The input data pointer must be 16-byte aligned for vector loads; contiguous views with an unaligned storage offset are rejected before the entry GPU barrier. Aligned nonzero storage offsets are supported.
+The caller computes experts and applies gate weights. Compact BF16 `expert_x[N,H]` contains the sum of weighted local expert outputs; expanded BF16 `expert_x[C,H]` contains one output per assignment. Padding is ignored. Inputs are contiguous on the local GPU with 16-byte-aligned data pointers.
 
-Optional FP32 `weights` uses the receive layout and is returned independently as `result.topk_weights[T,K]`, with masked positions zero; it never multiplies `expert_x`. With no weight payload, the result field is `None`. Optional source-local `bias[T,H]` has the expert-output dtype and is added once.
+`result.x[T,H]` accumulates FP32, adds optional source-local BF16 `bias[T,H]` once, then casts to BF16. Optional FP32 weights use the receive layout and return independently as `result.topk_weights[T,K]`, with masked slots zero. They never multiply `expert_x`; without weights the result field is `None`.
 
-`result.x[T,H]` accumulates FP32 then casts to the expert-output dtype. Default `allow_multiple_reduction=False` keeps expanded contributions separate until final reduction. True permits FP32 local reduction, BF16 communication storage, then FP32 source reduction. Compact inputs have already been locally reduced by the caller. Grouping and client BF16 rounding can change numerical results between modes/layouts; no bitwise equivalence is promised.
+`allow_multiple_reduction=False` keeps expanded contributions separate until source reduction. True permits FP32 local reduction, BF16 communication storage, then FP32 source reduction. Compact inputs are already locally reduced. Grouping and BF16 rounding can change results across layouts or modes.
 
-## Events and lifetime
+## Streams and lifetime
 
-With `async_op=False`, completion is ordered onto the caller's CUDA stream. With True, wait on the consumer stream:
+With `async_op=False`, completion is ordered onto the caller's CUDA stream. With True, wait on the consumer stream before using the output:
 
 ```python
 received = buffer.dispatch(x, topk_idx=indices, async_op=True)
 received.event.current_stream_wait()
 ```
 
-`previous_event` is an optional native `torch.cuda.Event` for an input producer on another stream. Otherwise the communication stream waits for the caller's current stream. The returned event tracks tensor ownership on the consumer stream. Keep the current device set to this process's GPU and do not mutate inputs until communication completes. Fresh exact allocation waits for mapped host N/C publication, without scalar D2H copies or a whole-main synchronization. Cached dispatch uses metadata shape for N and the handle's saved host C, without reading GPU offsets back. Asynchronous mode does not imply CUDA Graph compatibility.
+`previous_event` is an optional native `torch.cuda.Event` from another input-producing stream. Without it, communication waits for the caller's current stream. `current_stream_wait()` also records tensor use on the consumer stream. Do not modify inputs until communication completes.
 
-Native `dispatch_main` requires `cached_expanded_capacity` immediately after `cached_metadata`: fresh calls pass `0` (ignored), cached calls pass the original handle's C. The ten metadata tensors remain on the GPU, with unchanged ordering. Direct native callers must update this argument, rebuild core and restart the process; public `CudaBuffer.dispatch` arguments are unchanged.
+Fresh dispatch waits on mapped host N/C publication to allocate exact outputs. Cached dispatch uses the handle's saved counts. CUDA Graph capture is not supported.
 
-Close collectively after consumers finish, preferably with `with CudaBuffer(...)`. Closing drains GPU work, coordinates unmapping across ranks, then frees allocations. Do not use handles after close or across buffers. Fatal rank failure relies on the process-group/launcher timeout.
+Use `with CudaBuffer(...)` or close collectively after consumers finish. Close drains GPU work, unmaps peer memory collectively, then releases allocations. Handles cannot cross buffers or outlive close. Fatal rank failure relies on process-group/launcher timeouts.
 
-Communication region starts, row strides and top-k/weights/x field starts are aligned to 32 bytes. Public tensors retain their contiguous logical shapes; CUDA EP hidden sizes must be positive multiples of 256. Native extensions and buffers must be rebuilt after this byte-ABI change.
+## Native execution
 
-## Specialized combine epilogue
+PyTorch caches compiled CUDA modules. `CudaBuffer` prepares core and geometry modules before IPC setup; additional dispatch alignments compile on first use. Reuse a fixed configuration for steady-state calls.
 
-CUDA EP requires BF16 x and a positive hidden size divisible by 256 (`32 * sizeof(int4) / sizeof(BF16)`). Independent row operators and the byte-layout arithmetic utility retain their existing hidden-size support.
+| Module | Specialization |
+| --- | --- |
+| Dispatch main | H, K, R, L, Tmax, expert alignment |
+| Dispatch epilogue | H, K, L, cached mode |
+| Combine main / epilogue | H, K, R, L, Tmax |
 
-The combine epilogue is compiled separately for `(H,K,R,experts_per_rank,Tmax)` using the existing PyTorch C++/CUDA JIT. `CudaBuffer` prepares this module during collective initialization, before allocating/exporting IPC windows; initialization errors are gathered before peers continue. It binds `_dispatch_epilogue` and `_combine_epilogue` to their separately specialized module entries. Public calls invoke these callables directly. Low-level callers explicitly use `prepare_combine_epilogue(...).combine_epilogue`; the core native module does not expose a combine epilogue dispatcher. A new geometry incurs a cold compilation; reuse a fixed buffer configuration for steady-state calls.
+Main kernels use cooperative SM-sized grids and entry/completion peer barriers. Fresh dispatch counts routes, publishes receive counts and reserves local per-destination slots; cached dispatch reads saved mappings. Receive storage is source-partitioned `[R,Tmax,row_bytes]`, and epilogue maps its valid rows through the source prefix. Expanded epilogue builds expert slots and copies payloads in one kernel.
 
-The kernel derives P from R/K/reduction mode and derives return-row bytes from H/K. It uses 16-byte int4 loads/stores, an unroll factor chosen from H at compile time, and ordered FP32 accumulation followed by one BF16 cast. Bias is added after the partial sums, and routing weights remain an independent FP32 payload. There is no hidden tail path. This does not implement TMA or guarantee equality with every DeepEP rounding recipe.
-
-Combine main also specializes `(H,K,R,experts_per_rank,Tmax)`. `CudaBuffer` prepares and retains its module before allocating/exporting IPC windows. The core extension keeps validation, runtime ownership and epoch allocation; it calls the compiled host launcher through a named capsule. One cooperative kernel performs both barriers and payload work. Geometry mismatches fail before entering either barrier. `experts_per_rank` validates metadata geometry; the return kernel does not divide expert IDs.
-
-H/K/R/Tmax and the derived return-row stride are compile-time constants; actual N and input row capacity remain runtime values. The kernel uses int4 BF16 transfers, ascending-K FP32 local reduction, 256-thread blocks and one block per reported SM. Warp `w` in block `b` starts at receive row `w * gridDim.x + b` and advances by `(blockDim.x / 32) * gridDim.x`, refreshing per-row metadata each iteration. The warp count remains fixed at eight per block; this grid does not pin blocks to physical SMs. Each valid lane loads its expanded slot once for validation and weight return. Warp shuffles compact slots in ascending original-k order before local reduction, or broadcast each assignment slot for cooperative copying. All lanes participate in the shuffles. Compact inputs and expanded rows with exactly one local assignment share a direct BF16 copy path. This bypass preserves payload bits, including signed zero and NaN payloads; rows with multiple local assignments retain ordered FP32 reduction. TMA and PDL are not implemented. Dispatch main still uses runtime geometry; dispatch epilogue specializes H/K/local-expert-count.
-
-CTA 0 exchanges entry epochs before a grid sync permits writes. All writers synchronize the grid after their payload work, then CTA 0 exchanges completion epochs with system-scope release/acquire. For the current ordinary peer stores, the grid sync and cumulative system-scope release establish visibility without a separate per-thread system fence. No entry-side starting grid sync or exit-side ending grid sync is needed: earlier stream work has completed, and the separate epilogue waits for the entire cooperative kernel. Empty ranks still launch and participate. The launcher uses `has_pass` to check cooperative support and actual-kernel occupancy once per variant/host thread; each host thread must use a fixed GPU, since switching devices does not repeat the checks. It retains one block per SM. Each combine reserves two consecutive epochs in the same sequence and stream as standalone barriers. CUDA Graph replay still needs a device-side epoch protocol.
-
-Low-level `native.combine_main(...)` requires `launcher=prepare_combine_main(H,K,R,experts_per_rank,Tmax).launcher`. Keep the module alive while using the launcher. The cooperative launcher uses capsule name `nano_ep.CombineMainSpecialization`; rebuild the core extension together with specialized modules and restart the process. Public `CudaBuffer.combine` arguments, window byte layout and output layouts are unchanged.
-
-
-## Specialized dispatch epilogue
-
-`prepare_dispatch_epilogue(H, K, experts_per_rank, cached_mode=...)` compiles a
-fused dispatch epilogue for one geometry and cache mode. `CudaBuffer` prewarms
-both fresh and cached modules before allocating/exporting IPC windows and
-reports build failures collectively.
-H/K/local-expert-count are compile-time constants; row bytes and field offsets
-are derived from H/K. Actual N/C and rank remain runtime values. R, Tmax and
-alignment are not specialization keys: the kernels use the existing padded
-expert offsets. Fresh dispatch localizes IDs, reserves slots, saves all receive
-metadata and copies payloads in one kernel. Each lane retains its local ID and
-slot in registers; expanded copies broadcast slots with warp shuffles instead
-of rereading freshly written metadata. `NANO_EP_CACHED_MODE` fixes `kCachedMode`
-at JIT compilation; module names and cache keys distinguish both modes. The
-cached specialization reads existing mappings without allocating cursors or
-reserving slots. Host launchers do not dispatch between cache-mode templates.
-Payload copies use 16-byte `int4` loads/stores
-in both compact and expanded layouts, preserving eight BF16 bit patterns per
-vector. H%256 and the aligned communication fields cover complete warp vectors;
-CUDA-allocated outputs preserve row alignment. A compile-time unroll factor is
-the largest divisor up to four of H/256, matching combine's selection rule;
-the inner vector loop is explicitly unrolled in both layouts. Outputs use `empty`.
-The `kExpand && kZeroPadding` variant clears only expert gaps, including
-optional weight gaps, in the same copy kernel. All warps participate even when
-they have no receive row. A warp scan over each wave of 32 experts maps padding
-ordinals to `[offset[e] + count[e], offset[e+1])`; immutable counts and offsets
-are retained for cached replay. Compact ignores zero padding. The 256-thread
-blocks and `ceil(N/8)` grids are unchanged. No TMA is used.
-
-Low-level callers must load the core extension for `DispatchState` registration,
-then use the geometry module:
-
-```python
-module = prepare_dispatch_epilogue(H, K, experts_per_rank, cached_mode=state.metadata_prepared)
-x, indices, weights = module.dispatch_epilogue(state, expand, with_weights, zero_padding)
-```
-
-The old core `native.dispatch_epilogue` entry and all standalone
-`build_receive_metadata` entries are removed. Geometry mismatches fail before metadata preparation. Rebuild the
-core extension and restart the process; public `CudaBuffer.dispatch` arguments,
-wire layout, metadata ordering and output ownership are unchanged. The internal
-factory now requires keyword-only `cached_mode`; a mode mismatch is rejected
-before state mutation. Repeated epilogue calls on a prepared state use the
-cached module, including states originally created by a fresh dispatch.
-
-
-### Fused fresh notify
-
-Fresh dispatch uses a cooperative SM-sized kernel: four notify warps per CTA
-count routes in shared memory while four payload warps reserve/copy tokens.
-A persistent `notify_reduction[R+E]` region packs CTA arrivals in the high 32
-bits and counts in the low 32 bits. CTA 0 consumes/resets each word before
-exchanging peer counts; notify-only named barriers preserve payload progress.
-Empty ranks still launch and contribute zeros. Resource checks precede window
-mutation and communication. Cached dispatch keeps eight payload warps.
-
-The window now stores barrier signals, aligned notify reduction, aligned peer
-counts plus local send_next[R], and the shared dispatch/return arena. Rebuild extensions,
-restart the process and recreate IPC buffers/handles after this byte-layout
-change. Python signatures and metadata formats are unchanged. Peer counts keep
--1 pending / nonnegative ready. Expert reduction, alignment and prefix sums run inside the fused notify stage.
-Exact host counts are published by notify warps to mapped memory; entry/exit peer barriers are fused into the cooperative dispatch kernel.
-
-
-The standalone native `reserve_and_put` API has been removed. Fresh/cached
-main calls share one internal launcher whose mode follows the presence of
-cached slots; there is no `count_routes` argument. Test-only probes call
-the payload device helper from `dispatch_main.cuh` with caller-owned slots.
-Public `CudaBuffer.dispatch` is unchanged; low-level callers use dispatch_main.
-
-Standalone native `notify_counts` and its independent kernel are also removed.
-Notify warps call the exchange device helper directly. Test-only probes cover
-delayed peers, zero counts and receive-slot reuse through that same helper.
-
-
-Dispatch main specializes `(H,K,R,experts_per_rank,Tmax,expert_alignment)` through
-`prepare_dispatch_main(..., expert_alignment).launcher`. CudaBuffer prewarms
-alignment=1 before IPC allocation/export, then compiles other alignments on first
-use before stream work. Modules are retained by alignment; cached calls select
-the handle's original alignment. Geometry mismatches fail before window mutation.
-
-CTA 0 reuses shared outgoing counts for incoming counts after every send is
-published. After notify-group synchronization, warp 0 emits int64 rank inclusive
-prefix[R]; warp 1 sums source counts into actual expert counts[L], aligns in
-int64 registers and scans padded counts into offsets[L+1]. No raw received
-[R+E] tensor or standalone Torch count/padding/scan kernels are needed. Notify
-warps publish final N/C directly to mapped host scalars for exact allocation.
-The CPU waits for both scalars with the GIL released, checks stream errors every
-millisecond and times out after 60 seconds. Each fresh launch resets both fields
-to -1; each field is written once and becomes independently ready when nonnegative.
-State counts own a CPU copy. Cached calls do not touch this mailbox. Pending
-waits exclude concurrent communication and teardown; a failed wait requires
-draining and recreating the runtime. Fresh dispatch rejects CUDA Graph capture.
-Count readiness does not imply GPU metadata/payload completion; enqueue the
-epilogue on the same stream. The payload completion barrier runs inside the cooperative main kernel;
-the cached receive metadata contract is unchanged.
-
-The internal launcher ABI and prepare_dispatch_main signature changed; rebuild
-extensions and restart processes. Device helpers encode rank/expert geometry and timeout as templates; total
-experts derives from R*experts_per_rank. Public dispatch signatures, metadata
-order and wire layout remain unchanged.
-
-
-Standalone route_counts/pack_rows/expand_rows/reduce_rows operators and
-backends.ops have been removed. Their work belongs to the integrated
-dispatch/combine pipeline; old direct operator calls are no longer supported.
-
-
-Fresh and cached dispatch both launch cooperatively, even for T=0. The core
-validates support/occupancy for the selected variant before reserving two epochs
-or mutating the window. CTA 0 exchanges entry readiness, then every CTA grid-syncs
-before writing. A grid sync orders all writers before CTA 0's system-scope release
-publication of completion; release/acquire cumulativity carries their writes to peers.
-The following epilogue waits for kernel completion on the same stream.
-Fresh send_next[R] is reset by CTA 0's first R threads, followed by CTA synchronization
-and system-scope release publication of entry readiness. Cached calls preserve
-the counter; no standalone host memset is queued. Exact N/C waits use mapped host publication. The
-internal callback ABI changed; rebuild core and geometry modules together.
-
-
-### Source-partitioned dispatch reservation
-
-Dispatch payloads use BF16 int4 bit copies. Nonempty x must have a 16-byte
-aligned data pointer; core rejects misaligned contiguous offset views before
-barriers/window mutation. Clone such views to allocate aligned storage. Top-k
-and optional weights are preloaded per token; bounded register tiles reuse x
-across targets. No shared staging/TMA is added. Rebuild core/main/probe and restart.
-
-Fresh sends reserve from local device-scope send_next[destination], then store
-source_rank*Tmax+local_slot in dst_slots[T,R]. Each peer payload arena is
-source-major [R,Tmax,row_bytes]. Epilogue uses inclusive source prefix[R] to
-map exact logical N rows to valid physical rows; partition gaps are never read.
-Outputs retain exact N/C shapes. The prefix is metadata item 5 in fresh states
-and item 9 in prepared/cached states, and NativeLayout.recv_rank_prefix keeps it
-for replay. Combine still consumes logical provenance rows.
-
-The count region now reserves R counters instead of one; payload/return offsets
-and total allocation may change, while payload capacity remains R*Tmax rows.
-Fresh/prepared metadata contain 6/10 tensors. Rebuild core, JIT and probe modules,
-restart processes and recreate windows/handles; old 9-item metadata is unsupported.
+Communication fields and row strides are 32-byte aligned. BF16 payloads use int4 bit copies and bounded register tiles for source reuse across destinations; reductions accumulate FP32. Dispatch and combine share one communication arena. TMA and PDL are not implemented.

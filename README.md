@@ -4,6 +4,7 @@ Single-node expert-parallel dispatch and combine for PyTorch, using CUDA IPC and
 
 - BF16 EP payloads, compact and expert-major expanded layouts.
 - Cached routing handles, optional weight payloads, and asynchronous operations.
+- Geometry-specialized CUDA kernels with cooperative communication barriers.
 - Minimal by design: readable CUDA kernels without NVSHMEM or NCCL Gin.
 
 ## Install and build
@@ -79,8 +80,7 @@ See [testing](docs/testing.md) for more details.
 ## Future Plans
 
 - **Deeper Kernel Fusion** — Fuse more dispatch/combine stages to reduce kernel launches and intermediate memory traffic.
-- **More CUDA Magic** — Explore TMA, warp specialization, and better communication/computation overlap.
-- **Shape-specialized JIT Kernels** — Extend the existing JIT build with specialization for common hidden sizes and routing configurations.
+- **More CUDA Magic** — Explore TMA, PDL, and communication/computation overlap.
 
 ## Acknowledgements
 
