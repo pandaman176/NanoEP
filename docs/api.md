@@ -63,7 +63,7 @@ received = buffer.dispatch(x, topk_idx=indices, async_op=True)
 received.event.current_stream_wait()
 ```
 
-`previous_event` is an optional native `torch.cuda.Event` for an input producer on another stream. Otherwise the communication stream waits for the caller's current stream. The returned event tracks tensor ownership on the consumer stream. Keep the current device set to this process's GPU and do not mutate inputs until communication completes. Fresh exact receive-count readback can block the host. Cached dispatch uses metadata shape for N and the handle's saved host C, without reading GPU offsets back. Asynchronous mode does not imply CUDA Graph compatibility.
+`previous_event` is an optional native `torch.cuda.Event` for an input producer on another stream. Otherwise the communication stream waits for the caller's current stream. The returned event tracks tensor ownership on the consumer stream. Keep the current device set to this process's GPU and do not mutate inputs until communication completes. Fresh exact allocation waits for mapped host N/C publication, without scalar D2H copies or a whole-main synchronization. Cached dispatch uses metadata shape for N and the handle's saved host C, without reading GPU offsets back. Asynchronous mode does not imply CUDA Graph compatibility.
 
 Native `dispatch_main` requires `cached_expanded_capacity` immediately after `cached_metadata`: fresh calls pass `0` (ignored), cached calls pass the original handle's C. The nine metadata tensors remain on the GPU, with unchanged ordering. Direct native callers must update this argument, rebuild core and restart the process; public `CudaBuffer.dispatch` arguments are unchanged.
 
@@ -149,7 +149,7 @@ counts plus recv_next, and the shared dispatch/return arena. Rebuild extensions,
 restart the process and recreate IPC buffers/handles after this byte-layout
 change. Python signatures and metadata formats are unchanged. Peer counts keep
 -1 pending / nonnegative ready. Expert reduction, alignment and prefix sums run inside the fused notify stage.
-Exact host count readback remains on host; entry/exit peer barriers are fused into the cooperative dispatch kernel.
+Exact host counts are published by notify warps to mapped memory; entry/exit peer barriers are fused into the cooperative dispatch kernel.
 
 
 The standalone native `reserve_and_put` API has been removed. Fresh/cached
@@ -173,8 +173,16 @@ CTA 0 reuses shared outgoing counts for incoming counts after every send is
 published. After notify-group synchronization, warp 0 emits int64 rank inclusive
 prefix[R]; warp 1 sums source counts into actual expert counts[L], aligns in
 int64 registers and scans padded counts into offsets[L+1]. No raw received
-[R+E] tensor or standalone Torch count/padding/scan kernels are needed. N/C still
-come from host reads of the final prefixes for exact allocation. The payload completion barrier now runs inside the cooperative main kernel;
+[R+E] tensor or standalone Torch count/padding/scan kernels are needed. Notify
+warps publish final N/C directly to mapped host scalars for exact allocation.
+The CPU waits for both scalars with the GIL released, checks stream errors every
+millisecond and times out after 60 seconds. Each fresh launch resets both fields
+to -1; each field is written once and becomes independently ready when nonnegative.
+State counts own a CPU copy. Cached calls do not touch this mailbox. Pending
+waits exclude concurrent communication and teardown; a failed wait requires
+draining and recreating the runtime. Fresh dispatch rejects CUDA Graph capture.
+Count readiness does not imply GPU metadata/payload completion; enqueue the
+epilogue on the same stream. The payload completion barrier runs inside the cooperative main kernel;
 the cached receive metadata contract is unchanged.
 
 The internal launcher ABI and prepare_dispatch_main signature changed; rebuild
@@ -196,5 +204,5 @@ publication of completion; release/acquire cumulativity carries their writes to 
 The following epilogue waits for kernel completion on the same stream.
 Fresh recv_next is reset by CTA 0's thread 0, followed by CTA synchronization
 and system-scope release publication of entry readiness. Cached calls preserve
-the counter; no standalone host memset is queued. Exact N/C reads remain on host. The
+the counter; no standalone host memset is queued. Exact N/C waits use mapped host publication. The
 internal callback ABI changed; rebuild core and geometry modules together.

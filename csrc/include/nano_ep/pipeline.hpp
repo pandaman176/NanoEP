@@ -22,6 +22,7 @@ struct DispatchMainSpecialization {
                    const torch::Tensor& recv_rank_prefix,
                    const torch::Tensor& recv_expert_counts,
                    const torch::Tensor& expert_offsets,
+                   int64_t* mapped_counts,
                    int rank,
                    bool cached_mode,
                    int64_t entry_epoch,
@@ -79,14 +80,17 @@ struct DispatchState {
 // them directly into actual counts and padded offsets, using int64 accumulators.
 // Both variants launch cooperatively, including T=0 ranks. Cached sends use
 // eight payload warps. CTA 0 exchanges entry/exit epochs inside the kernel;
-// grid synchronization protects workspace reuse and system fences publish payloads.
+// grid synchronization protects workspace reuse; system release/acquire publishes payloads.
 // Fresh counts fit uint32; rank/expert counts require per-CTA shared memory.
 // Launch resource checks precede window mutation and the entry barrier.
 // Local storage checks precede window mutation and the entry barrier. Routing
 // values are a caller precondition: -1 or distinct valid experts per token.
 // Existing kernels assert bounds/uniqueness on device, without a validation
 // launch or status readback. Device failures are asynchronous and can invalidate
-// the CUDA context; fresh exact receive-count allocation reads back N/C.
+// the CUDA context. Fresh N/C are published to mapped host scalars by notify
+// warps; CPU polls them with the GIL released before allocating exact shapes.
+// Count readiness does not imply payload or GPU metadata completion; enqueue
+// the epilogue on the same stream. Cached calls do not touch the host mailbox.
 // Cached metadata is the unmodified vector prepared by dispatch_epilogue on this
 // runtime with the same H/K/E/capacity/alignment; the Python handle checks this
 // ownership/configuration contract. cached_expanded_capacity is the host capacity

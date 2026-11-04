@@ -68,14 +68,15 @@ template <int kWorldSize, int kExpertsPerRank, int64_t kExpertAlignment>
 __global__ void probe_finalize_receive_counts_kernel(const int64_t* incoming,
                                                      int64_t* rank_prefix,
                                                      int64_t* expert_counts,
-                                                     int64_t* expert_offsets) {
+                                                     int64_t* expert_offsets,
+                                                     int64_t* totals) {
     constexpr int threads = 128;
     constexpr int num_counts = kWorldSize + kWorldSize * kExpertsPerRank;
     __shared__ uint32_t counts[num_counts];
     for (int i = threadIdx.x; i < num_counts; i += threads)
         counts[i] = static_cast<uint32_t>(incoming[i]);
     nano_ep::notify_group_barrier<threads>();
-    nano_ep::finalize_receive_counts<kWorldSize, kExpertsPerRank, kExpertAlignment>(counts, rank_prefix, expert_counts, expert_offsets);
+    nano_ep::finalize_receive_counts<kWorldSize, kExpertsPerRank, kExpertAlignment>(counts, rank_prefix, expert_counts, expert_offsets, totals);
 }
 
 template <int kWorldSize, typename Launch>
@@ -110,13 +111,16 @@ std::vector<torch::Tensor> run_finalize_receive_counts(const torch::Tensor& inco
     auto rank_prefix = torch::full({ranks}, -777, incoming.options());
     auto expert_counts = torch::full({experts}, -777, incoming.options());
     auto expert_offsets = torch::full({experts + 1}, -777, incoming.options());
+    // Numerical probes retain totals on-device; runtime uses mapped host storage.
+    auto totals = torch::full({2}, -777, incoming.options());
     const auto select_alignment = [&]<int64_t kExpertAlignment>() {
         const auto launch = [&]<int kWorldSize, int kExpertsPerRank>() {
             probe_finalize_receive_counts_kernel<kWorldSize, kExpertsPerRank, kExpertAlignment>
                 <<<1, 128, 0, c10::cuda::getCurrentCUDAStream().stream()>>>(incoming.data_ptr<int64_t>(),
                                                                             rank_prefix.data_ptr<int64_t>(),
                                                                             expert_counts.data_ptr<int64_t>(),
-                                                                            expert_offsets.data_ptr<int64_t>());
+                                                                            expert_offsets.data_ptr<int64_t>(),
+                                                                            totals.data_ptr<int64_t>());
         };
         switch (ranks) {
             case 1:
@@ -152,7 +156,7 @@ std::vector<torch::Tensor> run_finalize_receive_counts(const torch::Tensor& inco
             TORCH_CHECK(false, "unsupported test alignment");
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {rank_prefix, expert_counts, expert_offsets};
+    return {rank_prefix, expert_counts, expert_offsets, totals};
 }
 
 template <int kWorldSize, int kExpertsPerRank, bool kReuseSlots>

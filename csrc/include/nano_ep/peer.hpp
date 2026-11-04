@@ -35,6 +35,10 @@ public:
     // Reserve consecutive phases for a fused kernel on the barrier stream.
     // Return the first epoch; this advances host bookkeeping without a launch.
     int64_t reserve_barrier_epochs(int64_t stream_handle, int64_t count);
+    // Fresh calls publish N/C without waiting for payload completion.
+    int64_t* prepare_dispatch_counts();
+    std::array<int64_t, 2> wait_dispatch_counts(cudaStream_t stream);
+    void fail_dispatch_counts() noexcept;
     // Caller drains all window users before phase 1, then completes a host
     // group barrier across all importers before phase 2 (close).
     void close_peer_mappings();
@@ -54,6 +58,10 @@ private:
     bool closed_ = false;
     int64_t last_barrier_epoch_ = 0;
     cudaStream_t barrier_stream_ = nullptr;
+    int64_t* host_counts_ = nullptr;
+    int64_t* mapped_counts_ = nullptr;
+    bool dispatch_counts_pending_ = false;
+    bool dispatch_counts_failed_ = false;
 };
 
 // Future backends consume offsets, never pointers from another process.

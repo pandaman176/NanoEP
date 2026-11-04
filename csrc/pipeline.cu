@@ -83,20 +83,28 @@ DispatchMainResult launch_dispatch_main(PeerRuntime& runtime,
     auto recv_expert_counts = cached_mode ? torch::Tensor() : torch::empty({local_experts}, indices.options());
     auto expert_offsets = cached_mode ? torch::Tensor() : torch::empty({local_experts + 1}, indices.options());
 
-    specialization.launch(addresses,
-                          window,
-                          x,
-                          indices,
-                          weights,
-                          dst_slots,
-                          send_counts,
-                          recv_rank_prefix,
-                          recv_expert_counts,
-                          expert_offsets,
-                          rank,
-                          cached_mode,
-                          entry_epoch,
-                          stream.stream());
+    auto* mapped_counts = cached_mode ? nullptr : runtime.prepare_dispatch_counts();
+    try {
+        specialization.launch(addresses,
+                              window,
+                              x,
+                              indices,
+                              weights,
+                              dst_slots,
+                              send_counts,
+                              recv_rank_prefix,
+                              recv_expert_counts,
+                              expert_offsets,
+                              mapped_counts,
+                              rank,
+                              cached_mode,
+                              entry_epoch,
+                              stream.stream());
+    } catch (...) {
+        if (!cached_mode)
+            runtime.fail_dispatch_counts();
+        throw;
+    }
     return {dst_slots, send_counts, recv_rank_prefix, recv_expert_counts, expert_offsets};
 }
 
@@ -133,6 +141,11 @@ DispatchState dispatch_main(PeerRuntime& runtime,
     c10::cuda::CUDAGuard guard(window.device());
     const auto stream = c10::cuda::getCurrentCUDAStream();
     const auto stream_handle = reinterpret_cast<int64_t>(stream.stream());
+    if (fresh) {
+        cudaStreamCaptureStatus capture;
+        C10_CUDA_CHECK(cudaStreamIsCapturing(stream.stream(), &capture));
+        TORCH_CHECK(capture == cudaStreamCaptureStatusNone, "Fresh dispatch with host count polling cannot be CUDA Graph captured");
+    }
     const auto route_indices = fresh ? routing_input.clone() : routing_input;
     // Validate specialized cooperative resources before mutating the window.
     specialization.prepare(x, !fresh);
@@ -179,9 +192,10 @@ DispatchState dispatch_main(PeerRuntime& runtime,
         launch_dispatch_main(runtime, x, route_indices, weights, num_experts, cached_meta_data[6], entry_epoch, specialization);
     }
 
-    const int64_t recv_count = fresh ? recv_rank_prefix[world_size - 1].item<int64_t>() : cached_meta_data[0].numel();
-    const int64_t local_experts = num_experts / world_size;
-    const int64_t expanded_capacity = fresh ? expert_offsets[local_experts].item<int64_t>() : cached_expanded_capacity;
+    const auto receive_counts = fresh ? runtime.wait_dispatch_counts(stream.stream())
+                                      : std::array<int64_t, 2>{cached_meta_data[0].numel(), cached_expanded_capacity};
+    const int64_t recv_count = receive_counts[0];
+    const int64_t expanded_capacity = receive_counts[1];
     const int64_t row_bytes = WindowLayout::payload_row_bytes(x.size(1), num_topk);
 
     auto stage_buffer =

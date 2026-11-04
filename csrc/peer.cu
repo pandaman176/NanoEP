@@ -2,12 +2,14 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <exception>
 #include <limits>
 #include <nano_ep/barrier.cuh>
 #include <nano_ep/peer.hpp>
+#include <thread>
 #include <utility>
 
 namespace nano_ep {
@@ -27,6 +29,10 @@ PeerRuntime::PeerRuntime(int rank, int world_size, int64_t num_bytes) : rank_(ra
     C10_CUDA_CHECK(cudaMalloc(&local_ptr_, static_cast<size_t>(num_bytes_)));
 
     try {
+        C10_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&host_counts_), 2 * sizeof(int64_t), cudaHostAllocMapped));
+        C10_CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&mapped_counts_), host_counts_, 0));
+        host_counts_[0] = -1;
+        host_counts_[1] = -1;
         C10_CUDA_CHECK(cudaMemsetAsync(local_ptr_, 0, static_cast<size_t>(num_bytes_), stream.stream()));
 
         C10_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
@@ -34,6 +40,10 @@ PeerRuntime::PeerRuntime(int rank, int world_size, int64_t num_bytes) : rank_(ra
         // Cleanup on failure
         cudaFree(local_ptr_);
         local_ptr_ = nullptr;
+        if (host_counts_ != nullptr)
+            cudaFreeHost(host_counts_);
+        host_counts_ = nullptr;
+        mapped_counts_ = nullptr;
         throw;
     }
 
@@ -158,6 +168,7 @@ __global__ void barrier_kernel(const int64_t* peer_addresses, uint64_t* local_wi
 
 int64_t PeerRuntime::reserve_barrier_epochs(int64_t stream_handle, int64_t count) {
     TORCH_CHECK(!closing_ && !closed_, "PeerRuntime is closing or closed");
+    TORCH_CHECK(!dispatch_counts_pending_ && !dispatch_counts_failed_, "A fresh dispatch is waiting for counts or has failed");
     TORCH_CHECK(peer_addresses_.defined(), "Peer handles are not imported");
     TORCH_CHECK(count > 0 && count <= std::numeric_limits<int64_t>::max() - last_barrier_epoch_, "Barrier epoch exhausted");
     TORCH_CHECK(world_size_ <= 32, "Too many ranks");
@@ -169,6 +180,53 @@ int64_t PeerRuntime::reserve_barrier_epochs(int64_t stream_handle, int64_t count
     barrier_stream_ = stream;
     last_barrier_epoch_ += count;
     return first_epoch;
+}
+
+int64_t* PeerRuntime::prepare_dispatch_counts() {
+    TORCH_CHECK(!closing_ && !closed_, "PeerRuntime is closing or closed");
+    TORCH_CHECK(!dispatch_counts_pending_ && !dispatch_counts_failed_, "A fresh dispatch is waiting for counts or has failed");
+    // Each scalar is written once by its notify warp and consumed before reuse.
+    auto* counts = static_cast<volatile int64_t*>(host_counts_);
+    counts[0] = -1;
+    counts[1] = -1;
+    dispatch_counts_pending_ = true;
+    return mapped_counts_;
+}
+
+std::array<int64_t, 2> PeerRuntime::wait_dispatch_counts(cudaStream_t stream) {
+    std::array<int64_t, 2> result;
+    try {
+        pybind11::gil_scoped_release release;
+        const auto* counts = static_cast<const volatile int64_t*>(host_counts_);
+        const auto start = std::chrono::steady_clock::now();
+        auto next_check = start;
+        for (;;) {
+            result = {counts[0], counts[1]};
+            if (result[0] >= 0 && result[1] >= 0)
+                break;
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= next_check) {
+                const auto status = cudaStreamQuery(stream);
+                if (status != cudaErrorNotReady)
+                    C10_CUDA_CHECK(status);
+                TORCH_CHECK(
+                    now - start < std::chrono::seconds(60), "Dispatch count timeout: rank=", rank_, " N=", result[0], " C=", result[1]);
+                next_check = now + std::chrono::milliseconds(1);
+                std::this_thread::yield();
+            }
+        }
+    } catch (...) {
+        fail_dispatch_counts();
+        throw;
+    }
+    dispatch_counts_pending_ = false;
+    return result;
+}
+
+void PeerRuntime::fail_dispatch_counts() noexcept {
+    dispatch_counts_pending_ = false;
+    dispatch_counts_failed_ = true;
 }
 
 void PeerRuntime::barrier(int64_t stream_handle, int64_t epoch) {
@@ -188,6 +246,8 @@ void PeerRuntime::barrier(int64_t stream_handle, int64_t epoch) {
 void PeerRuntime::close_peer_mappings() {
     if (closed_ || peer_mappings_closed_)
         return;
+
+    TORCH_CHECK(!dispatch_counts_pending_, "Cannot close while a fresh dispatch is waiting for counts");
 
     c10::cuda::CUDAGuard device_guard(device_);
     closing_ = true;
@@ -213,6 +273,9 @@ void PeerRuntime::close() {
     C10_CUDA_CHECK(cudaFree(local_ptr_));
     local_ptr_ = nullptr;
     peer_ptrs_[rank_] = nullptr;
+    C10_CUDA_CHECK(cudaFreeHost(host_counts_));
+    host_counts_ = nullptr;
+    mapped_counts_ = nullptr;
     closed_ = true;
 }
 

@@ -66,11 +66,14 @@ __device__ __forceinline__ void notify_peer_counts(const int64_t* peer_addresses
 
 // Counts are source-major after notification. Keep them read-only while the
 // first two notify warps independently build rank and expert prefix sums.
+// Each warp publishes its own host scalar once; readiness does not imply
+// completion of the GPU metadata or payload writes.
 template <int kWorldSize, int kExpertsPerRank, int64_t kExpertAlignment>
 __device__ __forceinline__ void finalize_receive_counts(const uint32_t* counts,
-                                                        int64_t* recv_rank_prefix,  // [R], inclusive
-                                                        int64_t* expert_counts,     // [L], actual assignments
-                                                        int64_t* expert_offsets     // [L+1], padded exclusive
+                                                        int64_t* recv_rank_prefix,       // [R], inclusive
+                                                        int64_t* expert_counts,          // [L], actual assignments
+                                                        int64_t* expert_offsets,         // [L+1], padded exclusive
+                                                        volatile int64_t* mapped_counts  // host [2], independently ready N/C
 ) {
     static_assert(kExpertAlignment > 0);
     constexpr int kWarpSize = 32;
@@ -81,6 +84,8 @@ __device__ __forceinline__ void finalize_receive_counts(const uint32_t* counts,
         const int64_t prefix = warp_inclusive_sum(count, lane);
         if (lane < kWorldSize)
             recv_rank_prefix[lane] = prefix;
+        if (lane == kWorldSize - 1)
+            mapped_counts[0] = prefix;
     } else if (warp == 1) {
         int64_t carry = 0;
         if (lane == 0)
@@ -100,6 +105,8 @@ __device__ __forceinline__ void finalize_receive_counts(const uint32_t* counts,
                 expert_offsets[expert + 1] = prefix;
             carry = __shfl_sync(0xffffffffu, prefix, kWarpSize - 1);
         }
+        if (lane == 0)
+            mapped_counts[1] = carry;
     }
 }
 
@@ -112,6 +119,7 @@ __device__ __forceinline__ void count_and_notify(const int64_t* peer_addresses,
                                                  int64_t* recv_rank_prefix,
                                                  int64_t* recv_expert_counts,
                                                  int64_t* expert_offsets,
+                                                 volatile int64_t* mapped_counts,
                                                  int rank,
                                                  int64_t num_tokens,
                                                  int64_t count_offset) {
@@ -193,7 +201,7 @@ __device__ __forceinline__ void count_and_notify(const int64_t* peer_addresses,
 
         // calculate expert_offsets and recv_expert_counts
         finalize_receive_counts<kWorldSize, kExpertsPerRank, kExpertAlignment>(
-            local_counts, recv_rank_prefix, recv_expert_counts, expert_offsets);
+            local_counts, recv_rank_prefix, recv_expert_counts, expert_offsets, mapped_counts);
     }
 }
 
@@ -311,15 +319,16 @@ template <int kHidden,
           bool kReuseSlots,
           uint64_t kTimeoutCycles = kBarrierTimeoutCycles>
 __global__ void dispatch_main_kernel(const int64_t* peer_addresses,
-                                     const at::BFloat16* x,        // [T,H]
-                                     const int64_t* indices,       // [T,K]
-                                     const float* weights,         // [T,K], or nullptr
-                                     int64_t* dst_slots,           // [T,R], fresh output or cached mapping
-                                     int64_t* send_counts,         // [R], fresh only
-                                     uint64_t* reduction,          // [R+E], fresh only
-                                     int64_t* recv_rank_prefix,    // [R], fresh inclusive prefix
-                                     int64_t* recv_expert_counts,  // [L], fresh actual counts
-                                     int64_t* expert_offsets,      // [L+1], fresh padded exclusive prefix
+                                     const at::BFloat16* x,            // [T,H]
+                                     const int64_t* indices,           // [T,K]
+                                     const float* weights,             // [T,K], or nullptr
+                                     int64_t* dst_slots,               // [T,R], fresh output or cached mapping
+                                     int64_t* send_counts,             // [R], fresh only
+                                     uint64_t* reduction,              // [R+E], fresh only
+                                     int64_t* recv_rank_prefix,        // [R], fresh inclusive prefix
+                                     int64_t* recv_expert_counts,      // [L], fresh actual counts
+                                     int64_t* expert_offsets,          // [L+1], fresh padded exclusive prefix
+                                     volatile int64_t* mapped_counts,  // host [2], fresh N/C publication
                                      int rank,
                                      int64_t num_tokens,
                                      int64_t entry_epoch) {
@@ -360,6 +369,7 @@ __global__ void dispatch_main_kernel(const int64_t* peer_addresses,
                                                                                                                     recv_rank_prefix,
                                                                                                                     recv_expert_counts,
                                                                                                                     expert_offsets,
+                                                                                                                    mapped_counts,
                                                                                                                     rank,
                                                                                                                     num_tokens,
                                                                                                                     kLayout.count_offset);
@@ -424,6 +434,7 @@ void launch_dispatch(const torch::Tensor& addresses,
                      const torch::Tensor& recv_rank_prefix,
                      const torch::Tensor& recv_expert_counts,
                      const torch::Tensor& expert_offsets,
+                     int64_t* mapped_counts,
                      int rank,
                      bool cached_mode,
                      int64_t entry_epoch,
@@ -442,6 +453,7 @@ void launch_dispatch(const torch::Tensor& addresses,
         auto* recv_ptr = kReuseSlots ? nullptr : recv_rank_prefix.data_ptr<int64_t>();
         auto* expert_ptr = kReuseSlots ? nullptr : recv_expert_counts.data_ptr<int64_t>();
         auto* offsets_ptr = kReuseSlots ? nullptr : expert_offsets.data_ptr<int64_t>();
+        volatile int64_t* counts_ptr = kReuseSlots ? nullptr : mapped_counts;
         int64_t num_tokens = x.size(0);
         void* args[] = {&address_ptr,
                         &x_ptr,
@@ -453,6 +465,7 @@ void launch_dispatch(const torch::Tensor& addresses,
                         &recv_ptr,
                         &expert_ptr,
                         &offsets_ptr,
+                        &counts_ptr,
                         &rank,
                         &num_tokens,
                         &entry_epoch};

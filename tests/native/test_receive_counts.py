@@ -37,3 +37,9 @@ def test_fused_receive_prefixes(payload_probe, ranks, experts, alignment, kind):
     torch.testing.assert_close(outputs[0], incoming[:ranks].cumsum(0), rtol=0, atol=0)
     torch.testing.assert_close(outputs[1], expected_counts, rtol=0, atol=0)
     torch.testing.assert_close(outputs[2], expected_offsets, rtol=0, atol=0)
+    torch.testing.assert_close(
+        outputs[3],
+        torch.stack((incoming[:ranks].sum(), expected_offsets[-1])),
+        rtol=0,
+        atol=0,
+    )

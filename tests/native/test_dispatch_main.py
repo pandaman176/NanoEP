@@ -644,3 +644,26 @@ def test_dispatch_stream_mismatch_precedes_window_mutation(native, runtime):
             )
     other.synchronize()
     torch.testing.assert_close(peer.local_window(), before, rtol=0, atol=0)
+
+
+def test_fresh_mapped_counts_reuse_preserves_old_states(native, runtime):
+    peer, _ = runtime
+    module = prepare_dispatch_main(256, 3, 1, 3, 5, 4)
+    patterns = [
+        ([[0, 1, -1], [2, -1, 0]], [2, 12]),
+        ([], [0, 0]),
+        ([[-1, -1, -1]], [0, 0]),
+        ([[2, -1, -1]], [1, 4]),
+    ]
+    states = []
+    for routing, expected in patterns * 2:
+        indices = torch.tensor(routing, dtype=torch.int64, device="cuda").reshape(-1, 3)
+        x = torch.ones((indices.shape[0], 256), dtype=torch.bfloat16, device="cuda")
+        state = native.dispatch_main(
+            peer, x, indices, None, 3, 5, 4, [], 0, False, module.launcher
+        )
+        assert state.counts.device.type == "cpu"
+        assert state.counts.tolist() == expected
+        states.append((state, expected))
+        for previous, old_counts in states:
+            assert previous.counts.tolist() == old_counts
