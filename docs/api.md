@@ -83,7 +83,7 @@ Combine main also specializes `(H,K,R,experts_per_rank,Tmax)`. `CudaBuffer` prep
 
 H/K/R/Tmax and the derived return-row stride are compile-time constants; actual N and input row capacity remain runtime values. The kernel uses int4 BF16 transfers, ascending-K FP32 local reduction, 256-thread blocks and one block per reported SM. Warp `w` in block `b` starts at receive row `w * gridDim.x + b` and advances by `(blockDim.x / 32) * gridDim.x`, refreshing per-row metadata each iteration. The warp count remains fixed at eight per block; this grid does not pin blocks to physical SMs. Each valid lane loads its expanded slot once for validation and weight return. Warp shuffles compact slots in ascending original-k order before local reduction, or broadcast each assignment slot for cooperative copying. All lanes participate in the shuffles. Compact inputs and expanded rows with exactly one local assignment share a direct BF16 copy path. This bypass preserves payload bits, including signed zero and NaN payloads; rows with multiple local assignments retain ordered FP32 reduction. TMA and PDL are not implemented. Dispatch main still uses runtime geometry; dispatch epilogue specializes H/K/local-expert-count.
 
-CTA 0 exchanges entry epochs before a grid sync permits writes. Every thread executes a system fence after its payload work, then the grid synchronizes before CTA 0 exchanges completion epochs. No entry-side starting grid sync or exit-side ending grid sync is needed: earlier stream work has completed, and the separate epilogue waits for the entire cooperative kernel. Empty ranks still launch and participate. The launcher uses `has_pass` to check cooperative support and actual-kernel occupancy once per variant/host thread; each host thread must use a fixed GPU, since switching devices does not repeat the checks. It retains one block per SM. Each combine reserves two consecutive epochs in the same sequence and stream as standalone barriers. CUDA Graph replay still needs a device-side epoch protocol.
+CTA 0 exchanges entry epochs before a grid sync permits writes. All writers synchronize the grid after their payload work, then CTA 0 exchanges completion epochs with system-scope release/acquire. For the current ordinary peer stores, the grid sync and cumulative system-scope release establish visibility without a separate per-thread system fence. No entry-side starting grid sync or exit-side ending grid sync is needed: earlier stream work has completed, and the separate epilogue waits for the entire cooperative kernel. Empty ranks still launch and participate. The launcher uses `has_pass` to check cooperative support and actual-kernel occupancy once per variant/host thread; each host thread must use a fixed GPU, since switching devices does not repeat the checks. It retains one block per SM. Each combine reserves two consecutive epochs in the same sequence and stream as standalone barriers. CUDA Graph replay still needs a device-side epoch protocol.
 
 Low-level `native.combine_main(...)` requires `launcher=prepare_combine_main(H,K,R,experts_per_rank,Tmax).launcher`. Keep the module alive while using the launcher. The cooperative launcher uses capsule name `nano_ep.CombineMainSpecialization`; rebuild the core extension together with specialized modules and restart the process. Public `CudaBuffer.combine` arguments, window byte layout and output layouts are unchanged.
 
@@ -149,7 +149,7 @@ counts plus recv_next, and the shared dispatch/return arena. Rebuild extensions,
 restart the process and recreate IPC buffers/handles after this byte-layout
 change. Python signatures and metadata formats are unchanged. Peer counts keep
 -1 pending / nonnegative ready. Expert reduction, alignment and prefix sums run inside the fused notify stage.
-Exact host count readback and entry/exit peer barriers remain outside it.
+Exact host count readback remains on host; entry/exit peer barriers are fused into the cooperative dispatch kernel.
 
 
 The standalone native `reserve_and_put` API has been removed. Fresh/cached
@@ -174,8 +174,8 @@ published. After notify-group synchronization, warp 0 emits int64 rank inclusive
 prefix[R]; warp 1 sums source counts into actual expert counts[L], aligns in
 int64 registers and scans padded counts into offsets[L+1]. No raw received
 [R+E] tensor or standalone Torch count/padding/scan kernels are needed. N/C still
-come from host reads of the final prefixes for exact allocation. The payload
-completion barrier and cached receive metadata contract are unchanged.
+come from host reads of the final prefixes for exact allocation. The payload completion barrier now runs inside the cooperative main kernel;
+the cached receive metadata contract is unchanged.
 
 The internal launcher ABI and prepare_dispatch_main signature changed; rebuild
 extensions and restart processes. Device helpers encode rank/expert geometry and timeout as templates; total
@@ -186,3 +186,15 @@ order and wire layout remain unchanged.
 Standalone route_counts/pack_rows/expand_rows/reduce_rows operators and
 backends.ops have been removed. Their work belongs to the integrated
 dispatch/combine pipeline; old direct operator calls are no longer supported.
+
+
+Fresh and cached dispatch both launch cooperatively, even for T=0. The core
+validates support/occupancy for the selected variant before reserving two epochs
+or mutating the window. CTA 0 exchanges entry readiness, then every CTA grid-syncs
+before writing. A grid sync orders all writers before CTA 0's system-scope release
+publication of completion; release/acquire cumulativity carries their writes to peers.
+The following epilogue waits for kernel completion on the same stream.
+Fresh recv_next is reset by CTA 0's thread 0, followed by CTA synchronization
+and system-scope release publication of entry readiness. Cached calls preserve
+the counter; no standalone host memset is queued. Exact N/C reads remain on host. The
+internal callback ABI changed; rebuild core and geometry modules together.

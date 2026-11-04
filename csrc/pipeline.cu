@@ -66,6 +66,7 @@ DispatchMainResult launch_dispatch_main(PeerRuntime& runtime,
                                         const c10::optional<torch::Tensor>& weights,
                                         int64_t num_experts,
                                         const c10::optional<torch::Tensor>& cached_dst_slots,
+                                        int64_t entry_epoch,
                                         const DispatchMainSpecialization& specialization) {
     const auto window = runtime.local_window();
     int rank = runtime.rank();
@@ -82,9 +83,6 @@ DispatchMainResult launch_dispatch_main(PeerRuntime& runtime,
     auto recv_expert_counts = cached_mode ? torch::Tensor() : torch::empty({local_experts}, indices.options());
     auto expert_offsets = cached_mode ? torch::Tensor() : torch::empty({local_experts + 1}, indices.options());
 
-    if (num_tokens == 0 && cached_mode)
-        return {dst_slots, send_counts, recv_rank_prefix, recv_expert_counts, expert_offsets};
-
     specialization.launch(addresses,
                           window,
                           x,
@@ -97,6 +95,7 @@ DispatchMainResult launch_dispatch_main(PeerRuntime& runtime,
                           expert_offsets,
                           rank,
                           cached_mode,
+                          entry_epoch,
                           stream.stream());
     return {dst_slots, send_counts, recv_rank_prefix, recv_expert_counts, expert_offsets};
 }
@@ -136,8 +135,7 @@ DispatchState dispatch_main(PeerRuntime& runtime,
     const auto stream_handle = reinterpret_cast<int64_t>(stream.stream());
     const auto route_indices = fresh ? routing_input.clone() : routing_input;
     // Validate specialized cooperative resources before mutating the window.
-    if (fresh)
-        specialization.prepare(x);
+    specialization.prepare(x, !fresh);
 
     if (!fresh) {
         TORCH_CHECK(cached_expanded_capacity >= 0, "cached expanded capacity must be nonnegative");
@@ -157,14 +155,7 @@ DispatchState dispatch_main(PeerRuntime& runtime,
         check_cached_tensor(cached_meta_data[7], x, {world_size}, "send_counts");
     }
 
-    // Clear the recv_next counters
-    if (fresh) {
-        C10_CUDA_CHECK(
-            cudaMemsetAsync(window.data_ptr<uint8_t>() + window_layout.recv_next_offset, 0, sizeof(unsigned long long), stream.stream()));
-    }
-
-    // Every rank finishes the previous operation before counts/slots are reused.
-    runtime.barrier(stream_handle);
+    const int64_t entry_epoch = runtime.reserve_barrier_epochs(stream_handle, 2);
 
     torch::Tensor send_counts;
     torch::Tensor dst_slots;
@@ -173,7 +164,7 @@ DispatchState dispatch_main(PeerRuntime& runtime,
     torch::Tensor expert_offsets;
 
     if (fresh) {
-        auto result = launch_dispatch_main(runtime, x, route_indices, weights, num_experts, c10::nullopt, specialization);
+        auto result = launch_dispatch_main(runtime, x, route_indices, weights, num_experts, c10::nullopt, entry_epoch, specialization);
         send_counts = std::move(result.send_counts);                // GPU int64 [R]
         dst_slots = std::move(result.dst_slots);                    // GPU int64 [T,R]
         recv_rank_prefix = std::move(result.recv_rank_prefix);      // GPU int64 [R], inclusive by source
@@ -185,11 +176,8 @@ DispatchState dispatch_main(PeerRuntime& runtime,
         dst_slots = cached_meta_data[6];
         recv_expert_counts = cached_meta_data[3];
         expert_offsets = cached_meta_data[4];
-        launch_dispatch_main(runtime, x, route_indices, weights, num_experts, cached_meta_data[6], specialization);
+        launch_dispatch_main(runtime, x, route_indices, weights, num_experts, cached_meta_data[6], entry_epoch, specialization);
     }
-
-    // Keep all payload writes above this barrier; the epilogue reads completed data.
-    runtime.barrier(stream_handle);
 
     const int64_t recv_count = fresh ? recv_rank_prefix[world_size - 1].item<int64_t>() : cached_meta_data[0].numel();
     const int64_t local_experts = num_experts / world_size;

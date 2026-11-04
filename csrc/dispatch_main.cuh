@@ -2,6 +2,7 @@
 
 #include <ATen/cuda/CUDAContextLight.h>
 #include <c10/cuda/CUDAException.h>
+#include <cooperative_groups.h>
 #include <torch/extension.h>
 
 #include <cstdint>
@@ -320,7 +321,8 @@ __global__ void dispatch_main_kernel(const int64_t* peer_addresses,
                                      int64_t* recv_expert_counts,  // [L], fresh actual counts
                                      int64_t* expert_offsets,      // [L+1], fresh padded exclusive prefix
                                      int rank,
-                                     int64_t num_tokens) {
+                                     int64_t num_tokens,
+                                     int64_t entry_epoch) {
     constexpr int kNumNotifyWarps = kReuseSlots ? 0 : 4;
     constexpr int kNumExperts = kWorldSize * kExpertsPerRank;
     constexpr auto kLayout = WindowLayout::make(kWorldSize, kMaxTokens, kHidden, kTopk, kNumExperts);
@@ -329,6 +331,22 @@ __global__ void dispatch_main_kernel(const int64_t* peer_addresses,
     static_assert(kTopk > 0 && kTopk <= 32 && kTopk <= kNumExperts);
     static_assert(kWorldSize > 0 && kWorldSize <= 32 && (kWorldSize & (kWorldSize - 1)) == 0);
     static_assert(kExpertsPerRank > 0 && kMaxTokens > 0 && kExpertAlignment > 0);
+
+    auto grid = cooperative_groups::this_grid();
+    auto* local_window = reinterpret_cast<uint8_t*>(peer_addresses[rank]);
+    auto* local_signals = reinterpret_cast<uint64_t*>(local_window);
+    if (blockIdx.x == 0) {
+        if constexpr (!kReuseSlots) {
+            // Reset before publishing entry readiness so peers reserve from zero.
+            if (threadIdx.x == 0) {
+                auto* recv_next = reinterpret_cast<unsigned long long*>(local_window + kLayout.recv_next_offset);
+                *recv_next = 0ULL;
+            }
+            __syncthreads();
+        }
+        peer_barrier(peer_addresses, local_signals, rank, kWorldSize, static_cast<uint64_t>(entry_epoch));
+    }
+    grid.sync();
 
     const int warp_idx = threadIdx.x / 32;
     if constexpr (!kReuseSlots) {
@@ -362,23 +380,37 @@ __global__ void dispatch_main_kernel(const int64_t* peer_addresses,
                                                                                                        kLayout.payload_offset,
                                                                                                        kRowBytes);
     }
+
+    // Order all writers before CTA 0's cumulative system-scope release.
+    // All warp roles participate, including empty source ranks.
+    grid.sync();
+    if (blockIdx.x == 0)
+        peer_barrier(peer_addresses, local_signals, rank, kWorldSize, static_cast<uint64_t>(entry_epoch + 1));
 }
 
 template <int kHidden, int kTopk, int kWorldSize, int kExpertsPerRank, int64_t kMaxTokens, int64_t kExpertAlignment>
-void prepare_dispatch_launch(const torch::Tensor& x) {
-    TORCH_CHECK(x.size(0) <= std::numeric_limits<uint32_t>::max(), "fresh dispatch token count exceeds packed notify count capacity");
-    // Each specialization has fixed shared-memory and register requirements.
-    static thread_local int checked_device = -1;
-    if (checked_device != x.get_device()) {
-        int supported = 0;
-        C10_CUDA_CHECK(cudaDeviceGetAttribute(&supported, cudaDevAttrCooperativeLaunch, x.get_device()));
-        TORCH_CHECK(supported, "fresh dispatch requires CUDA cooperative launch support");
-        const auto kernel = dispatch_main_kernel<kHidden, kTopk, kWorldSize, kExpertsPerRank, kMaxTokens, kExpertAlignment, false>;
-        int active_blocks_per_sm = 0;
-        C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_sm, kernel, 256, 0));
-        TORCH_CHECK(active_blocks_per_sm >= 1, "fresh dispatch cannot fit a 256-thread cooperative block on an SM");
-        checked_device = x.get_device();
-    }
+void prepare_dispatch_launch(const torch::Tensor& x, bool cached_mode) {
+    if (!cached_mode)
+        TORCH_CHECK(x.size(0) <= std::numeric_limits<uint32_t>::max(), "fresh dispatch token count exceeds packed notify count capacity");
+    // Each specialization and cache mode has fixed cooperative resource requirements.
+    const auto prepare = [&]<bool kReuseSlots>() {
+        static thread_local int checked_device = -1;
+        if (checked_device != x.get_device()) {
+            int supported = 0;
+            C10_CUDA_CHECK(cudaDeviceGetAttribute(&supported, cudaDevAttrCooperativeLaunch, x.get_device()));
+            TORCH_CHECK(supported, "dispatch main requires CUDA cooperative launch support");
+            const auto kernel =
+                dispatch_main_kernel<kHidden, kTopk, kWorldSize, kExpertsPerRank, kMaxTokens, kExpertAlignment, kReuseSlots>;
+            int active_blocks_per_sm = 0;
+            C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_sm, kernel, 256, 0));
+            TORCH_CHECK(active_blocks_per_sm >= 1, "dispatch main cannot fit a 256-thread cooperative block on an SM");
+            checked_device = x.get_device();
+        }
+    };
+    if (cached_mode)
+        prepare.template operator()<true>();
+    else
+        prepare.template operator()<false>();
 }
 
 template <int kHidden, int kTopk, int kWorldSize, int kExpertsPerRank, int64_t kMaxTokens, int64_t kExpertAlignment>
@@ -394,6 +426,7 @@ void launch_dispatch(const torch::Tensor& addresses,
                      const torch::Tensor& expert_offsets,
                      int rank,
                      bool cached_mode,
+                     int64_t entry_epoch,
                      cudaStream_t stream) {
     const auto launch = [&]<bool kReuseSlots>() {
         const auto kernel = dispatch_main_kernel<kHidden, kTopk, kWorldSize, kExpertsPerRank, kMaxTokens, kExpertAlignment, kReuseSlots>;
@@ -421,15 +454,11 @@ void launch_dispatch(const torch::Tensor& addresses,
                         &expert_ptr,
                         &offsets_ptr,
                         &rank,
-                        &num_tokens};
+                        &num_tokens,
+                        &entry_epoch};
         constexpr int threads = 256;
         const int blocks = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-        if constexpr (kReuseSlots) {
-            C10_CUDA_CHECK(cudaLaunchKernel(reinterpret_cast<const void*>(kernel), dim3(blocks), dim3(threads), args, 0, stream));
-        } else {
-            C10_CUDA_CHECK(
-                cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(kernel), dim3(blocks), dim3(threads), args, 0, stream));
-        }
+        C10_CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(kernel), dim3(blocks), dim3(threads), args, 0, stream));
     };
     if (cached_mode)
         launch.template operator()<true>();

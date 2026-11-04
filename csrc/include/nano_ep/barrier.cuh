@@ -17,8 +17,8 @@ __device__ __forceinline__ void notify_group_barrier() {
     asm volatile("bar.sync 1, %0;" : : "n"(kNumThreads) : "memory");
 }
 
-// One CTA exchanges rank epochs. The caller provides any required grid sync
-// and system fences for writes made by other CTAs before publishing an epoch.
+// One CTA exchanges rank epochs with system-scope release/acquire.
+// The caller orders participating writers before the publishing CTA.
 __device__ __forceinline__ void peer_barrier(
     const int64_t* peer_addresses, uint64_t* local_signals, int rank, int world_size, uint64_t epoch) {
     const int peer = threadIdx.x;

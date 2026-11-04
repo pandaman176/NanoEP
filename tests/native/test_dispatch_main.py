@@ -581,3 +581,66 @@ def test_dispatch_rejects_combine_launcher_before_window_mutation(native, runtim
             peer, x, indices, None, 3, 5, 4, [], 0, False, wrong.launcher
         )
     torch.testing.assert_close(peer.local_window(), before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tokens", [0, 2])
+def test_fused_dispatch_epochs_include_empty_cached_ranks(native, runtime, tokens):
+    peer, _ = runtime
+    stream = torch.cuda.current_stream()
+    x = torch.ones((tokens, 256), dtype=torch.bfloat16, device="cuda")
+    indices = torch.tensor([[0, 1, -1], [2, -1, 0]], device="cuda")[
+        :tokens
+    ].contiguous()
+    module = prepare_dispatch_main(256, 3, 1, 3, 5, 4)
+    peer.barrier(stream.cuda_stream, 7)
+    epoch = 7
+    metadata, capacity = [], 0
+    for cached in (False, True, False, True):
+        state = native.dispatch_main(
+            peer,
+            x,
+            indices,
+            None,
+            3,
+            5,
+            4,
+            metadata if cached else [],
+            capacity if cached else 0,
+            False,
+            module.launcher,
+        )
+        if not cached:
+            prepare_dispatch_metadata(state)
+            metadata, capacity = state.metadata, int(state.counts[1])
+        epoch += 2
+        assert peer.local_window()[:8].view(torch.int64).item() == epoch
+    peer.barrier(stream.cuda_stream)
+    epoch += 1
+    assert peer.local_window()[:8].view(torch.int64).item() == epoch
+    with pytest.raises(RuntimeError, match="strictly increase"):
+        peer.barrier(stream.cuda_stream, epoch)
+    peer.barrier(stream.cuda_stream, epoch + 5)
+    state = native.dispatch_main(
+        peer, x, indices, None, 3, 5, 4, metadata, capacity, False, module.launcher
+    )
+    assert state.metadata_prepared
+    assert peer.local_window()[:8].view(torch.int64).item() == epoch + 7
+
+
+def test_dispatch_stream_mismatch_precedes_window_mutation(native, runtime):
+    peer, _ = runtime
+    x = torch.ones((2, 256), dtype=torch.bfloat16, device="cuda")
+    indices = torch.tensor([[0, 1, -1], [2, -1, 0]], device="cuda")
+    module = prepare_dispatch_main(256, 3, 1, 3, 5, 4)
+    original = torch.cuda.current_stream()
+    peer.barrier(original.cuda_stream)
+    before = peer.local_window().clone()
+    other = torch.cuda.Stream()
+    other.wait_stream(original)
+    with torch.cuda.stream(other):
+        with pytest.raises(RuntimeError, match="same stream"):
+            native.dispatch_main(
+                peer, x, indices, None, 3, 5, 4, [], 0, False, module.launcher
+            )
+    other.synchronize()
+    torch.testing.assert_close(peer.local_window(), before, rtol=0, atol=0)

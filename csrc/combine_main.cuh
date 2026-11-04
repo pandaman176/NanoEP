@@ -248,10 +248,9 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,
     combine_return_rows<kHidden, kTopk, kWorldSize, kMaxTokens, data_t, kExpand, kAllowMultipleReduction, kWithWeights>(
         peer_addresses, x, weights, src_ranks, src_tokens, local_topk_idx, expanded_slots, rank, recv_count, input_rows, return_offset);
 
-    // Each writer orders its own remote stores before CTA 0 publishes completion.
+    // Order all writers before CTA 0's cumulative system-scope release.
     // Empty ranks participate too. Stream ordering delays the epilogue until
     // the whole kernel ends, so no final grid sync is needed after the exchange.
-    __threadfence_system();
     grid.sync();
     if (blockIdx.x == 0)
         peer_barrier(peer_addresses, local_signals, rank, kWorldSize, static_cast<uint64_t>(entry_epoch + 1));

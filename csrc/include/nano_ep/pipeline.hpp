@@ -11,7 +11,7 @@ struct WindowLayout;
 // and stream handles without passing PeerRuntime across extension modules.
 struct DispatchMainSpecialization {
     int64_t hidden, topk, world_size, experts_per_rank, max_tokens, expert_alignment;
-    void (*prepare)(const torch::Tensor& x);
+    void (*prepare)(const torch::Tensor& x, bool cached_mode);
     void (*launch)(const torch::Tensor& addresses,
                    const torch::Tensor& window,
                    const torch::Tensor& x,
@@ -24,6 +24,7 @@ struct DispatchMainSpecialization {
                    const torch::Tensor& expert_offsets,
                    int rank,
                    bool cached_mode,
+                   int64_t entry_epoch,
                    cudaStream_t stream);
 };
 
@@ -76,7 +77,9 @@ struct DispatchState {
 // proceeds. Incoming counts reuse the same shared buffer after all sends.
 // CTA 0's warp 0 builds the rank prefix; warp 1 sums experts, aligns and scans
 // them directly into actual counts and padded offsets, using int64 accumulators.
-// Empty ranks participate. Cached sends use eight payload warps.
+// Both variants launch cooperatively, including T=0 ranks. Cached sends use
+// eight payload warps. CTA 0 exchanges entry/exit epochs inside the kernel;
+// grid synchronization protects workspace reuse and system fences publish payloads.
 // Fresh counts fit uint32; rank/expert counts require per-CTA shared memory.
 // Launch resource checks precede window mutation and the entry barrier.
 // Local storage checks precede window mutation and the entry barrier. Routing

@@ -34,3 +34,9 @@ torchrun --standalone --nproc-per-node=2 -m nano_ep.examples.moe --async-op --ca
 ```
 
 With development dependencies installed, `python tools/check_package.py` builds the wheel from its sdist, verifies every bundled native source, and imports the installed wheel outside the checkout. Add `--compile` on a GPU host to compile those bundled sources.
+
+
+Fused dispatch barrier checks run with
+`pytest tests/distributed/test_dispatch_barrier_launch.py --run-distributed --nproc 2`
+(or 4/8). Each rank verifies 24 fresh/cached, delayed-reader, multi-CTA and empty
+source cases, including interleaving standalone and fused barrier epochs.
