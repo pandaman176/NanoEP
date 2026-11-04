@@ -345,6 +345,7 @@ def test_nonfinite_payload_is_preserved(native, runtime, dtype):
         "x_fp32",
         "x_shape",
         "x_stride",
+        "x_alignment",
         "capacity",
         "idx_cpu",
         "idx_dtype",

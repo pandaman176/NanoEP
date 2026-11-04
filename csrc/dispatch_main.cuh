@@ -205,21 +205,29 @@ __device__ __forceinline__ void count_and_notify(const int64_t* peer_addresses,
     }
 }
 
-template <typename data_t, int kWorldSize, int kExpertsPerRank, bool kReuseSlots, int kNumNotifyWarps>
+template <int kHidden, int kTopk, int kWorldSize, int kExpertsPerRank, bool kReuseSlots, int kNumNotifyWarps>
 __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addresses,
-                                                      const data_t* x,
+                                                      const at::BFloat16* x,
                                                       const int64_t* indices,
                                                       const float* weights,
                                                       int64_t* dst_slots,
                                                       int rank,
                                                       int64_t num_tokens,
-                                                      int64_t hidden,
-                                                      int64_t num_topk,
                                                       int64_t max_tokens,
                                                       int64_t send_next_offset,
                                                       int64_t payload_offset,
                                                       int64_t payload_row_bytes) {
     constexpr int kWarpSize = 32;
+    constexpr int kElemsPerVector = sizeof(int4) / sizeof(at::BFloat16);
+    constexpr int kVectorsPerLane = kHidden / (kWarpSize * kElemsPerVector);
+    static_assert(kHidden > 0 && kHidden % (kWarpSize * kElemsPerVector) == 0);
+    static_assert(kTopk > 0 && kTopk <= kWarpSize);
+    constexpr int kUnrollFactor = [] {
+        for (int factor = 4; factor >= 1; --factor)
+            if (kVectorsPerLane % factor == 0)
+                return factor;
+        return 1;
+    }();
     const int lane = threadIdx.x % kWarpSize;
     const int warp_idx = threadIdx.x / kWarpSize;
     // reserve slots and write payloads to the peer windows.
@@ -229,6 +237,7 @@ __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addres
     // Warps process disjoint token sequences across the SM-sized grid.
     for (int64_t token = token_start; token < num_tokens; token += token_stride) {
         int destination = -1;
+        int64_t expert_id = -1;
         unsigned long long slot = 0;
         bool is_sender = false;
         if constexpr (kReuseSlots) {
@@ -243,8 +252,8 @@ __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addres
         } else {
             // Fist K lane handle one routing
             // Expert[0, 1, 2, 3, 4, 5, 6, 7] -> Rank[0, 0, 1, 1, 2, 2, 3, 3]
-            if (lane < num_topk) {
-                const int64_t expert_id = indices[token * num_topk + lane];
+            if (lane < kTopk) {
+                expert_id = indices[token * kTopk + lane];
                 if (expert_id < -1 || expert_id >= kWorldSize * kExpertsPerRank) {
                     printf("NanoEP dispatch invalid expert: token=%lld expert=%lld\n",
                            static_cast<long long>(token),
@@ -279,40 +288,70 @@ __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addres
         }
 
         // e.g. senders = 0b00000000000000000000000010101010
-        unsigned senders = __ballot_sync(0xffffffffu, is_sender);
-        while (senders != 0) {
-            // find the first sender in the warp
-            const int sender = __ffs(senders) - 1;
+        const unsigned senders = __ballot_sync(0xffffffffu, is_sender);
+        if (senders == 0)
+            continue;
 
-            // Cached sender lanes already identify destination ranks.
-            const int64_t dst = kReuseSlots ? sender : __shfl_sync(0xffffffffu, destination, sender);
-            const int64_t dst_slot = __shfl_sync(0xffffffffu, slot, sender);
+        if constexpr (kReuseSlots) {
+            if (lane < kTopk)
+                expert_id = indices[token * kTopk + lane];
+        }
+        const float route_weight = weights != nullptr && lane < kTopk ? weights[token * kTopk + lane] : 0.0f;
+        unsigned long long row_address = 0;
+        if (is_sender) {
+            const int dst = kReuseSlots ? lane : destination;
             auto* peer_window = reinterpret_cast<uint8_t*>(peer_addresses[dst]);
+            row_address = reinterpret_cast<unsigned long long>(peer_window + payload_offset + slot * payload_row_bytes);
+        }
+
+        // Header fields and row addresses stay in registers across all targets.
+        unsigned remaining = senders;
+        while (remaining != 0) {
+            // find the first sender in the warp
+            const int sender = __ffs(remaining) - 1;
 
             // write payload together
-            auto* row = peer_window + payload_offset + dst_slot * payload_row_bytes;
+            auto* row = reinterpret_cast<uint8_t*>(__shfl_sync(0xffffffffu, row_address, sender));
             auto* row_src_rank = reinterpret_cast<int64_t*>(row);
             auto* row_src_token = reinterpret_cast<int64_t*>(row + 8);
             auto* row_topk = reinterpret_cast<int64_t*>(row + WindowLayout::kPayloadTopkOffset);
-            auto* row_weights = reinterpret_cast<float*>(row + WindowLayout::payload_weights_offset(num_topk));
-            auto* row_x = reinterpret_cast<data_t*>(row + WindowLayout::payload_x_offset(num_topk));
+            auto* row_weights = reinterpret_cast<float*>(row + WindowLayout::payload_weights_offset(kTopk));
 
             if (lane == 0) {
                 row_src_rank[0] = rank;
                 row_src_token[0] = token;
             }
-            for (int64_t k = lane; k < num_topk; k += kWarpSize) {
-                row_topk[k] = indices[token * num_topk + k];
+            if (lane < kTopk) {
+                row_topk[lane] = expert_id;
                 if (weights != nullptr) {
-                    row_weights[k] = weights[token * num_topk + k];
+                    row_weights[lane] = route_weight;
                 }
             }
-            for (int64_t h = lane; h < hidden; h += kWarpSize) {
-                row_x[h] = x[token * hidden + h];
-            }
+            remaining &= remaining - 1;
+        }
 
-            // clear the first sender
-            senders &= senders - 1;
+        // Load one bounded tile once, then copy its BF16 bits to every target.
+        const auto* input_vectors = reinterpret_cast<const int4*>(x + token * kHidden);
+        const auto x_address = row_address + WindowLayout::payload_x_offset(kTopk);
+#pragma unroll 1
+        for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
+            int4 slices[kUnrollFactor];
+#pragma unroll
+            for (int u = 0; u < kUnrollFactor; ++u) {
+                const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
+                slices[u] = input_vectors[index];
+            }
+            remaining = senders;
+            while (remaining != 0) {
+                const int sender = __ffs(remaining) - 1;
+                auto* output_vectors = reinterpret_cast<int4*>(__shfl_sync(0xffffffffu, x_address, sender));
+#pragma unroll
+                for (int u = 0; u < kUnrollFactor; ++u) {
+                    const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
+                    output_vectors[index] = slices[u];
+                }
+                remaining &= remaining - 1;
+            }
         }
     }
 }
@@ -383,19 +422,17 @@ __global__ void dispatch_main_kernel(const int64_t* peer_addresses,
         }
     }
     if (warp_idx >= kNumNotifyWarps) {
-        dispatch_payload_rows<at::BFloat16, kWorldSize, kExpertsPerRank, kReuseSlots, kNumNotifyWarps>(peer_addresses,
-                                                                                                       x,
-                                                                                                       indices,
-                                                                                                       weights,
-                                                                                                       dst_slots,
-                                                                                                       rank,
-                                                                                                       num_tokens,
-                                                                                                       kHidden,
-                                                                                                       kTopk,
-                                                                                                       kMaxTokens,
-                                                                                                       kLayout.send_next_offset,
-                                                                                                       kLayout.payload_offset,
-                                                                                                       kRowBytes);
+        dispatch_payload_rows<kHidden, kTopk, kWorldSize, kExpertsPerRank, kReuseSlots, kNumNotifyWarps>(peer_addresses,
+                                                                                                         x,
+                                                                                                         indices,
+                                                                                                         weights,
+                                                                                                         dst_slots,
+                                                                                                         rank,
+                                                                                                         num_tokens,
+                                                                                                         kMaxTokens,
+                                                                                                         kLayout.send_next_offset,
+                                                                                                         kLayout.payload_offset,
+                                                                                                         kRowBytes);
     }
 
     // Order all writers before CTA 0's cumulative system-scope release.

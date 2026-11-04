@@ -29,6 +29,8 @@ void check_payload_inputs(const torch::Tensor& window,
     TORCH_CHECK(x.device() == window.device() && x.dim() == 2 && x.is_contiguous(),
                 "x must be contiguous CUDA [T,H] on the runtime device");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "dispatch x must be bfloat16");
+    TORCH_CHECK(x.numel() == 0 || reinterpret_cast<uintptr_t>(x.data_ptr()) % sizeof(int4) == 0,
+                "dispatch x data pointer must be 16-byte aligned");
     TORCH_CHECK(x.size(1) > 0 && x.size(1) % WindowLayout::kHiddenAlignment == 0, "dispatch hidden must be a positive multiple of 256");
     TORCH_CHECK(indices.device() == x.device() && indices.scalar_type() == torch::kInt64 && indices.dim() == 2 &&
                     indices.size(0) == x.size(0) && indices.is_contiguous(),
@@ -200,9 +202,9 @@ DispatchState dispatch_main(PeerRuntime& runtime,
     const int64_t expanded_capacity = receive_counts[1];
     const int64_t row_bytes = WindowLayout::payload_row_bytes(x.size(1), num_topk);
 
-    auto stage_buffer =
-        runtime.local_window().narrow(0, window_layout.payload_offset, world_size * max_tokens * row_bytes)
-            .view({world_size * max_tokens, row_bytes});
+    auto stage_buffer = runtime.local_window()
+                            .narrow(0, window_layout.payload_offset, world_size * max_tokens * row_bytes)
+                            .view({world_size * max_tokens, row_bytes});
 
     std::vector<torch::Tensor> metadata;
     if (fresh) {
@@ -212,7 +214,7 @@ DispatchState dispatch_main(PeerRuntime& runtime,
             dst_slots,           // 2: dst_slots          [T,R]
             send_counts,         // 3: send_counts        [R]
             route_indices,       // 4: source snapshot    [T,K]
-            recv_rank_prefix,     // 5: inclusive source counts [R]
+            recv_rank_prefix,    // 5: inclusive source counts [R]
         };
     } else {
         metadata = cached_meta_data;

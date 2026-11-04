@@ -339,16 +339,17 @@ def test_cached_payload_preserves_mapping_and_counter(
 
 
 @pytest.mark.parametrize(
-    "ranks,local_experts,topk",
-    [(1, 4, 3), (2, 2, 3), (8, 2, 3), (32, 1, 1)],
+    "ranks,local_experts,topk,hidden",
+    [(1, 4, 3, 256), (8, 2, 3, 256), (32, 1, 1, 256)]
+    + [(2, 2, 3, hidden) for hidden in (256, 512, 768, 1280, 7168)],
 )
 @pytest.mark.parametrize("weighted", [False, True])
 @pytest.mark.parametrize("cached", [False, True])
 def test_source_partitioned_payload(
-    native, payload_probe, ranks, local_experts, topk, weighted, cached
+    native, payload_probe, ranks, local_experts, topk, hidden, weighted, cached
 ):
     """Run rank-lane selection with logical peer allocations on one GPU."""
-    tokens, hidden, capacity = 5, 256, 5
+    tokens, capacity = 5, 5
     experts = ranks * local_experts
     layout = native.window_layout(ranks, capacity, hidden, topk, experts)
     send_next_offset = layout[1] + (ranks + experts) * 8
@@ -388,6 +389,8 @@ def test_source_partitioned_payload(
             [0x7FC1, -32768, 0x7F80, -128], dtype=torch.int16
         )
         weights = torch.arange(tokens * topk).reshape(tokens, topk).float() / 7 + phase
+        weights.view(torch.int32)[0, 0] = 0x7FC01234
+        weights.view(torch.int32)[3, 0] = -2147483648
         for window in windows:
             window.fill_(0xA5)
             window[send_next_offset : send_next_offset + ranks * 8].view(

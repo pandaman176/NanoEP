@@ -210,6 +210,12 @@ internal callback ABI changed; rebuild core and geometry modules together.
 
 ### Source-partitioned dispatch reservation
 
+Dispatch payloads use BF16 int4 bit copies. Nonempty x must have a 16-byte
+aligned data pointer; core rejects misaligned contiguous offset views before
+barriers/window mutation. Clone such views to allocate aligned storage. Top-k
+and optional weights are preloaded per token; bounded register tiles reuse x
+across targets. No shared staging/TMA is added. Rebuild core/main/probe and restart.
+
 Fresh sends reserve from local device-scope send_next[destination], then store
 source_rank*Tmax+local_slot in dst_slots[T,R]. Each peer payload arena is
 source-major [R,Tmax,row_bytes]. Epilogue uses inclusive source prefix[R] to
