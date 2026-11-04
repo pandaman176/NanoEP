@@ -64,7 +64,7 @@ def expert_inputs(case, rank, expand, *, alignment=4):
     ranks = len(case.indices)
     layouts = [reference_layout(case.indices, r, case.num_experts, alignment) for r in range(ranks)]
     layout = layouts[rank]
-    order = torch.arange(layout.recv_count - 1, -1, -1, dtype=torch.int64)
+    order = torch.cat([torch.where(layout.src_ranks == source)[0].flip(0) for source in range(ranks)])
     sources, tokens, local = layout.src_ranks[order], layout.src_tokens[order], layout.local_topk_idx[order]
     slots = layout.expanded_slots[order].clone()
     for expert, count in enumerate(layout.expert_counts.tolist()):
@@ -87,9 +87,11 @@ def expert_inputs(case, rank, expand, *, alignment=4):
     dst_slots = torch.full((len(case.indices[rank]), ranks), -1, dtype=torch.int64)
     for destination, recv in enumerate(layouts):
         keys = list(zip(recv.src_ranks.tolist(), recv.src_tokens.tolist(), strict=True))[::-1]
-        for row, (source, token) in enumerate(keys):
+        local_slot = 0
+        for source, token in keys:
             if source == rank:
-                dst_slots[token, destination] = row
+                dst_slots[token, destination] = rank * case.capacity + local_slot
+                local_slot += 1
     metadata = [
         sources,
         tokens,
@@ -100,6 +102,7 @@ def expert_inputs(case, rank, expand, *, alignment=4):
         dst_slots,
         reference_plan(case.indices[rank], case.num_experts, ranks).send_counts,
         case.indices[rank].clone(),
+        torch.bincount(layout.src_ranks, minlength=ranks).cumsum(0),
     ]
     return x, weights, metadata
 

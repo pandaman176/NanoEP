@@ -216,7 +216,7 @@ __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addres
                                                       int64_t hidden,
                                                       int64_t num_topk,
                                                       int64_t max_tokens,
-                                                      int64_t recv_next_offset,
+                                                      int64_t send_next_offset,
                                                       int64_t payload_offset,
                                                       int64_t payload_row_bytes) {
     constexpr int kWarpSize = 32;
@@ -264,15 +264,16 @@ __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addres
             is_sender = (destination >= 0 && lane == leader);
 
             if (is_sender) {
-                auto* target_window = reinterpret_cast<uint8_t*>(peer_addresses[destination]);
-                auto* recv_next = reinterpret_cast<unsigned long long*>(target_window + recv_next_offset);
-                using Counter = cuda::atomic_ref<unsigned long long, cuda::thread_scope_system>;
-                Counter counter(*recv_next);
-                slot = counter.fetch_add(1ULL, cuda::memory_order_relaxed);
+                auto* local_window = reinterpret_cast<uint8_t*>(peer_addresses[rank]);
+                auto* send_next = reinterpret_cast<unsigned long long*>(local_window + send_next_offset);
+                using Counter = cuda::atomic_ref<unsigned long long, cuda::thread_scope_device>;
+                Counter counter(send_next[destination]);
+                slot = static_cast<unsigned long long>(rank) * max_tokens + counter.fetch_add(1ULL, cuda::memory_order_relaxed);
                 dst_slots[token * kWorldSize + destination] = static_cast<int64_t>(slot);
             }
         }
-        if (is_sender && !(slot < static_cast<unsigned long long>(kWorldSize) * max_tokens)) {
+        const auto source_start = static_cast<unsigned long long>(rank) * max_tokens;
+        if (is_sender && !(slot >= source_start && slot - source_start < static_cast<unsigned long long>(max_tokens))) {
             printf("Invalid destination slot\n");
             asm volatile("trap;");
         }
@@ -352,10 +353,10 @@ __global__ void dispatch_main_kernel(const int64_t* peer_addresses,
     auto* local_signals = reinterpret_cast<uint64_t*>(local_window);
     if (blockIdx.x == 0) {
         if constexpr (!kReuseSlots) {
-            // Reset before publishing entry readiness so peers reserve from zero.
-            if (threadIdx.x == 0) {
-                auto* recv_next = reinterpret_cast<unsigned long long*>(local_window + kLayout.recv_next_offset);
-                *recv_next = 0ULL;
+            // All local CTAs reserve within one source-owned segment per peer.
+            if (threadIdx.x < kWorldSize) {
+                auto* send_next = reinterpret_cast<unsigned long long*>(local_window + kLayout.send_next_offset);
+                send_next[threadIdx.x] = 0ULL;
             }
             __syncthreads();
         }
@@ -392,7 +393,7 @@ __global__ void dispatch_main_kernel(const int64_t* peer_addresses,
                                                                                                        kHidden,
                                                                                                        kTopk,
                                                                                                        kMaxTokens,
-                                                                                                       kLayout.recv_next_offset,
+                                                                                                       kLayout.send_next_offset,
                                                                                                        kLayout.payload_offset,
                                                                                                        kRowBytes);
     }

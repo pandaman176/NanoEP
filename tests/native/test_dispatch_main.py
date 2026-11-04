@@ -211,7 +211,7 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
             ).launcher,
         )
         assert not state.metadata_prepared
-        assert len(state.metadata) == 5
+        assert len(state.metadata) == 6
         assert all(isinstance(tensor, torch.Tensor) for tensor in state.metadata)
         torch.testing.assert_close(state.metadata[4].cpu(), case.indices[0])
         assert (
@@ -231,7 +231,7 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
         indices.fill_(99)
         torch.testing.assert_close(state.metadata[8].cpu(), case.indices[0])
 
-        # A different fresh dispatch overwrites the window and resets recv_next.
+        # A different fresh dispatch overwrites the window and resets send_next.
         masked = replace(case, indices=[torch.full_like(case.indices[0], -1)])
         fresh = native.dispatch_main(
             runtime,
@@ -381,6 +381,10 @@ def test_invalid_input_precedes_communication(native, runtime, kind):
         x = x.flatten()
     elif kind == "x_stride":
         x = torch.ones((2, 512), dtype=torch.bfloat16, device="cuda")[:, ::2]
+    elif kind == "x_alignment":
+        x = torch.ones(2 * 256 + 1, dtype=torch.bfloat16, device="cuda")[1:].view(
+            2, 256
+        )
     elif kind == "capacity":
         capacity = 1
     elif kind == "idx_cpu":

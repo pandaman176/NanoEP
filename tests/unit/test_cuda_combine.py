@@ -33,6 +33,7 @@ def combine_runtime(dispatch_runtime):
         expert_counts=integers("expert_counts", [1, 1, 1]),
         expert_offsets=integers("expert_offsets", [0, 4, 8, 12]),
         expanded_slots=integers("expanded_slots", []),
+        recv_rank_prefix=integers("recv_rank_prefix", [1, 2]),
         recv_count=2,
         expanded_capacity=12,
     )
@@ -103,6 +104,7 @@ def handle_metadata(handle):
         handle.dst_slots,
         handle.send_counts,
         handle.topk_idx,
+        layout.recv_rank_prefix,
     ]
 
 

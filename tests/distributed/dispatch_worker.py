@@ -34,6 +34,7 @@ def check_output(got, case, rank, alignment, weights, zero_padding):
         handle.dst_slots,
         handle.send_counts,
         handle.topk_idx,
+        layout.recv_rank_prefix,
     ]
     # The shared checker uses device and receive mappings; it never reads raw staging here.
     state = SimpleNamespace(stage_buffer=got.x, metadata=metadata)

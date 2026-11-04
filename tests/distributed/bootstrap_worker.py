@@ -92,11 +92,11 @@ def run():
                     window[
                         buffer._count_offset
                         + (size + config.num_experts) * 8 : buffer._count_offset
-                        + (size + config.num_experts + 1) * 8
+                        + (2 * size + config.num_experts) * 8
                     ]
                     .view(torch.int64)
-                    .item()
-                    == 0
+                    .tolist()
+                    == [0] * size
                 )
                 del addresses, window, counts
                 with torch.cuda.stream(buffer._comm_stream):

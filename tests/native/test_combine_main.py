@@ -50,6 +50,7 @@ def empty_inputs(native, mode=False, dtype=torch.bfloat16, tokens=2, *, expand=F
         torch.full((tokens, 1), -1, dtype=torch.int64, device="cuda"),
         torch.zeros(1, dtype=torch.int64, device="cuda"),
         torch.full((tokens, topk), -1, dtype=torch.int64, device="cuda"),
+        torch.zeros(1, dtype=torch.int64, device="cuda"),
     ]
     x = torch.empty((0, hidden), dtype=dtype, device="cuda")
     torch.cuda.synchronize()

@@ -125,7 +125,7 @@ DispatchState dispatch_main(PeerRuntime& runtime,
     const auto window = runtime.local_window();
     const int world_size = runtime.world_size();
     const bool fresh = cached_meta_data.empty();
-    TORCH_CHECK(fresh || cached_meta_data.size() == 9, "cached metadata must contain nine prepared tensors from dispatch_epilogue");
+    TORCH_CHECK(fresh || cached_meta_data.size() == 10, "cached metadata must contain ten prepared tensors from dispatch_epilogue");
     TORCH_CHECK(world_size <= 32 && (world_size & (world_size - 1)) == 0, "dispatch world_size must be one of {1,2,4,8,16,32}");
     const auto& routing_input = fresh ? indices : cached_meta_data[8];
     check_payload_inputs(window, x, routing_input, weights, world_size, num_experts, max_tokens);
@@ -166,6 +166,7 @@ DispatchState dispatch_main(PeerRuntime& runtime,
             check_cached_tensor(cached_meta_data[5], x, {recv_count, num_topk}, "expanded_slots");
         check_cached_tensor(cached_meta_data[6], x, {x.size(0), world_size}, "dst_slots");
         check_cached_tensor(cached_meta_data[7], x, {world_size}, "send_counts");
+        check_cached_tensor(cached_meta_data[9], x, {world_size}, "recv_rank_prefix");
     }
 
     const int64_t entry_epoch = runtime.reserve_barrier_epochs(stream_handle, 2);
@@ -189,6 +190,7 @@ DispatchState dispatch_main(PeerRuntime& runtime,
         dst_slots = cached_meta_data[6];
         recv_expert_counts = cached_meta_data[3];
         expert_offsets = cached_meta_data[4];
+        recv_rank_prefix = cached_meta_data[9];
         launch_dispatch_main(runtime, x, route_indices, weights, num_experts, cached_meta_data[6], entry_epoch, specialization);
     }
 
@@ -199,7 +201,8 @@ DispatchState dispatch_main(PeerRuntime& runtime,
     const int64_t row_bytes = WindowLayout::payload_row_bytes(x.size(1), num_topk);
 
     auto stage_buffer =
-        runtime.local_window().narrow(0, window_layout.payload_offset, recv_count * row_bytes).view({recv_count, row_bytes});
+        runtime.local_window().narrow(0, window_layout.payload_offset, world_size * max_tokens * row_bytes)
+            .view({world_size * max_tokens, row_bytes});
 
     std::vector<torch::Tensor> metadata;
     if (fresh) {
@@ -209,6 +212,7 @@ DispatchState dispatch_main(PeerRuntime& runtime,
             dst_slots,           // 2: dst_slots          [T,R]
             send_counts,         // 3: send_counts        [R]
             route_indices,       // 4: source snapshot    [T,K]
+            recv_rank_prefix,     // 5: inclusive source counts [R]
         };
     } else {
         metadata = cached_meta_data;
@@ -247,7 +251,7 @@ torch::Tensor combine_main(PeerRuntime& runtime,
 
     const auto window = runtime.local_window();
     const int world_size = runtime.world_size();
-    TORCH_CHECK(metadata.size() == 9, "combine requires nine prepared metadata tensors from dispatch_epilogue");
+    TORCH_CHECK(metadata.size() == 10, "combine requires ten prepared metadata tensors from dispatch_epilogue");
     TORCH_CHECK(x.device() == window.device() && x.dim() == 2 && x.is_contiguous() && x.size(1) > 0,
                 "combine x must be contiguous CUDA [N,H] or [C,H] on the runtime device");
     TORCH_CHECK(x.scalar_type() == torch::kBFloat16, "combine x must be bfloat16");
@@ -281,6 +285,7 @@ torch::Tensor combine_main(PeerRuntime& runtime,
     check_cached_tensor(metadata[6], x, {source_tokens, world_size}, "dst_slots");
     check_cached_tensor(metadata[7], x, {world_size}, "send_counts");
     check_cached_tensor(metadata[8], x, {source_tokens, num_topk}, "source_topk_snapshot");
+    check_cached_tensor(metadata[9], x, {world_size}, "recv_rank_prefix");
     TORCH_CHECK(expand ? (x.size(0) >= recv_count && (recv_count != 0 || x.size(0) == 0)) : x.size(0) == recv_count,
                 "combine x rows do not match the receive layout");
     if (weights.has_value()) {

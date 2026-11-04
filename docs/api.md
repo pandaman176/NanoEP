@@ -65,7 +65,7 @@ received.event.current_stream_wait()
 
 `previous_event` is an optional native `torch.cuda.Event` for an input producer on another stream. Otherwise the communication stream waits for the caller's current stream. The returned event tracks tensor ownership on the consumer stream. Keep the current device set to this process's GPU and do not mutate inputs until communication completes. Fresh exact allocation waits for mapped host N/C publication, without scalar D2H copies or a whole-main synchronization. Cached dispatch uses metadata shape for N and the handle's saved host C, without reading GPU offsets back. Asynchronous mode does not imply CUDA Graph compatibility.
 
-Native `dispatch_main` requires `cached_expanded_capacity` immediately after `cached_metadata`: fresh calls pass `0` (ignored), cached calls pass the original handle's C. The nine metadata tensors remain on the GPU, with unchanged ordering. Direct native callers must update this argument, rebuild core and restart the process; public `CudaBuffer.dispatch` arguments are unchanged.
+Native `dispatch_main` requires `cached_expanded_capacity` immediately after `cached_metadata`: fresh calls pass `0` (ignored), cached calls pass the original handle's C. The ten metadata tensors remain on the GPU, with unchanged ordering. Direct native callers must update this argument, rebuild core and restart the process; public `CudaBuffer.dispatch` arguments are unchanged.
 
 Close collectively after consumers finish, preferably with `with CudaBuffer(...)`. Closing drains GPU work, coordinates unmapping across ranks, then frees allocations. Do not use handles after close or across buffers. Fatal rank failure relies on the process-group/launcher timeout.
 
@@ -145,7 +145,7 @@ Empty ranks still launch and contribute zeros. Resource checks precede window
 mutation and communication. Cached dispatch keeps eight payload warps.
 
 The window now stores barrier signals, aligned notify reduction, aligned peer
-counts plus recv_next, and the shared dispatch/return arena. Rebuild extensions,
+counts plus local send_next[R], and the shared dispatch/return arena. Rebuild extensions,
 restart the process and recreate IPC buffers/handles after this byte-layout
 change. Python signatures and metadata formats are unchanged. Peer counts keep
 -1 pending / nonnegative ready. Expert reduction, alignment and prefix sums run inside the fused notify stage.
@@ -202,7 +202,23 @@ or mutating the window. CTA 0 exchanges entry readiness, then every CTA grid-syn
 before writing. A grid sync orders all writers before CTA 0's system-scope release
 publication of completion; release/acquire cumulativity carries their writes to peers.
 The following epilogue waits for kernel completion on the same stream.
-Fresh recv_next is reset by CTA 0's thread 0, followed by CTA synchronization
+Fresh send_next[R] is reset by CTA 0's first R threads, followed by CTA synchronization
 and system-scope release publication of entry readiness. Cached calls preserve
 the counter; no standalone host memset is queued. Exact N/C waits use mapped host publication. The
 internal callback ABI changed; rebuild core and geometry modules together.
+
+
+### Source-partitioned dispatch reservation
+
+Fresh sends reserve from local device-scope send_next[destination], then store
+source_rank*Tmax+local_slot in dst_slots[T,R]. Each peer payload arena is
+source-major [R,Tmax,row_bytes]. Epilogue uses inclusive source prefix[R] to
+map exact logical N rows to valid physical rows; partition gaps are never read.
+Outputs retain exact N/C shapes. The prefix is metadata item 5 in fresh states
+and item 9 in prepared/cached states, and NativeLayout.recv_rank_prefix keeps it
+for replay. Combine still consumes logical provenance rows.
+
+The count region now reserves R counters instead of one; payload/return offsets
+and total allocation may change, while payload capacity remains R*Tmax rows.
+Fresh/prepared metadata contain 6/10 tensors. Rebuild core, JIT and probe modules,
+restart processes and recreate windows/handles; old 9-item metadata is unsupported.

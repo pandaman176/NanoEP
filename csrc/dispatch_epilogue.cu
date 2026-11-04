@@ -25,7 +25,7 @@ static_assert(kTopk > 0 && kTopk <= 32 && kExpertsPerRank > 0);
 // Use the same communication stream as dispatch_main; construct the Python
 // handle after this call and expose completion via its event.
 static std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool expand, bool with_weights, bool zero_padding) {
-    TORCH_CHECK(state.metadata.size() == (state.metadata_prepared ? 9 : 5) && state.stage_buffer.is_cuda(),
+    TORCH_CHECK(state.metadata.size() == (state.metadata_prepared ? 10 : 6) && state.stage_buffer.is_cuda(),
                 "dispatch_epilogue requires a native dispatch state");
     TORCH_CHECK(state.metadata_prepared == kCachedMode, "dispatch epilogue cached_mode does not match the state");
     TORCH_CHECK(state.x_dtype == torch::kBFloat16, "dispatch output dtype must be bfloat16");
@@ -33,12 +33,18 @@ static std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool e
                 "dispatch hidden must be a positive multiple of 256");
     const auto& expert_counts = state.metadata[kCachedMode ? 3 : 0];
     const auto& source_topk = state.metadata[kCachedMode ? 8 : 4];
+    const auto& recv_rank_prefix = state.metadata[kCachedMode ? 9 : 5];
+    const int world_size = recv_rank_prefix.numel();
     TORCH_CHECK(state.hidden == kHidden && source_topk.dim() == 2 && source_topk.size(1) == kTopk &&
                     expert_counts.numel() == kExpertsPerRank && state.stage_buffer.dim() == 2 && state.stage_buffer.size(1) == kRowBytes,
                 "dispatch epilogue inputs do not match the compiled geometry");
+    TORCH_CHECK(world_size > 0 && world_size <= 32 && state.stage_buffer.size(0) % world_size == 0,
+                "dispatch stage must contain equally sized source partitions");
+    const int64_t max_tokens = state.stage_buffer.size(0) / world_size;
     const auto* counts = state.counts.data_ptr<int64_t>();  // CPU
     const int64_t N = counts[0];
     const int64_t C = counts[1];
+    TORCH_CHECK(max_tokens > 0 && N >= 0 && N <= state.stage_buffer.size(0), "dispatch receive count exceeds stage capacity");
 
     c10::cuda::CUDAGuard guard(state.stage_buffer.device());
     if constexpr (kCachedMode) {
@@ -60,6 +66,7 @@ static std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool e
             state.metadata[2],  // dst_slots
             state.metadata[3],  // send_counts
             state.metadata[4],  // source_topk_snapshot
+            state.metadata[5],  // recv_rank_prefix
         };
     }
 
@@ -104,6 +111,9 @@ static std::vector<torch::Tensor> dispatch_epilogue(DispatchState& state, bool e
                 kExpand ? nullptr : local_indices.data_ptr<int64_t>(),
                 kWithWeights ? weights.data_ptr<float>() : nullptr,
                 N,
+                state.metadata[9].data_ptr<int64_t>(),
+                world_size,
+                max_tokens,
                 state.rank);
     };
     const auto weighted = [&]<bool kExpand, bool kZeroPadding>() {

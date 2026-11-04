@@ -119,6 +119,7 @@ def dispatch_runtime(monkeypatch):
                 integers("dst_slots", [[0, 1], [-1, -1]]),
                 integers("send_counts", [1, 1]),
                 Tensor("snapshot", routing.payload.clone()),
+                integers("recv_rank_prefix", [1, 2]),
             ]
         state = SimpleNamespace(
             metadata=metadata,
@@ -148,7 +149,7 @@ def dispatch_runtime(monkeypatch):
         if settings["failure"] == "epilogue":
             raise RuntimeError("injected epilogue failure")
         if not state.metadata_prepared:
-            counts, offsets, dst, sends, snapshot = state.metadata
+            counts, offsets, dst, sends, snapshot, prefix = state.metadata
             alignment = int(offsets.payload[1])
             state.metadata = [
                 integers("src_ranks", [0, 1]),
@@ -163,6 +164,7 @@ def dispatch_runtime(monkeypatch):
                 dst,
                 sends,
                 snapshot,
+                prefix,
             ]
             state.metadata_prepared = True
         n, capacity = state.counts.tolist()
@@ -291,6 +293,7 @@ def test_fresh_dispatch_wires_state_and_streams(
         h.dst_slots,
         h.send_counts,
         h.topk_idx,
+        h.layout.recv_rank_prefix,
     ] == metadata
     assert got.x is call.state.outputs[0]
     assert got.topk_idx is (None if expand else call.state.outputs[1])

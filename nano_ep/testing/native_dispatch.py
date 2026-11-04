@@ -86,12 +86,14 @@ def assert_dispatch_state(state, case, rank, alignment, weights, *, expand):
     assert state.counts.device.type == "cpu" and state.counts.dtype == torch.int64
     assert state.counts.tolist() == [rows, expected.expanded_capacity]
     assert state.stage_buffer.dtype == torch.uint8
-    assert state.stage_buffer.shape == (rows, row_bytes)
-    assert len(state.metadata) == 9
+    assert state.stage_buffer.shape == (world_size * case.capacity, row_bytes)
+    assert len(state.metadata) == 10
     for tensor in state.metadata:
         assert tensor.device == state.stage_buffer.device and tensor.dtype == torch.int64
         assert tensor.is_contiguous()
-    src_ranks, src_tokens, local, counts, offsets, slots, dst_slots, sends, snapshot = [t.cpu() for t in state.metadata]
+    src_ranks, src_tokens, local, counts, offsets, slots, dst_slots, sends, snapshot, prefix = [t.cpu() for t in state.metadata]
+    expected_prefix = torch.bincount(expected.src_ranks, minlength=world_size).cumsum(0)
+    torch.testing.assert_close(prefix, expected_prefix)
     assert src_ranks.shape == src_tokens.shape == (rows,)
     assert local.shape == (rows, topk)
     assert slots.shape == ((rows, topk) if expand else (0,))
@@ -114,12 +116,14 @@ def assert_dispatch_state(state, case, rank, alignment, weights, *, expand):
         destinations = {expert // local_experts for expert in choices if expert >= 0}
         for destination in range(world_size):
             slot = dst_slots[token, destination].item()
-            assert 0 <= slot < world_size * case.capacity if destination in destinations else slot == -1
+            assert rank * case.capacity <= slot < (rank + 1) * case.capacity if destination in destinations else slot == -1
             if destination == rank and destination in destinations:
-                assert keys[slot] == (rank, token)
+                start = int(prefix[rank - 1]) if rank else 0
+                assert keys[start + slot - rank * case.capacity] == (rank, token)
     payload = state.stage_buffer.cpu()
     for row, (source, token) in enumerate(keys):
-        record = payload[row]
+        start = int(prefix[source - 1]) if source else 0
+        record = payload[source * case.capacity + row - start]
         assert record[:16].view(torch.int64).tolist() == [source, token]
         torch.testing.assert_close(
             record[dispatch_offsets(topk)[0] : dispatch_offsets(topk)[0] + 8 * topk].view(torch.int64), case.indices[source][token]

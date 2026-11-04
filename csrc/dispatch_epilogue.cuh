@@ -115,7 +115,7 @@ __device__ __forceinline__ void do_zero_padding(const int64_t* expert_counts,
 }
 
 template <int kHidden, int kTopk, int kExpertsPerRank, bool kCachedMode, bool kExpand, bool kWithWeights, bool kZeroPadding>
-__global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,        // [N, kRowBytes]
+__global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,        // [R*Tmax, kRowBytes], source-major
                                               int64_t* src_ranks,                 // [N], written only in fresh mode
                                               int64_t* src_tokens,                // [N], written only in fresh mode
                                               int64_t* local_topk_idx,            // [N,K]
@@ -127,6 +127,9 @@ __global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,      
                                               int64_t* recv_topk_idx,             // compact [N,K], expanded nullptr
                                               float* recv_weights,                // compact [N,K], expanded [C], optional
                                               int64_t recv_count,                 // N
+                                              const int64_t* recv_rank_prefix,    // [R], inclusive counts by source
+                                              int world_size,
+                                              int64_t max_tokens,
                                               int64_t rank) {
     static_assert(kHidden > 0 && kHidden % WindowLayout::kHiddenAlignment == 0 && kTopk > 0 && kTopk <= 32);
     constexpr int64_t kRowBytes = WindowLayout::payload_x_offset(kTopk) + int64_t{kHidden} * sizeof(at::BFloat16);
@@ -146,9 +149,17 @@ __global__ void dispatch_copy_epilogue_kernel(const uint8_t* stage_buffer,      
     // Distribute the first rows across blocks before assigning another warp to each block.
     const int64_t global_warp_idx = static_cast<int64_t>(warp_idx) * gridDim.x + blockIdx.x;
     const int64_t total_warps = static_cast<int64_t>(gridDim.x) * (blockDim.x / kWarpSize);
+    const int64_t source_end = lane < world_size ? recv_rank_prefix[lane] : 0;
+    const int64_t shifted_end = __shfl_up_sync(0xffffffffu, source_end, 1);
+    const int64_t source_begin = lane == 0 ? 0 : shifted_end;
 
     for (int64_t row = global_warp_idx; row < recv_count; row += total_warps) {
-        const auto* payload = stage_buffer + row * kRowBytes;
+        // each lane represent a source rank, and the first lane with row < source_end is the owner of this row
+        const unsigned sources = __ballot_sync(0xffffffffu, lane < world_size && row < source_end);
+        const int source = __ffs(sources) - 1;
+        const int64_t begin = __shfl_sync(0xffffffffu, source_begin, source);
+        const int64_t physical_slot = source * max_tokens + row - begin;
+        const auto* payload = stage_buffer + physical_slot * kRowBytes;
         const auto* weights = reinterpret_cast<const float*>(payload + WindowLayout::payload_weights_offset(kTopk));
         const auto* x_vectors = reinterpret_cast<const int4*>(payload + WindowLayout::payload_x_offset(kTopk));
         ReceiveAssignment assignment{-1, -1};

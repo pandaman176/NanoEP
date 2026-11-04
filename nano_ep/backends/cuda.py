@@ -19,7 +19,7 @@ from nano_ep.config import EPConfig
 
 @dataclass
 class NativeLayout:
-    """CUDA receive metadata; expanded_slots is [N,K] expanded or [0] compact."""
+    """CUDA metadata with source prefix [R]; expanded_slots is [N,K] or compact [0]."""
 
     src_ranks: torch.Tensor
     src_tokens: torch.Tensor
@@ -27,6 +27,7 @@ class NativeLayout:
     expert_counts: torch.Tensor
     expert_offsets: torch.Tensor
     expanded_slots: torch.Tensor
+    recv_rank_prefix: torch.Tensor
     recv_count: int
     expanded_capacity: int
 
@@ -203,7 +204,7 @@ class CudaBuffer:
                 1,
             )
             self._runtime = self._backend.PeerRuntime(self._rank, self._world_size, self._num_bytes)
-            # All-one bytes represent int64 -1; recv_next and barrier signals stay zero.
+            # All-one bytes represent int64 -1; send_next and barrier signals stay zero.
             window = self._runtime.local_window()
             window[self._count_offset : self._count_offset + (self._world_size + config.num_experts) * 8].fill_(255)
             torch.cuda.current_stream(self._device).synchronize()
@@ -336,6 +337,7 @@ class CudaBuffer:
                 handle.dst_slots,
                 handle.send_counts,
                 handle.topk_idx,
+                layout.recv_rank_prefix,
             ]
 
         with torch.cuda.device(self._device):
@@ -386,6 +388,7 @@ class CudaBuffer:
                         expert_counts=metadata[3],
                         expert_offsets=metadata[4],
                         expanded_slots=metadata[5],
+                        recv_rank_prefix=metadata[9],
                         recv_count=recv_count,
                         expanded_capacity=expanded_capacity,
                     )
@@ -467,6 +470,7 @@ class CudaBuffer:
             handle.dst_slots,
             handle.send_counts,
             handle.topk_idx,
+            layout.recv_rank_prefix,
         ]
         with torch.cuda.device(self._device):
             compute_stream = torch.cuda.current_stream(self._device)

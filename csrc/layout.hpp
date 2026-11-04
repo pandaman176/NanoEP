@@ -14,7 +14,7 @@ namespace nano_ep {
 
 struct WindowLayout {
     int64_t signal_offset, count_offset, payload_offset, return_offset, num_bytes;
-    int64_t recv_next_offset;
+    int64_t send_next_offset;
     int64_t notify_reduction_offset;
     bool return_rank_layout;
     int return_partitions;
@@ -68,11 +68,11 @@ struct WindowLayout {
         // each rank has a uint64_t signal to store the epoch of the last barrier
         const auto signal_bytes = checked_mul(ranks, 8);
 
-        // int64 rank_count[R], expert_count_by_source[R,E/R], then recv_next.
-        // Counts use -1 for pending and >=0 for ready; recv_next starts at zero.
+        // int64 rank_count[R], expert_count_by_source[R,E/R].
+        // Counts use -1 for pending and >=0 for ready; send_next start at zero.
         const auto notify_bytes = checked_mul(checked_add(ranks, num_experts), 8);
-        // int64 recv_next
-        const auto count_bytes = checked_add(notify_bytes, 8);
+        // int64 send_next[R]
+        const auto count_bytes = checked_add(notify_bytes, checked_mul(ranks, 8));
 
         const auto recv_capacity = checked_mul(ranks, max_tokens);
         const auto payload_bytes = checked_mul(recv_capacity, payload_row_bytes(hidden, topk));
@@ -86,7 +86,7 @@ struct WindowLayout {
         // Rank-local reduction words pack CTA arrivals (high 32) and counts (low 32).
         layout.notify_reduction_offset = align(signal_bytes, kRegionAlignment);
         layout.count_offset = align(checked_add(layout.notify_reduction_offset, notify_bytes), kRegionAlignment);
-        layout.recv_next_offset = checked_add(layout.count_offset, notify_bytes);
+        layout.send_next_offset = checked_add(layout.count_offset, notify_bytes);
         layout.return_rank_layout = use_rank_layout(ranks, topk, allow_multiple_reduction);
         layout.return_partitions = return_partitions;
         layout.return_capacity = return_capacity;

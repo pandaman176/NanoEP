@@ -22,7 +22,7 @@ def layout_binary(tmp_path_factory):
         "#include <iostream>\n"
         "#include <string>\n"
         "constexpr auto fixed = nano_ep::WindowLayout::make(2,3,4,2,4);\n"
-        "static_assert(fixed.count_offset == 96 && fixed.payload_offset == 160 && fixed.recv_next_offset == 144);\n"
+        "static_assert(fixed.count_offset == 96 && fixed.payload_offset == 160 && fixed.send_next_offset == 144);\n"
         "static_assert(nano_ep::WindowLayout::payload_row_bytes(4,2) == 128);\n"
         "int main(int argc, char** argv) {\n"
         "  try {\n"
@@ -36,7 +36,7 @@ def layout_binary(tmp_path_factory):
         "      std::cout << x.return_rank_layout << ' ' << x.return_partitions << ' ' << x.return_capacity << ' '\n"
         "        << nano_ep::WindowLayout::return_row_bytes(std::stoi(argv[3]), std::stoi(argv[4]));\n"
         "    } else {\n"
-        "      std::cout << x.signal_offset << ' ' << x.count_offset << ' ' << x.payload_offset << ' ' << x.return_offset << ' ' << x.num_bytes << ' ' << x.recv_next_offset << ' ' << x.notify_reduction_offset;\n"
+        "      std::cout << x.signal_offset << ' ' << x.count_offset << ' ' << x.payload_offset << ' ' << x.return_offset << ' ' << x.num_bytes << ' ' << x.send_next_offset << ' ' << x.notify_reduction_offset;\n"
         "    }\n"
         "    return 0;\n"
         "  } catch (const std::exception& error) {\n"
@@ -150,7 +150,7 @@ def test_shared_arena_covers_both_phases_without_overlapping_control(
         layout_binary, ranks, tokens, hidden, topk, experts, allow_multiple_reduction
     )
     assert result.returncode == 0, result.stderr
-    signal, count, payload, returned, total, recv_next, reduction = map(
+    signal, count, payload, returned, total, send_next, reduction = map(
         int, result.stdout.split()
     )
     assert signal == 0
@@ -160,8 +160,8 @@ def test_shared_arena_covers_both_phases_without_overlapping_control(
     assert reduction % 32 == 0
     assert count == align32(reduction + (ranks + experts) * 8)
     assert reduction + (ranks + experts) * 8 <= count
-    assert recv_next == count + (ranks + experts) * 8
-    assert 0 <= payload - (recv_next + 8) < 32
+    assert send_next == count + (ranks + experts) * 8
+    assert 0 <= payload - (send_next + ranks * 8) < 32
     payload_stride = dispatch_row_bytes(hidden, topk)
     return_stride = return_row_bytes(hidden, topk)
     partitions = min(ranks, topk) if allow_multiple_reduction else topk
@@ -228,15 +228,15 @@ def test_maximum_replaces_sum_without_rejecting_representable_layout(layout_bina
 
 
 def test_count_region_has_no_epoch_fields(layout_binary):
-    # The reduction workspace is separate from 776 B of peer counts and recv_next.
+    # 96 peer counts and 32 local send counters occupy 1024 bytes.
     result = run_layout(layout_binary, 32, 1, 1, 1, 64)
     assert result.returncode == 0, result.stderr
     assert list(map(int, result.stdout.split())) == [
         0,
         1024,
-        1824,
-        1824,
-        5920,
+        2048,
+        2048,
+        6144,
         1792,
         256,
     ]

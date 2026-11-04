@@ -17,7 +17,8 @@ from nano_ep.testing.native_dispatch import (
     assert_dispatch_output,
     assert_dispatch_state,
 )
-from nano_ep.testing.wire import align32, dispatch_offsets
+from nano_ep.testing.wire import align32, dispatch_offsets, dispatch_row_bytes
+from nano_ep.testing.oracle import reference_layout, reference_plan
 
 pytestmark = [pytest.mark.cuda]
 
@@ -626,3 +627,110 @@ def test_prepared_state_retains_layout_without_reserving_again(
         torch.testing.assert_close(state.metadata[4], initial_offsets)
         for actual, expected in zip(outputs, saved_outputs, strict=True):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("sources", [(0, 2), (1, 3)])
+@pytest.mark.parametrize("expand", [False, True])
+@pytest.mark.parametrize("weighted", [False, True])
+def test_source_partition_gaps_and_cached_prefix(
+    native, payload_probe, sources, expand, weighted
+):
+    ranks, hidden, topk, experts, capacity, alignment = 4, 256, 3, 8, 5, 4
+    indices = [torch.full((1, topk), -1, dtype=torch.int64) for _ in range(ranks)]
+    indices[sources[0]] = torch.tensor([[0, 1, -1], [1, -1, -1]])
+    indices[sources[1]] = torch.tensor([[0, -1, -1]])
+    original = make_case(ranks, dtype=torch.bfloat16, hidden=hidden)
+    case = replace(
+        original,
+        indices=indices,
+        xs=[
+            (
+                torch.arange(len(idx) * hidden).reshape(len(idx), hidden) / 16
+                + source * 64
+            ).to(torch.bfloat16)
+            for source, idx in enumerate(indices)
+        ],
+        weights=[
+            torch.arange(len(idx) * topk).reshape(len(idx), topk).float() + source
+            for source, idx in enumerate(indices)
+        ],
+        num_experts=experts,
+        capacity=capacity,
+        expert_matrices=original.expert_matrices[:experts],
+    )
+    layout = reference_layout(indices, 0, experts, alignment)
+    prefix = torch.bincount(layout.src_ranks, minlength=ranks).cumsum(0)
+    row_bytes = dispatch_row_bytes(hidden, topk)
+    topk_offset, weight_offset, x_offset = dispatch_offsets(topk)
+    epilogues = [
+        prepare_dispatch_epilogue(hidden, topk, 2, cached_mode=mode).dispatch_epilogue
+        for mode in (False, True)
+    ]
+    plan = reference_plan(indices[0], experts, ranks)
+    dst_slots = torch.full((len(indices[0]), ranks), -1, dtype=torch.int64)
+    for destination in range(ranks):
+        sending = torch.where(plan.token_in_rank[:, destination])[0]
+        dst_slots[sending, destination] = torch.arange(len(sending))
+    metadata = [
+        layout.expert_counts.cuda(),
+        layout.expert_offsets.cuda(),
+        dst_slots.cuda(),
+        plan.send_counts.cuda(),
+        indices[0].cuda(),
+        prefix.cuda(),
+    ]
+    counts = torch.tensor([layout.recv_count, layout.expanded_capacity])
+    for phase in range(2):
+        current = replace(
+            case,
+            xs=[x + phase * 8 for x in case.xs],
+            weights=[w - phase * 3 for w in case.weights],
+        )
+        stage = torch.full((ranks * capacity, row_bytes), 0xA5, dtype=torch.uint8)
+        local_next = [0] * ranks
+        for source, token in zip(
+            layout.src_ranks.tolist(), layout.src_tokens.tolist(), strict=True
+        ):
+            physical = source * capacity + local_next[source]
+            local_next[source] += 1
+            record = stage[physical]
+            record[:16].view(torch.int64).copy_(torch.tensor([source, token]))
+            record[topk_offset : topk_offset + topk * 8].view(torch.int64).copy_(
+                indices[source][token]
+            )
+            record[x_offset : x_offset + hidden * 2].view(torch.bfloat16).copy_(
+                current.xs[source][token]
+            )
+            if weighted:
+                record[weight_offset : weight_offset + topk * 4].view(
+                    torch.float32
+                ).copy_(current.weights[source][token])
+        state = payload_probe.make_dispatch_state(
+            stage.cuda(), metadata, counts, hidden, 0, phase > 0
+        )
+        outputs = epilogues[phase > 0](state, expand, weighted, True)
+        assert_dispatch_state(
+            state,
+            current,
+            0,
+            alignment,
+            current.weights if weighted else None,
+            expand=expand,
+        )
+        assert_dispatch_output(
+            state,
+            outputs,
+            current,
+            0,
+            alignment,
+            current.weights if weighted else None,
+            expand=expand,
+            zero_padding=expand,
+        )
+        torch.testing.assert_close(state.metadata[9].cpu(), prefix)
+        if phase == 0:
+            metadata = state.metadata
+            saved_metadata = [tensor.cpu().clone() for tensor in metadata]
+        else:
+            for actual, expected in zip(state.metadata, saved_metadata, strict=True):
+                torch.testing.assert_close(actual.cpu(), expected)

@@ -230,7 +230,7 @@ def test_cached_payload_preserves_mapping_and_counter(
     runtime = native.PeerRuntime(0, 1, layout[-1])
     runtime.import_peer_handles([runtime.export_local_handle()])
     window = runtime.local_window()
-    recv_next = window[layout[1] + 40 : layout[1] + 48].view(torch.int64)
+    send_next = window[layout[1] + 40 : layout[1] + 48].view(torch.int64)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     x_bytes = torch.empty((), dtype=dtype).element_size() * hidden
@@ -260,9 +260,9 @@ def test_cached_payload_preserves_mapping_and_counter(
                     else None
                 )
                 if not cached:
-                    recv_next.zero_()
+                    send_next.zero_()
                 runtime.barrier(stream.cuda_stream)
-                old_slots, old_counter = slots, recv_next.item()
+                old_slots, old_counter = slots, send_next.item()
                 if not cached:
                     slots = torch.full(
                         (tokens, 1), -1, device="cuda", dtype=torch.int64
@@ -286,11 +286,11 @@ def test_cached_payload_preserves_mapping_and_counter(
                 )
                 x_cpu = x.cpu()
                 expected_count = int((indices_cpu >= 0).any(dim=1).sum())
-                assert recv_next.item() == expected_count
+                assert send_next.item() == expected_count
                 if cached:
                     assert slots.data_ptr() == old_slots.data_ptr()
                     torch.testing.assert_close(slots_cpu, previous_slots)
-                    assert recv_next.item() == old_counter
+                    assert send_next.item() == old_counter
                 previous_slots = slots_cpu.clone()
                 assert sorted(slots_cpu[slots_cpu >= 0].tolist()) == list(
                     range(expected_count)
@@ -333,23 +333,25 @@ def test_cached_payload_preserves_mapping_and_counter(
                         )
     finally:
         torch.cuda.synchronize()
-        del recv_next, window
+        del send_next, window
         runtime.close_peer_mappings()
         runtime.close()
 
 
 @pytest.mark.parametrize(
-    "ranks,local_experts,topk", [(1, 4, 3), (2, 2, 3), (8, 2, 3), (32, 1, 1)]
+    "ranks,local_experts,topk",
+    [(1, 4, 3), (2, 2, 3), (8, 2, 3), (32, 1, 1)],
 )
 @pytest.mark.parametrize("weighted", [False, True])
-def test_cached_payload_rank_lanes(
-    native, payload_probe, ranks, local_experts, topk, weighted
+@pytest.mark.parametrize("cached", [False, True])
+def test_source_partitioned_payload(
+    native, payload_probe, ranks, local_experts, topk, weighted, cached
 ):
     """Run rank-lane selection with logical peer allocations on one GPU."""
     tokens, hidden, capacity = 5, 256, 5
     experts = ranks * local_experts
     layout = native.window_layout(ranks, capacity, hidden, topk, experts)
-    recv_next_offset = layout[1] + (ranks + experts) * 8
+    send_next_offset = layout[1] + (ranks + experts) * 8
     row_bytes = dispatch_row_bytes(hidden, topk)
     topk_offset, weight_offset, x_offset = dispatch_offsets(topk)
     indices = torch.full((tokens, topk), -1, dtype=torch.int64)
@@ -365,7 +367,7 @@ def test_cached_payload_rank_lanes(
     for token in range(tokens):
         destinations = {int(e) // local_experts for e in indices[token] if e >= 0}
         for destination in sorted(destinations):
-            slots[token, destination] = used[destination]
+            slots[token, destination] = (ranks - 1) * capacity + used[destination]
             used[destination] += 1
 
     # Each pointer names separate storage; no cross-GPU IPC is exercised here.
@@ -382,15 +384,54 @@ def test_cached_payload_rank_lanes(
         x = (torch.arange(tokens * hidden).reshape(tokens, hidden) / 8 + phase * 64).to(
             torch.bfloat16
         )
+        x.view(torch.int16)[[0, 3], :4] = torch.tensor(
+            [0x7FC1, -32768, 0x7F80, -128], dtype=torch.int16
+        )
         weights = torch.arange(tokens * topk).reshape(tokens, topk).float() / 7 + phase
+        for window in windows:
+            window.fill_(0xA5)
+            window[send_next_offset : send_next_offset + ranks * 8].view(
+                torch.int64
+            ).fill_(1)
+        if not cached:
+            windows[rank][send_next_offset : send_next_offset + ranks * 8].view(
+                torch.int64
+            ).zero_()
+            slots_gpu.fill_(-1)
+        payload_probe.run_dispatch_payload(
+            addresses,
+            x.cuda(),
+            indices_gpu,
+            weights.cuda() if weighted else None,
+            slots_gpu,
+            rank,
+            experts,
+            capacity,
+            cached,
+        )
+        actual_slots = slots_gpu.cpu()
+        if cached:
+            torch.testing.assert_close(actual_slots, slots, rtol=0, atol=0)
+        else:
+            torch.testing.assert_close(actual_slots >= 0, slots >= 0)
+            for destination in range(ranks):
+                published = actual_slots[:, destination]
+                torch.testing.assert_close(
+                    published[published >= 0].sort().values,
+                    rank * capacity + torch.arange(used[destination]),
+                )
         expected = []
         for destination, window in enumerate(windows):
-            window.fill_(0xA5)
             packet = torch.full((layout[-1],), 0xA5, dtype=torch.uint8)
-            window[recv_next_offset : recv_next_offset + 8].view(torch.int64).fill_(1)
-            packet[recv_next_offset : recv_next_offset + 8].view(torch.int64).fill_(1)
+            packet[send_next_offset : send_next_offset + ranks * 8].view(
+                torch.int64
+            ).fill_(1)
+            if not cached and destination == rank:
+                packet[send_next_offset : send_next_offset + ranks * 8].view(
+                    torch.int64
+                ).copy_(torch.tensor(used))
             for token in range(tokens):
-                slot = int(slots[token, destination])
+                slot = int(actual_slots[token, destination])
                 if slot < 0:
                     continue
                 start = layout[2] + slot * row_bytes
@@ -407,17 +448,5 @@ def test_cached_payload_rank_lanes(
                         torch.float32
                     ).copy_(weights[token])
             expected.append(packet)
-        payload_probe.run_dispatch_payload(
-            addresses,
-            x.cuda(),
-            indices_gpu,
-            weights.cuda() if weighted else None,
-            slots_gpu,
-            rank,
-            experts,
-            capacity,
-            True,
-        )
         for window, packet in zip(windows, expected, strict=True):
             torch.testing.assert_close(window.cpu(), packet, rtol=0, atol=0)
-        torch.testing.assert_close(slots_gpu.cpu(), slots, rtol=0, atol=0)

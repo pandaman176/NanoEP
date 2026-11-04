@@ -208,6 +208,7 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
                 first.handle.layout.expanded_slots,
                 first.handle.dst_slots,
                 first.handle.topk_idx,
+                first.handle.layout.recv_rank_prefix,
             )
         ]
         replay_case = replace(
@@ -241,6 +242,7 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
                 first.handle.layout.expanded_slots,
                 first.handle.dst_slots,
                 first.handle.topk_idx,
+                first.handle.layout.recv_rank_prefix,
             ),
             saved_metadata,
             strict=True,

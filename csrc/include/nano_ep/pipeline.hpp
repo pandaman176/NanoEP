@@ -45,15 +45,17 @@ struct CombineMainSpecialization {
                    cudaStream_t stream);
 };
 
-// metadata tensors are on the caller's GPU. Fresh main returns five inputs:
-// expert_counts, expert_offsets, dst_slots, send_counts, source_topk_snapshot.
+// metadata tensors are on the caller's GPU. Fresh main returns six inputs:
+// expert_counts, expert_offsets, dst_slots, send_counts, source_topk_snapshot,
+// recv_rank_prefix[R] (inclusive source counts).
 // After the epilogue prepares receive metadata (and on cached states), it is:
 // src_ranks, src_tokens, local_topk_idx, expert_counts, expert_offsets,
-// expanded_slots, dst_slots, send_counts, source_topk_snapshot.
+// expanded_slots, dst_slots, send_counts, source_topk_snapshot, recv_rank_prefix.
 // expanded_slots is int64 [N,K] for expanded layout and [0] for compact;
 // prepared metadata retains its original layout, including when N is zero.
 // counts is CPU int64 [2], containing (recv_count, expanded_capacity).
-// stage_buffer is borrowed uint8 [N,row_bytes] communication storage. Keep its
+// stage_buffer is borrowed uint8 [R*Tmax,row_bytes] source-partitioned storage.
+// Only each source's count prefix of its Tmax rows is valid. Keep its
 // runtime alive and consume it on the same stream before the next dispatch or
 // combine overwrites the shared arena. Metadata owns its storage independently.
 // hidden/x_dtype describe BF16 x and its dispatch wire format.

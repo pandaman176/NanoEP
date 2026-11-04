@@ -293,7 +293,7 @@ def check_payload(native, probe, rank):
     runtime = native.PeerRuntime(rank, 2, layout[-1])
     window = runtime.local_window()
     counts = window[layout[1] : layout[1] + 48].view(torch.int64)
-    recv_next = window[layout[1] + 48 : layout[1] + 56].view(torch.int64)
+    send_next = window[layout[1] + 48 : layout[1] + 64].view(torch.int64)
     counts.fill_(-1)
     torch.cuda.synchronize()
     handles = [None, None]
@@ -339,9 +339,17 @@ def check_payload(native, probe, rank):
                 for expert in indices[token].tolist()
             )
         }
-        assert received[layout[1] + 48 : layout[1] + 56].view(
-            torch.int64
-        ).item() == len(expected)
+        expected_sends = [
+            sum(
+                any(e >= 0 and e // 2 == destination for e in choices)
+                for choices in sources[rank][1].tolist()
+            )
+            for destination in range(2)
+        ]
+        assert (
+            received[layout[1] + 48 : layout[1] + 64].view(torch.int64).tolist()
+            == expected_sends
+        )
         assert (
             received[layout[1] : layout[1] + 48].view(torch.int64).tolist() == [-1] * 6
         )
@@ -350,17 +358,23 @@ def check_payload(native, probe, rank):
             for destination in range(2):
                 slot = slots_cpu[token, destination].item()
                 assert (
-                    0 <= slot < 2 * capacity
+                    rank * capacity <= slot < (rank + 1) * capacity
                     if destination in destinations
                     else slot == -1
                 )
         seen = set()
-        for slot in range(len(expected)):
+        published = [
+            source * capacity + local_slot
+            for source in range(2)
+            for local_slot in range(sum(key[0] == source for key in expected))
+        ]
+        for slot in published:
             row = received[
                 layout[2] + slot * row_bytes : layout[2] + (slot + 1) * row_bytes
             ]
             key = tuple(row[:16].view(torch.int64).tolist())
             assert key in expected and key not in seen
+            assert key[0] == slot // capacity
             seen.add(key)
             wanted_x, wanted_indices, wanted_weights = expected[key]
             torch.testing.assert_close(
@@ -409,7 +423,7 @@ def check_payload(native, probe, rank):
                 plan.send_counts.cuda(),
                 plan.expert_counts.cuda(),
             )
-            recv_next.zero_()
+            send_next.zero_()
             runtime.barrier(stream.cuda_stream)
             received_raw = probe.run_notify_peer_counts(
                 runtime.peer_addresses(),
@@ -488,7 +502,7 @@ def check_payload(native, probe, rank):
     torch.cuda.synchronize()
     dist.barrier()
     runtime.close_peer_mappings()
-    del counts, recv_next, window
+    del counts, send_next, window
     dist.barrier()
     runtime.close()
     print(f"NANO_EP_PAYLOAD_RANK_OK={rank}", flush=True)

@@ -3,6 +3,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
+#include <nano_ep/pipeline.hpp>
 
 #include <cstdio>
 #include <cuda/atomic>
@@ -170,11 +171,11 @@ __global__ void probe_payload_kernel(const int64_t* addresses,
                                      int64_t hidden,
                                      int64_t topk,
                                      int64_t capacity,
-                                     int64_t recv_next_offset,
+                                     int64_t send_next_offset,
                                      int64_t payload_offset,
                                      int64_t row_bytes) {
     nano_ep::dispatch_payload_rows<at::BFloat16, kWorldSize, kExpertsPerRank, kReuseSlots, 0>(
-        addresses, x, indices, weights, slots, rank, tokens, hidden, topk, capacity, recv_next_offset, payload_offset, row_bytes);
+        addresses, x, indices, weights, slots, rank, tokens, hidden, topk, capacity, send_next_offset, payload_offset, row_bytes);
 }
 
 // Exercise the production payload device helper with caller-owned slots.
@@ -209,7 +210,7 @@ void run_dispatch_payload(const torch::Tensor& addresses,
                                                  x.size(1),
                                                  indices.size(1),
                                                  max_tokens,
-                                                 layout.recv_next_offset,
+                                                 layout.send_next_offset,
                                                  layout.payload_offset,
                                                  nano_ep::WindowLayout::payload_row_bytes(x.size(1), indices.size(1)));
         };
@@ -275,6 +276,14 @@ void wait_for_arrival(const torch::Tensor& window, int peer, int64_t epoch) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+    module.def("make_dispatch_state", [](const torch::Tensor& stage,
+                                          const std::vector<torch::Tensor>& metadata,
+                                          const torch::Tensor& counts,
+                                          int64_t hidden,
+                                          int64_t rank,
+                                          bool prepared) {
+        return nano_ep::DispatchState{metadata, counts, stage, hidden, torch::kBFloat16, rank, prepared};
+    });
     module.def("run_finalize_receive_counts", &run_finalize_receive_counts);
     module.def("run_notify_peer_counts", &run_notify_peer_counts);
     module.def("run_dispatch_payload", &run_dispatch_payload);
