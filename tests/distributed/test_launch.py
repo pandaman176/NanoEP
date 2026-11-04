@@ -19,11 +19,17 @@ def test_single_node_torchrun(request):
         pytest.fail(
             f"requested {nproc} ranks; need nproc 1/2/4/8 and that many visible CUDA GPUs"
         )
-    from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
+    from nano_ep.backends._build import (
+        load_extension,
+        prepare_dispatch_epilogue,
+        prepare_dispatch_main,
+    )
 
     load_extension()  # Build once before rank startup; a compiler failure stays a failure.
     for cached_mode in (False, True):
         prepare_dispatch_epilogue(256, 3, 3, cached_mode=cached_mode)
+    for expert_alignment in (1, 4):
+        prepare_dispatch_main(256, 3, nproc, 3, 5, expert_alignment)
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["NANO_EP_EXPECTED_WORLD"] = str(nproc)

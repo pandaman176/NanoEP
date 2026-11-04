@@ -7,6 +7,26 @@ namespace nano_ep {
 
 struct WindowLayout;
 
+// The core validates geometry and owns IPC; specialization callbacks use tensors
+// and stream handles without passing PeerRuntime across extension modules.
+struct DispatchMainSpecialization {
+    int64_t hidden, topk, world_size, experts_per_rank, max_tokens, expert_alignment;
+    void (*prepare)(const torch::Tensor& x);
+    void (*launch)(const torch::Tensor& addresses,
+                   const torch::Tensor& window,
+                   const torch::Tensor& x,
+                   const torch::Tensor& indices,
+                   const c10::optional<torch::Tensor>& weights,
+                   const torch::Tensor& dst_slots,
+                   const torch::Tensor& send_counts,
+                   const torch::Tensor& recv_rank_prefix,
+                   const torch::Tensor& recv_expert_counts,
+                   const torch::Tensor& expert_offsets,
+                   int rank,
+                   bool cached_mode,
+                   cudaStream_t stream);
+};
+
 // Geometry-specific modules share this host launcher contract with the core
 // extension. Keep the module alive while its launcher is bound to a buffer.
 struct CombineMainSpecialization {
@@ -46,32 +66,19 @@ struct DispatchState {
     bool metadata_prepared = false;
 };
 
-// Collective on the current stream: exchange rank counts [R] and each peer's
-// expert-count slice from [E]. Return CUDA int64 rank counts [R] by source and
-// aggregated local expert counts [E/R]. Consumed slots are reset to -1.
-// The window's count slots must be initialized to -1 before peers can use it.
-// Caller enters a GPU barrier before publishing and completes another after
-// payload writes. Counts becoming ready does not imply token payload arrival.
-std::vector<torch::Tensor> notify_counts(PeerRuntime& runtime,
-                                         const torch::Tensor& send_counts,
-                                         const torch::Tensor& send_expert_counts,
-                                         int64_t count_offset);
-
-// Fresh routing reserves once per (token,destination) and returns CUDA int64
-// [T,R] slots, with -1 for absent routes. Cached calls read the supplied slots
-// without modifying the mapping or counter; indices must be the old snapshot.
-// Valid expert IDs are in [-1,E). Caller resets local recv_next for fresh calls
-// before the entry barrier and runs an exit barrier before reading payloads.
-torch::Tensor reserve_and_put(PeerRuntime& runtime,
-                              const torch::Tensor& x,
-                              const torch::Tensor& indices,
-                              const c10::optional<torch::Tensor>& weights,
-                              int64_t num_experts,
-                              int64_t max_tokens,
-                              const WindowLayout& layout,
-                              const c10::optional<torch::Tensor>& cached_dst_slots = c10::nullopt);
-
 // All ranks use BF16 x, matching geometry and either fresh or cached mode.
+// Specialize H/K/R/experts-per-rank/Tmax/alignment; actual T and rank remain runtime inputs.
+// The core rejects mismatched launchers before window mutation or barriers.
+// Keep the specialization module alive while its callbacks are in use.
+// Fresh cooperative sends split each CTA into four notify and four payload
+// warps. Notify uses shared-memory counts and persistent packed CTA reductions;
+// CTA 0 consumes/resets the reductions and exchanges counts while payload work
+// proceeds. Incoming counts reuse the same shared buffer after all sends.
+// CTA 0's warp 0 builds the rank prefix; warp 1 sums experts, aligns and scans
+// them directly into actual counts and padded offsets, using int64 accumulators.
+// Empty ranks participate. Cached sends use eight payload warps.
+// Fresh counts fit uint32; rank/expert counts require per-CTA shared memory.
+// Launch resource checks precede window mutation and the entry barrier.
 // Local storage checks precede window mutation and the entry barrier. Routing
 // values are a caller precondition: -1 or distinct valid experts per token.
 // Existing kernels assert bounds/uniqueness on device, without a validation
@@ -94,7 +101,8 @@ DispatchState dispatch_main(PeerRuntime& runtime,
                             int64_t alignment,
                             const std::vector<torch::Tensor>& cached_metadata,
                             int64_t cached_expanded_capacity,
-                            bool allow_multiple_reduction = false);
+                            bool allow_multiple_reduction,
+                            const DispatchMainSpecialization& specialization);
 
 // Collective on the current stream. Use the same reduction mode and capacity
 // as the owning allocation. Return borrowed uint8 [P,Tmax,row_bytes] storage,

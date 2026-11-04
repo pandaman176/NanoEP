@@ -1,11 +1,17 @@
 """Exercise one device assertion per process, then discard its CUDA context."""
 
+import importlib.util
 import os
 import sys
+from pathlib import Path
 
 import torch
 
-from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
+from nano_ep.backends._build import (
+    load_extension,
+    prepare_dispatch_epilogue,
+    prepare_dispatch_main,
+)
 from nano_ep.testing.native_dispatch import prepare_dispatch_metadata
 
 
@@ -15,24 +21,43 @@ def run(stage, kind):
     if stage == "dispatch_epilogue":
         for cached_mode in (False, True):
             prepare_dispatch_epilogue(256, 3, 3, cached_mode=cached_mode)
+    if stage == "dispatch_payload":
+        binary = Path(os.environ["NANO_EP_PEER_PROBE_PATH"])
+        spec = importlib.util.spec_from_file_location(binary.name.split(".")[0], binary)
+        probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe)
     x = torch.ones((2, 256), dtype=torch.bfloat16, device="cuda")
     valid = torch.tensor([[0, 1, -1], [2, -1, 0]], device="cuda")
-    if stage != "route_counts":
-        layout = native.window_layout(1, 2, 256, 3, 3)
-        runtime = native.PeerRuntime(0, 1, layout[-1])
-        window = runtime.local_window()
-        window[layout[1] : layout[1] + 32].view(torch.int64).fill_(-1)
-        torch.cuda.synchronize()
-        runtime.import_peer_handles([runtime.export_local_handle()])
+    layout = native.window_layout(1, 2, 256, 3, 3)
+    runtime = native.PeerRuntime(0, 1, layout[-1])
+    window = runtime.local_window()
+    window[layout[1] : layout[1] + 32].view(torch.int64).fill_(-1)
+    torch.cuda.synchronize()
+    runtime.import_peer_handles([runtime.export_local_handle()])
 
     def launch(indices):
-        if stage == "route_counts":
-            native.route_counts(indices, 3, 1)
-        elif stage == "reserve_and_put":
+        if stage == "dispatch_payload":
             window[layout[1] + 32 : layout[1] + 40].view(torch.int64).zero_()
-            native.reserve_and_put(runtime, x, indices, None, 3, 2)
+            slots = torch.full((2, 1), -1, dtype=torch.int64, device="cuda")
+            probe.run_dispatch_payload(
+                runtime.peer_addresses(), x, indices, None, slots, 0, 3, 2, False
+            )
         else:
-            state = native.dispatch_main(runtime, x, indices, None, 3, 2, 4, [], 0)
+            state = native.dispatch_main(
+                runtime,
+                x,
+                indices,
+                None,
+                3,
+                2,
+                4,
+                [],
+                0,
+                allow_multiple_reduction=False,
+                launcher=prepare_dispatch_main(
+                    x.shape[1], indices.shape[1], 1, 3, 2, 4
+                ).launcher,
+            )
             if stage == "dispatch_epilogue":
                 prepare_dispatch_metadata(state)
         torch.cuda.synchronize()

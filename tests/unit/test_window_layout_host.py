@@ -21,6 +21,9 @@ def layout_binary(tmp_path_factory):
         '#include "layout.hpp"\n'
         "#include <iostream>\n"
         "#include <string>\n"
+        "constexpr auto fixed = nano_ep::WindowLayout::make(2,3,4,2,4);\n"
+        "static_assert(fixed.count_offset == 96 && fixed.payload_offset == 160 && fixed.recv_next_offset == 144);\n"
+        "static_assert(nano_ep::WindowLayout::payload_row_bytes(4,2) == 128);\n"
         "int main(int argc, char** argv) {\n"
         "  try {\n"
         "    const auto x = nano_ep::WindowLayout::make(std::stoi(argv[1]), std::stoll(argv[2]), std::stoi(argv[3]), std::stoi(argv[4]), std::stoll(argv[5]), std::stoi(argv[6]));\n"
@@ -33,7 +36,7 @@ def layout_binary(tmp_path_factory):
         "      std::cout << x.return_rank_layout << ' ' << x.return_partitions << ' ' << x.return_capacity << ' '\n"
         "        << nano_ep::WindowLayout::return_row_bytes(std::stoi(argv[3]), std::stoi(argv[4]));\n"
         "    } else {\n"
-        "      std::cout << x.signal_offset << ' ' << x.count_offset << ' ' << x.payload_offset << ' ' << x.return_offset << ' ' << x.num_bytes << ' ' << x.recv_next_offset;\n"
+        "      std::cout << x.signal_offset << ' ' << x.count_offset << ' ' << x.payload_offset << ' ' << x.return_offset << ' ' << x.num_bytes << ' ' << x.recv_next_offset << ' ' << x.notify_reduction_offset;\n"
         "    }\n"
         "    return 0;\n"
         "  } catch (const std::exception& error) {\n"
@@ -94,7 +97,7 @@ def test_hand_calculated_layout(layout_binary):
     # R=2,T=3,H=4,K=2: 6 dispatch rows (128 B), 6 return rows (64 B).
     result = run_layout(layout_binary, 2, 3, 4, 2, 4)
     assert result.returncode == 0, result.stderr
-    assert list(map(int, result.stdout.split())) == [0, 32, 96, 96, 864, 80]
+    assert list(map(int, result.stdout.split())) == [0, 96, 160, 160, 928, 144, 32]
 
 
 @pytest.mark.parametrize("topk", [1, 3, 8, 32])
@@ -147,11 +150,16 @@ def test_shared_arena_covers_both_phases_without_overlapping_control(
         layout_binary, ranks, tokens, hidden, topk, experts, allow_multiple_reduction
     )
     assert result.returncode == 0, result.stderr
-    signal, count, payload, returned, total, recv_next = map(int, result.stdout.split())
+    signal, count, payload, returned, total, recv_next, reduction = map(
+        int, result.stdout.split()
+    )
     assert signal == 0
     assert all(offset % 32 == 0 for offset in (signal, count, payload, returned, total))
     assert signal < count < payload == returned < total
-    assert signal + ranks * 8 <= count
+    assert reduction == align32(signal + ranks * 8)
+    assert reduction % 32 == 0
+    assert count == align32(reduction + (ranks + experts) * 8)
+    assert reduction + (ranks + experts) * 8 <= count
     assert recv_next == count + (ranks + experts) * 8
     assert 0 <= payload - (recv_next + 8) < 32
     payload_stride = dispatch_row_bytes(hidden, topk)
@@ -204,8 +212,9 @@ def test_modes_preserve_dispatch_regions_and_reduce_return_storage(layout_binary
     assert offsets[0][:4] == offsets[1][:4]
     assert offsets[0][5] == offsets[1][5]
     # Single reduction needs 8 return partitions; multiple fits in dispatch's arena.
-    assert offsets[0][4] == 192 + 8 * 128 * 128
-    assert offsets[1][4] == 192 + 2 * 128 * 224
+    assert offsets[0][2] == offsets[1][2] == 352
+    assert offsets[0][4] == 352 + 8 * 128 * 128
+    assert offsets[1][4] == 352 + 2 * 128 * 224
 
 
 def test_maximum_replaces_sum_without_rejecting_representable_layout(layout_binary):
@@ -214,15 +223,23 @@ def test_maximum_replaces_sum_without_rejecting_representable_layout(layout_bina
     result = run_layout(layout_binary, 1, tokens, 1, 1, 1)
     assert result.returncode == 0, result.stderr
     offsets = list(map(int, result.stdout.split()))
-    assert offsets[2] == offsets[3] == 64
-    assert offsets[4] == align32(64 + tokens * 128)
+    assert offsets[2] == offsets[3] == 96
+    assert offsets[4] == align32(96 + tokens * 128)
 
 
 def test_count_region_has_no_epoch_fields(layout_binary):
-    # 32 rank counts + 64 expert counts + recv_next occupy 776 B.
+    # The reduction workspace is separate from 776 B of peer counts and recv_next.
     result = run_layout(layout_binary, 32, 1, 1, 1, 64)
     assert result.returncode == 0, result.stderr
-    assert list(map(int, result.stdout.split())) == [0, 256, 1056, 1056, 5152, 1024]
+    assert list(map(int, result.stdout.split())) == [
+        0,
+        1024,
+        1824,
+        1824,
+        5920,
+        1792,
+        256,
+    ]
 
 
 def test_expert_count_capacity_changes_offsets(layout_binary):
@@ -231,9 +248,9 @@ def test_expert_count_capacity_changes_offsets(layout_binary):
     assert small.returncode == large.returncode == 0
     small_offsets = list(map(int, small.stdout.split()))
     large_offsets = list(map(int, large.stdout.split()))
-    assert small_offsets[2] == 96
-    assert large_offsets[2] == 1088
-    assert large_offsets[5] == 1072
+    assert small_offsets[2] == 160
+    assert large_offsets[2] == 2144
+    assert large_offsets[5] == 2128
 
 
 @pytest.mark.parametrize(

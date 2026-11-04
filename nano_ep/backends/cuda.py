@@ -7,7 +7,13 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.distributed as dist
 
-from nano_ep.backends._build import load_extension, prepare_combine_epilogue, prepare_combine_main, prepare_dispatch_epilogue
+from nano_ep.backends._build import (
+    load_extension,
+    prepare_combine_epilogue,
+    prepare_combine_main,
+    prepare_dispatch_epilogue,
+    prepare_dispatch_main,
+)
 from nano_ep.config import EPConfig
 
 
@@ -96,6 +102,7 @@ class CudaBuffer:
         self._dispatch_epilogues = None
         self._combine_epilogue = None
         self._combine_main_module = None
+        self._dispatch_main_modules = {}
         self._comm_stream = None
         self._closed = True
         if dist.get_backend(group) != "gloo":
@@ -186,6 +193,14 @@ class CudaBuffer:
                 self._world_size,
                 config.num_experts // self._world_size,
                 config.num_max_tokens_per_rank,
+            )
+            self._dispatch_main_modules[1] = prepare_dispatch_main(
+                config.hidden,
+                config.num_topk,
+                self._world_size,
+                config.num_experts // self._world_size,
+                config.num_max_tokens_per_rank,
+                1,
             )
             self._runtime = self._backend.PeerRuntime(self._rank, self._world_size, self._num_bytes)
             # All-one bytes represent int64 -1; recv_next and barrier signals stay zero.
@@ -324,6 +339,16 @@ class CudaBuffer:
             ]
 
         with torch.cuda.device(self._device):
+            if expert_alignment not in self._dispatch_main_modules:
+                self._dispatch_main_modules[expert_alignment] = prepare_dispatch_main(
+                    self._config.hidden,
+                    self._config.num_topk,
+                    self._world_size,
+                    self._config.num_experts // self._world_size,
+                    self._config.num_max_tokens_per_rank,
+                    expert_alignment,
+                )
+            main_module = self._dispatch_main_modules[expert_alignment]
             compute_stream = torch.cuda.current_stream(self._device)
             if previous_event is None:
                 self._comm_stream.wait_stream(compute_stream)
@@ -347,6 +372,7 @@ class CudaBuffer:
                     cached_metadata,
                     cached_expanded_capacity,
                     self._allow_multiple_reduction,
+                    main_module.launcher,
                 )
                 outputs = self._dispatch_epilogues[state.metadata_prepared](state, expand, weights is not None, zero_padding)
                 metadata = state.metadata

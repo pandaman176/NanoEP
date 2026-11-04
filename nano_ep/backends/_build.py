@@ -25,7 +25,7 @@ def load_extension():
     source = native_source_dir()
     return load(
         name="nano_ep_native",
-        sources=[str(source / name) for name in ("bindings.cpp", "ops.cu", "peer.cu", "pipeline.cu")],
+        sources=[str(source / name) for name in ("bindings.cpp", "peer.cu", "pipeline.cu")],
         extra_include_paths=[str(source / "include")],
         extra_cflags=["-O2", "-std=c++20"],
         extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo"],
@@ -83,6 +83,41 @@ def prepare_combine_main(hidden: int, topk: int, world_size: int, experts_per_ra
     return load(
         name="nano_ep_combine_main_" + "_".join(map(str, geometry)),
         sources=[str(source / "combine_main.cu")],
+        extra_include_paths=[str(source / "include")],
+        extra_cflags=["-O2", "-std=c++20"],
+        extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo", *defines],
+        verbose=os.environ.get("NANO_EP_BUILD_VERBOSE") == "1",
+    )
+
+
+@cache
+def prepare_dispatch_main(hidden: int, topk: int, world_size: int, experts_per_rank: int, max_tokens: int, expert_alignment: int):
+    """Compile one geometry; CudaBuffer prewarms it before IPC collectives."""
+    from torch.utils.cpp_extension import load
+
+    if (
+        hidden <= 0
+        or hidden > 2**31 - 1
+        or hidden % 256
+        or not 1 <= topk <= 32
+        or not 1 <= world_size <= 32
+        or world_size & (world_size - 1)
+        or topk > world_size * experts_per_rank
+        or world_size * (experts_per_rank + 1) > 2**31 - 1
+        or experts_per_rank <= 0
+        or max_tokens <= 0
+        or isinstance(expert_alignment, bool)
+        or not isinstance(expert_alignment, int)
+        or not 0 < expert_alignment <= 2**63 - 1
+    ):
+        raise RuntimeError("invalid dispatch main geometry: H must be a positive multiple of 256, K/R in [1,32], L/Tmax and integer alignment positive")
+    source = native_source_dir()
+    geometry = (hidden, topk, world_size, experts_per_rank, max_tokens, expert_alignment)
+    names = ("HIDDEN", "TOPK", "WORLD_SIZE", "EXPERTS_PER_RANK", "MAX_TOKENS", "EXPERT_ALIGNMENT")
+    defines = [f"-DNANO_EP_{name}={value}" for name, value in zip(names, geometry, strict=True)]
+    return load(
+        name="nano_ep_dispatch_main_" + "_".join(map(str, geometry)),
+        sources=[str(source / "dispatch_main.cu")],
         extra_include_paths=[str(source / "include")],
         extra_cflags=["-O2", "-std=c++20"],
         extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo", *defines],

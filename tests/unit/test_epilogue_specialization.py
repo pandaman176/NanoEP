@@ -9,6 +9,7 @@ from nano_ep.backends._build import (
     prepare_combine_epilogue,
     prepare_combine_main,
     prepare_dispatch_epilogue,
+    prepare_dispatch_main,
 )
 
 
@@ -23,11 +24,13 @@ def builds(monkeypatch):
 
     prepare_combine_epilogue.cache_clear()
     prepare_combine_main.cache_clear()
+    prepare_dispatch_main.cache_clear()
     prepare_dispatch_epilogue.cache_clear()
     monkeypatch.setattr(torch.utils.cpp_extension, "load", load)
     yield calls
     prepare_combine_epilogue.cache_clear()
     prepare_combine_main.cache_clear()
+    prepare_dispatch_main.cache_clear()
     prepare_dispatch_epilogue.cache_clear()
 
 
@@ -36,18 +39,20 @@ def builds(monkeypatch):
     [
         (prepare_combine_epilogue, "combine_epilogue.cu"),
         (prepare_combine_main, "combine_main.cu"),
+        (prepare_dispatch_main, "dispatch_main.cu"),
     ],
 )
 def test_every_geometry_dimension_selects_a_specialization(builds, factory, source):
-    shape = (256, 3, 2, 3, 5)
+    shape = (256, 3, 2, 5, 5) + ((4,) if factory is prepare_dispatch_main else ())
     first = factory(*shape)
     assert factory(*shape) is first
-    for position, value in enumerate((512, 8, 4, 8, 17)):
+    values = (512, 8, 4, 8, 17) + ((16,) if factory is prepare_dispatch_main else ())
+    for position, value in enumerate(values):
         changed = list(shape)
         changed[position] = value
         assert factory(*changed) is not first
-    assert len(builds) == 6
-    assert len({entry["name"] for entry in builds}) == 6
+    assert len(builds) == len(shape) + 1
+    assert len({entry["name"] for entry in builds}) == len(shape) + 1
     assert builds[0]["sources"][0].endswith(source)
     assert "-DNANO_EP_HIDDEN=256" in builds[0]["extra_cuda_cflags"]
     assert "-DNANO_EP_MAX_TOKENS=5" in builds[0]["extra_cuda_cflags"]
@@ -57,11 +62,13 @@ def test_every_geometry_dimension_selects_a_specialization(builds, factory, sour
     )
 
 
-@pytest.mark.parametrize("factory", [prepare_combine_epilogue, prepare_combine_main])
+@pytest.mark.parametrize(
+    "factory", [prepare_combine_epilogue, prepare_combine_main, prepare_dispatch_main]
+)
 @pytest.mark.parametrize("hidden", [0, 1, 128, 255, 257])
 def test_invalid_hidden_never_starts_compilation(builds, hidden, factory):
     with pytest.raises(RuntimeError, match="multiple of 256"):
-        factory(hidden, 3, 2, 3, 5)
+        factory(hidden, 3, 2, 3, 5, *((4,) if factory is prepare_dispatch_main else ()))
     assert not builds
 
 
@@ -125,3 +132,39 @@ def test_dispatch_cache_modes_build_distinct_modules(builds):
     assert len(builds) == 2
     assert "-DNANO_EP_CACHED_MODE=0" in builds[0]["extra_cuda_cflags"]
     assert "-DNANO_EP_CACHED_MODE=1" in builds[1]["extra_cuda_cflags"]
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        (256, 0, 2, 3, 5),
+        (256, 33, 2, 32, 5),
+        (256, 3, 0, 3, 5),
+        (256, 3, 3, 3, 5),
+        (256, 3, 64, 3, 5),
+        (256, 3, 2, 0, 5),
+        (256, 3, 1, 2, 5),
+        (256, 3, 2, 2**30, 5),
+        (256, 3, 2, 3, 0),
+    ],
+)
+def test_invalid_dispatch_main_geometry_never_compiles(builds, geometry):
+    with pytest.raises(RuntimeError, match="invalid dispatch main geometry"):
+        prepare_dispatch_main(*geometry, 4)
+    assert not builds
+
+
+@pytest.mark.parametrize("alignment", [0, -1, True, 1.5, "4", None])
+def test_invalid_dispatch_alignment_never_compiles(builds, alignment):
+    with pytest.raises(RuntimeError, match="invalid dispatch main geometry"):
+        prepare_dispatch_main(256, 3, 2, 3, 5, alignment)
+    assert not builds
+
+
+def test_dispatch_alignment_is_an_independent_specialization_key(builds):
+    first = prepare_dispatch_main(256, 3, 2, 3, 5, 3)
+    second = prepare_dispatch_main(256, 3, 2, 3, 5, 16)
+    assert first is not second
+    assert prepare_dispatch_main(256, 3, 2, 3, 5, 3) is first
+    assert "-DNANO_EP_EXPERT_ALIGNMENT=3" in builds[0]["extra_cuda_cflags"]
+    assert "-DNANO_EP_EXPERT_ALIGNMENT=16" in builds[1]["extra_cuda_cflags"]

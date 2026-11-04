@@ -1,5 +1,4 @@
 #include <cstring>
-#include <nano_ep/ops.hpp>
 #include <nano_ep/peer.hpp>
 #include <nano_ep/pipeline.hpp>
 #include <string>
@@ -18,33 +17,33 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         .def_readwrite("x_dtype", &nano_ep::DispatchState::x_dtype)
         .def_readonly("rank", &nano_ep::DispatchState::rank)
         .def_readonly("metadata_prepared", &nano_ep::DispatchState::metadata_prepared);
-    module.def("dispatch_main",
-               &nano_ep::dispatch_main,
-               py::arg("runtime"),
-               py::arg("x"),
-               py::arg("indices"),
-               py::arg("weights"),
-               py::arg("num_experts"),
-               py::arg("max_tokens"),
-               py::arg("alignment"),
-               py::arg("cached_metadata"),
-               py::arg("cached_expanded_capacity"),
-               py::arg("allow_multiple_reduction") = false);
-    module.def("notify_counts", &nano_ep::notify_counts);
     module.def(
-        "reserve_and_put",
+        "dispatch_main",
         [](nano_ep::PeerRuntime& runtime,
            const torch::Tensor& x,
            const torch::Tensor& indices,
            const c10::optional<torch::Tensor>& weights,
            int64_t num_experts,
            int64_t max_tokens,
-           const c10::optional<torch::Tensor>& cached_dst_slots,
-           bool allow_multiple_reduction) {
-            TORCH_CHECK(x.dim() == 2 && indices.dim() == 2, "x and indices must be 2D");
-            const auto layout = nano_ep::WindowLayout::make(
-                runtime.world_size(), max_tokens, x.size(1), indices.size(1), num_experts, allow_multiple_reduction);
-            return nano_ep::reserve_and_put(runtime, x, indices, weights, num_experts, max_tokens, layout, cached_dst_slots);
+           int64_t alignment,
+           const std::vector<torch::Tensor>& cached_metadata,
+           int64_t cached_expanded_capacity,
+           bool allow_multiple_reduction,
+           const py::capsule& launcher) {
+            if (!PyCapsule_IsValid(launcher.ptr(), "nano_ep.DispatchMainSpecialization"))
+                throw py::value_error("expected a dispatch main specialization launcher");
+            const auto* specialization = static_cast<const nano_ep::DispatchMainSpecialization*>(launcher.get_pointer());
+            return nano_ep::dispatch_main(runtime,
+                                          x,
+                                          indices,
+                                          weights,
+                                          num_experts,
+                                          max_tokens,
+                                          alignment,
+                                          cached_metadata,
+                                          cached_expanded_capacity,
+                                          allow_multiple_reduction,
+                                          *specialization);
         },
         py::arg("runtime"),
         py::arg("x"),
@@ -52,8 +51,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         py::arg("weights"),
         py::arg("num_experts"),
         py::arg("max_tokens"),
-        py::arg("cached_dst_slots") = py::none(),
-        py::arg("allow_multiple_reduction") = false);
+        py::arg("alignment"),
+        py::arg("cached_metadata"),
+        py::arg("cached_expanded_capacity"),
+        py::arg("allow_multiple_reduction"),
+        py::arg("launcher"));
     module.def(
         "combine_main",
         [](nano_ep::PeerRuntime& runtime,
@@ -89,10 +91,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         py::arg("topk"),
         py::arg("num_experts"),
         py::arg("allow_multiple_reduction") = false);
-    module.def("route_counts", &nano_ep::route_counts);
-    module.def("pack_rows", &nano_ep::pack_rows);
-    module.def("expand_rows", &nano_ep::expand_rows);
-    module.def("reduce_rows", &nano_ep::reduce_rows);
     py::class_<nano_ep::PeerRuntime>(module, "PeerRuntime")
         .def(py::init<int, int, int64_t>())
         .def("export_local_handle",

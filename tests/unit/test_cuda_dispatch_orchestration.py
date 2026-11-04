@@ -86,6 +86,8 @@ def dispatch_runtime(monkeypatch):
         return Tensor(name, torch.tensor(data, dtype=torch.int64))
 
     runtime = object()
+    main_launcher = object()
+    main_builds = []
 
     def main(
         actual_runtime,
@@ -98,7 +100,9 @@ def dispatch_runtime(monkeypatch):
         cached,
         cached_expanded_capacity,
         mode,
+        launcher,
     ):
+        assert launcher is main_launchers[alignment]
         assert actual_runtime is runtime and current[0] is comm
         assert (experts, capacity) == (6, 5)
         events.append(("main",))
@@ -196,6 +200,17 @@ def dispatch_runtime(monkeypatch):
     buffer._runtime = runtime
     buffer._comm_stream = comm
     buffer._backend = SimpleNamespace(dispatch_main=main)
+    main_launchers = {1: main_launcher}
+    buffer._dispatch_main_modules = {1: SimpleNamespace(launcher=main_launcher)}
+
+    def prepare_main(hidden, topk, ranks, experts_per_rank, capacity, alignment):
+        assert (hidden, topk, ranks, experts_per_rank, capacity) == (256, 3, 2, 3, 5)
+        assert current[0] is compute
+        main_builds.append(alignment)
+        main_launchers[alignment] = object()
+        return SimpleNamespace(launcher=main_launchers[alignment])
+
+    monkeypatch.setattr(cuda, "prepare_dispatch_main", prepare_main)
 
     def mode_epilogue(cached_mode):
         def bound(state, *args):
@@ -216,6 +231,7 @@ def dispatch_runtime(monkeypatch):
         use_stream=use_stream,
         events=events,
         calls=calls,
+        main_builds=main_builds,
         settings=settings,
         indices=integers("indices", [[0, 1, 3], [-1, -1, -1]]),
     )
@@ -362,3 +378,29 @@ def test_native_failure_does_not_return_completion(dispatch_runtime, failure):
         r.buffer.dispatch(x, topk_idx=r.indices)
     assert ("record_tensor", "x", "comm") in r.events
     assert not any(event[0] == "record_event" for event in r.events)
+
+
+def test_alignment_modules_reused_by_fresh_and_cached_calls(dispatch_runtime):
+    r = dispatch_runtime
+    x = r.tensor("x", torch.ones((2, 256), dtype=torch.bfloat16))
+    first = r.buffer.dispatch(x, topk_idx=r.indices, alignment=3)
+    r.buffer.dispatch(x, topk_idx=r.indices, alignment=16)
+    r.buffer.dispatch(x, topk_idx=r.indices, alignment=3)
+    replay = r.buffer.dispatch(x, handle=first.handle)
+    assert r.main_builds == [3, 16]
+    assert [call.alignment for call in r.calls] == [3, 16, 3, 3]
+    assert replay.handle is first.handle
+
+
+def test_alignment_build_failure_precedes_stream_work(dispatch_runtime, monkeypatch):
+    r = dispatch_runtime
+    x = r.tensor("x", torch.ones((2, 256), dtype=torch.bfloat16))
+
+    def fail(*args):
+        raise RuntimeError("alignment build failed")
+
+    monkeypatch.setattr(cuda, "prepare_dispatch_main", fail)
+    with pytest.raises(RuntimeError, match="alignment build failed"):
+        r.buffer.dispatch(x, topk_idx=r.indices, alignment=3)
+    assert not r.events
+    assert set(r.buffer._dispatch_main_modules) == {1}

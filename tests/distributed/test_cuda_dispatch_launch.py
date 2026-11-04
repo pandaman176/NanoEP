@@ -8,7 +8,11 @@ import sys
 import pytest
 import torch
 
-from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
+from nano_ep.backends._build import (
+    load_extension,
+    prepare_dispatch_epilogue,
+    prepare_dispatch_main,
+)
 from nano_ep.testing.launcher import run_logged
 
 pytestmark = [pytest.mark.distributed]
@@ -27,6 +31,9 @@ def test_public_cuda_dispatch(request):
         prepare_dispatch_epilogue(256, 3, 3, cached_mode=cached_mode)
     for cached_mode in (False, True):
         prepare_dispatch_epilogue(512, 3, 3, cached_mode=cached_mode)
+    for hidden in (256, 512):
+        for expert_alignment in (1, 4):
+            prepare_dispatch_main(hidden, 3, nproc, 3, 5, expert_alignment)
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["NANO_EP_EXPECTED_WORLD"] = str(nproc)

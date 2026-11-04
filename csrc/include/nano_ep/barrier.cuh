@@ -10,6 +10,13 @@ namespace nano_ep {
 
 inline constexpr unsigned long long kBarrierTimeoutCycles = 20'000'000'000ULL;
 
+// Only the named group participates; other warp roles can keep working.
+template <int kNumThreads>
+__device__ __forceinline__ void notify_group_barrier() {
+    static_assert(kNumThreads > 0 && kNumThreads % 32 == 0);
+    asm volatile("bar.sync 1, %0;" : : "n"(kNumThreads) : "memory");
+}
+
 // One CTA exchanges rank epochs. The caller provides any required grid sync
 // and system fences for writes made by other CTAs before publishing an epoch.
 __device__ __forceinline__ void peer_barrier(

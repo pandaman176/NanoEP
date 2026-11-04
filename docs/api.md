@@ -132,3 +132,57 @@ wire layout, metadata ordering and output ownership are unchanged. The internal
 factory now requires keyword-only `cached_mode`; a mode mismatch is rejected
 before state mutation. Repeated epilogue calls on a prepared state use the
 cached module, including states originally created by a fresh dispatch.
+
+
+### Fused fresh notify
+
+Fresh dispatch uses a cooperative SM-sized kernel: four notify warps per CTA
+count routes in shared memory while four payload warps reserve/copy tokens.
+A persistent `notify_reduction[R+E]` region packs CTA arrivals in the high 32
+bits and counts in the low 32 bits. CTA 0 consumes/resets each word before
+exchanging peer counts; notify-only named barriers preserve payload progress.
+Empty ranks still launch and contribute zeros. Resource checks precede window
+mutation and communication. Cached dispatch keeps eight payload warps.
+
+The window now stores barrier signals, aligned notify reduction, aligned peer
+counts plus recv_next, and the shared dispatch/return arena. Rebuild extensions,
+restart the process and recreate IPC buffers/handles after this byte-layout
+change. Python signatures and metadata formats are unchanged. Peer counts keep
+-1 pending / nonnegative ready. Expert reduction, alignment and prefix sums run inside the fused notify stage.
+Exact host count readback and entry/exit peer barriers remain outside it.
+
+
+The standalone native `reserve_and_put` API has been removed. Fresh/cached
+main calls share one internal launcher whose mode follows the presence of
+cached slots; there is no `count_routes` argument. Test-only probes call
+the payload device helper from `dispatch_main.cuh` with caller-owned slots.
+Public `CudaBuffer.dispatch` is unchanged; low-level callers use dispatch_main.
+
+Standalone native `notify_counts` and its independent kernel are also removed.
+Notify warps call the exchange device helper directly. Test-only probes cover
+delayed peers, zero counts and receive-slot reuse through that same helper.
+
+
+Dispatch main specializes `(H,K,R,experts_per_rank,Tmax,expert_alignment)` through
+`prepare_dispatch_main(..., expert_alignment).launcher`. CudaBuffer prewarms
+alignment=1 before IPC allocation/export, then compiles other alignments on first
+use before stream work. Modules are retained by alignment; cached calls select
+the handle's original alignment. Geometry mismatches fail before window mutation.
+
+CTA 0 reuses shared outgoing counts for incoming counts after every send is
+published. After notify-group synchronization, warp 0 emits int64 rank inclusive
+prefix[R]; warp 1 sums source counts into actual expert counts[L], aligns in
+int64 registers and scans padded counts into offsets[L+1]. No raw received
+[R+E] tensor or standalone Torch count/padding/scan kernels are needed. N/C still
+come from host reads of the final prefixes for exact allocation. The payload
+completion barrier and cached receive metadata contract are unchanged.
+
+The internal launcher ABI and prepare_dispatch_main signature changed; rebuild
+extensions and restart processes. Device helpers encode rank/expert geometry and timeout as templates; total
+experts derives from R*experts_per_rank. Public dispatch signatures, metadata
+order and wire layout remain unchanged.
+
+
+Standalone route_counts/pack_rows/expand_rows/reduce_rows operators and
+backends.ops have been removed. Their work belongs to the integrated
+dispatch/combine pipeline; old direct operator calls are no longer supported.

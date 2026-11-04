@@ -8,7 +8,11 @@ import sys
 import pytest
 import torch
 
-from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
+from nano_ep.backends._build import (
+    load_extension,
+    prepare_dispatch_epilogue,
+    prepare_dispatch_main,
+)
 from nano_ep.testing.launcher import run_logged
 
 pytestmark = [pytest.mark.distributed]
@@ -29,6 +33,9 @@ def test_shared_arena_lifecycle(request):
         prepare_dispatch_epilogue(256, 3, 8, cached_mode=cached_mode)
     for cached_mode in (False, True):
         prepare_dispatch_epilogue(256, 8, 8, cached_mode=cached_mode)
+    for topk in (3, 8):
+        for expert_alignment in (1, 16):
+            prepare_dispatch_main(256, topk, nproc, 8, 11, expert_alignment)
     probe = build_probe()
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()

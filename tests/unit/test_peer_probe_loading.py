@@ -44,3 +44,5 @@ def test_launcher_builds_probe_once(worker, monkeypatch):
     assert worker.build_probe() is worker.build_probe() is module
     assert len(calls) == 1
     assert calls[0]["name"] == "nano_ep_peer_probe"
+    source, include = map(Path, calls[0]["extra_include_paths"])
+    assert include == source / "include"

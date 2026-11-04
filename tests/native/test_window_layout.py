@@ -22,7 +22,8 @@ def test_window_layout_binding_and_allocation(
         ranks, tokens, hidden, topk, experts, allow_multiple_reduction
     )
 
-    payload = align32(align32(ranks * 8) + (ranks + experts + 1) * 8)
+    count = align32(align32(ranks * 8) + (ranks + experts) * 8)
+    payload = align32(count + (ranks + experts + 1) * 8)
     returned = payload
     partitions = min(ranks, topk) if allow_multiple_reduction else topk
     total = align32(
@@ -32,8 +33,8 @@ def test_window_layout_binding_and_allocation(
             partitions * tokens * return_row_bytes(hidden, topk),
         )
     )
-    assert layout == [0, align32(ranks * 8), payload, returned, total]
-    assert native.window_layout(2, 3, 4, 2, 4) == [0, 32, 96, 96, 864]
+    assert layout == [0, count, payload, returned, total]
+    assert native.window_layout(2, 3, 4, 2, 4) == [0, 96, 160, 160, 928]
     with pytest.raises(ValueError, match="WindowLayout"):
         native.window_layout(0, 3, 4, 2, 4)
     with pytest.raises(OverflowError, match="overflow"):

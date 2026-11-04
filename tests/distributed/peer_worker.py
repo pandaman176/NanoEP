@@ -16,7 +16,10 @@ from nano_ep.backends._build import (
     prepare_combine_epilogue,
     prepare_combine_main,
     prepare_dispatch_epilogue,
+    prepare_dispatch_main,
+    native_source_dir,
 )
+from nano_ep.testing.oracle import reference_plan
 from nano_ep.testing.wire import dispatch_offsets, dispatch_row_bytes
 
 
@@ -28,6 +31,10 @@ def build_probe():
     return load(
         name="nano_ep_peer_probe",
         sources=[str(Path(__file__).with_name("peer_probe.cu"))],
+        extra_include_paths=[
+            str(native_source_dir()),
+            str(native_source_dir() / "include"),
+        ],
         extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo"],
     )
 
@@ -175,7 +182,7 @@ def check_lifetime(native, probe, rank, lifetime):
     )
 
 
-def check_notify(native, rank):
+def check_notify(native, probe, rank):
     num_experts = 260
     local_experts = num_experts // 2
     layout = native.window_layout(2, 8, 4, 2, num_experts)
@@ -217,8 +224,13 @@ def check_notify(native, rank):
 
             # Delay alternate publishers after both ranks passed the entry barrier.
             if rank == waiter:
-                received, received_experts = native.notify_counts(
-                    runtime, send, send_experts, layout[1]
+                received_raw = probe.run_notify_peer_counts(
+                    runtime.peer_addresses(),
+                    window,
+                    send,
+                    send_experts,
+                    rank,
+                    layout[1],
                 )
                 done = torch.cuda.Event()
                 done.record(stream)
@@ -239,10 +251,17 @@ def check_notify(native, rank):
                 dist.send(message, peer)
                 dist.recv(message, peer)
                 time.sleep(0.1)
-                received, received_experts = native.notify_counts(
-                    runtime, send, send_experts, layout[1]
+                received_raw = probe.run_notify_peer_counts(
+                    runtime.peer_addresses(),
+                    window,
+                    send,
+                    send_experts,
+                    rank,
+                    layout[1],
                 )
 
+            received = received_raw[:2]
+            received_experts = received_raw[2:].view(2, local_experts).sum(0)
             expected = [matrix[source][rank] for source in range(2)]
             assert received.tolist() == expected
             expected_experts = [
@@ -267,7 +286,7 @@ def check_notify(native, rank):
     print(f"NANO_EP_NOTIFY_RANK_OK={rank}", flush=True)
 
 
-def check_payload(native, rank):
+def check_payload(native, probe, rank):
     hidden, topk, capacity = 256, 3, 11
     dist.barrier()
     layout = native.window_layout(2, capacity, hidden, topk, 4)
@@ -382,16 +401,38 @@ def check_payload(native, rank):
     ):
         sources = [inputs(source, round_id, dtype, weighted) for source in range(2)]
         source_x, source_indices, source_weights = sources[rank]
+        plan = reference_plan(source_indices, 4, 2)
         with torch.cuda.stream(stream):
             x, indices = source_x.cuda(), source_indices.cuda()
             weights = source_weights.cuda() if weighted else None
+            send_counts, expert_counts = (
+                plan.send_counts.cuda(),
+                plan.expert_counts.cuda(),
+            )
             recv_next.zero_()
             runtime.barrier(stream.cuda_stream)
-            send_counts, expert_counts = native.route_counts(indices, 4, 2)
-            received_counts, received_experts = native.notify_counts(
-                runtime, send_counts, expert_counts, layout[1]
+            received_raw = probe.run_notify_peer_counts(
+                runtime.peer_addresses(),
+                window,
+                send_counts,
+                expert_counts,
+                rank,
+                layout[1],
             )
-            slots = native.reserve_and_put(runtime, x, indices, weights, 4, capacity)
+            received_counts = received_raw[:2]
+            received_experts = received_raw[2:].view(2, 2).sum(0)
+            slots = torch.full((x.shape[0], 2), -1, dtype=torch.int64, device="cuda")
+            probe.run_dispatch_payload(
+                runtime.peer_addresses(),
+                x,
+                indices,
+                weights,
+                slots,
+                rank,
+                4,
+                capacity,
+                False,
+            )
             runtime.barrier(stream.cuda_stream)
             received, slots_cpu = window.cpu(), slots.cpu()
             expected_count = received_counts.sum().item()
@@ -423,12 +464,19 @@ def check_payload(native, rank):
             x = cached_x.cuda()
             weights = cached_weights.cuda() if cached_weights is not None else None
             runtime.barrier(stream.cuda_stream)
-            reused = native.reserve_and_put(
-                runtime, x, indices, weights, 4, capacity, cached_dst_slots=slots
+            probe.run_dispatch_payload(
+                runtime.peer_addresses(),
+                x,
+                indices,
+                weights,
+                slots,
+                rank,
+                4,
+                capacity,
+                True,
             )
             runtime.barrier(stream.cuda_stream)
-            cached_received, cached_slots = window.cpu(), reused.cpu()
-        assert reused.data_ptr() == slots.data_ptr()
+            cached_received, cached_slots = window.cpu(), slots.cpu()
         torch.testing.assert_close(cached_slots, slots_cpu)
         assert (
             validate_payload(
@@ -501,7 +549,21 @@ def check_dispatch_main(native, rank):
                 case.indices[rank].cuda(),
                 case.weights[rank].cuda(),
             )
-            state = native.dispatch_main(runtime, x, indices, weights, 6, 5, 4, [], 0)
+            state = native.dispatch_main(
+                runtime,
+                x,
+                indices,
+                weights,
+                6,
+                5,
+                4,
+                [],
+                0,
+                allow_multiple_reduction=False,
+                launcher=prepare_dispatch_main(
+                    x.shape[1], indices.shape[1], 2, (6) // 2, 5, 4
+                ).launcher,
+            )
             assert not state.metadata_prepared and state.rank == rank
             prepare_dispatch_metadata(state)
             assert_dispatch_state(state, case, rank, 4, case.weights, expand=False)
@@ -515,7 +577,19 @@ def check_dispatch_main(native, rank):
                 case, indices=[torch.full_like(idx, -1) for idx in case.indices]
             )
             fresh = native.dispatch_main(
-                runtime, x, masked.indices[rank].cuda(), None, 6, 5, 1, [], 0
+                runtime,
+                x,
+                masked.indices[rank].cuda(),
+                None,
+                6,
+                5,
+                1,
+                [],
+                0,
+                allow_multiple_reduction=False,
+                launcher=prepare_dispatch_main(
+                    x.shape[1], masked.indices[rank].shape[1], 2, (6) // 2, 5, 1
+                ).launcher,
             )
             prepare_dispatch_metadata(fresh)
             assert_dispatch_state(fresh, masked, rank, 1, None, expand=False)
@@ -531,6 +605,10 @@ def check_dispatch_main(native, rank):
                 4,
                 state.metadata,
                 int(state.counts[1]),
+                allow_multiple_reduction=False,
+                launcher=prepare_dispatch_main(
+                    (x * 2).shape[1], indices.shape[1], 2, (6) // 2, 5, 4
+                ).launcher,
             )
             assert replay.metadata_prepared
             prepare_dispatch_metadata(replay)
@@ -549,6 +627,10 @@ def check_dispatch_main(native, rank):
                 4,
                 state.metadata,
                 int(state.counts[1]),
+                allow_multiple_reduction=False,
+                launcher=prepare_dispatch_main(
+                    (x * 3).shape[1], indices.shape[1], 2, (6) // 2, 5, 4
+                ).launcher,
             )
             prepare_dispatch_metadata(replay)
             assert_dispatch_state(
@@ -668,8 +750,8 @@ def run():
     try:
         for lifetime in range(2):
             check_lifetime(native, probe, rank, lifetime)
-        check_notify(native, rank)
-        check_payload(native, rank)
+        check_notify(native, probe, rank)
+        check_payload(native, probe, rank)
         check_dispatch_main(native, rank)
         check_combine_main(native, rank)
         print(f"NANO_EP_PEER_RANK_OK={rank}", flush=True)

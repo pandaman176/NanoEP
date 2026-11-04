@@ -90,7 +90,7 @@ def bootstrap(monkeypatch):
     class Runtime:
         def __init__(self, rank, world_size, num_bytes, /):
             operation("allocate")
-            assert rank == local.rank and world_size == 2 and num_bytes == 9824
+            assert rank == local.rank and world_size == 2 and num_bytes == 9888
             self.rank = rank
             self.unmapped = False
             self.freed = False
@@ -125,7 +125,7 @@ def bootstrap(monkeypatch):
         operation("layout")
         assert (ranks, tokens, hidden, topk, experts) == (2, 8, 256, 2, 4)
         assert allow_multiple_reduction is settings["allow_multiple_reduction"]
-        return [0, 32, 96, 96, 9824]
+        return [0, 96, 160, 160, 9888]
 
     def dispatch_epilogue(*args):
         raise AssertionError("bootstrap must not execute dispatch epilogue")
@@ -173,6 +173,16 @@ def bootstrap(monkeypatch):
         return SimpleNamespace(launcher="main-launcher")
 
     monkeypatch.setattr(cuda, "prepare_combine_main", prepare_main)
+
+    def prepare_dispatch_main(
+        hidden, topk, ranks, experts_per_rank, capacity, alignment
+    ):
+        operation("dispatch_main_specialization")
+        assert alignment == 1
+        assert (hidden, topk, ranks, experts_per_rank, capacity) == (256, 2, 2, 2, 8)
+        return SimpleNamespace(launcher="dispatch-main-launcher")
+
+    monkeypatch.setattr(cuda, "prepare_dispatch_main", prepare_dispatch_main)
     monkeypatch.setattr(cuda.torch.cuda, "Stream", stream)
     monkeypatch.setattr(
         cuda.torch.cuda,
@@ -205,6 +215,10 @@ def bootstrap(monkeypatch):
                 )
                 assert buffer._combine_epilogue is combine_epilogue
                 assert buffer._combine_main_module.launcher == "main-launcher"
+                assert (
+                    buffer._dispatch_main_modules[1].launcher
+                    == "dispatch-main-launcher"
+                )
                 if close:
                     buffer.close()
                     buffer.close()
@@ -239,12 +253,12 @@ def test_bootstrap_and_collective_close(bootstrap, allow_multiple_reduction):
             buffer._payload_offset,
             buffer._return_offset,
             buffer._num_bytes,
-        ) == (0, 32, 96, 96, 9824)
+        ) == (0, 96, 160, 160, 9888)
         assert buffer._comm_stream is not None
         window = bootstrap.runtimes[rank].window
-        assert window.view(torch.int64)[4:10].tolist() == [-1] * 6
-        assert torch.count_nonzero(window[:32]).item() == 0
-        assert torch.count_nonzero(window[80:]).item() == 0
+        assert window.view(torch.int64)[12:18].tolist() == [-1] * 6
+        assert torch.count_nonzero(window[:96]).item() == 0
+        assert torch.count_nonzero(window[144:]).item() == 0
         operations = [
             name for name, actual_rank in bootstrap.events if actual_rank == rank
         ]
@@ -252,6 +266,9 @@ def test_bootstrap_and_collective_close(bootstrap, allow_multiple_reduction):
             "allocate"
         )
         assert operations.index("dispatch_cached_specialization") < operations.index(
+            "allocate"
+        )
+        assert operations.index("dispatch_main_specialization") < operations.index(
             "allocate"
         )
         assert (
@@ -269,6 +286,7 @@ def test_bootstrap_and_collective_close(bootstrap, allow_multiple_reduction):
         "layout",
         "specialization",
         "main_specialization",
+        "dispatch_main_specialization",
         "dispatch_specialization",
         "dispatch_cached_specialization",
         "allocate",
@@ -291,6 +309,7 @@ def test_one_rank_failure_reaches_both_ranks(bootstrap, failure):
         "layout",
         "specialization",
         "main_specialization",
+        "dispatch_main_specialization",
         "dispatch_specialization",
         "dispatch_cached_specialization",
         "allocate",

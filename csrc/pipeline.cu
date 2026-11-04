@@ -1,3 +1,4 @@
+#include <ATen/cuda/CUDAContextLight.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -6,7 +7,7 @@
 #include <cstdio>
 #include <cuda/atomic>
 #include <limits>
-#include <nano_ep/ops.hpp>
+#include <nano_ep/barrier.cuh>
 #include <nano_ep/pipeline.hpp>
 #include <utility>
 
@@ -51,285 +52,56 @@ void check_cached_tensor(const torch::Tensor& tensor, const torch::Tensor& refer
         " has invalid CUDA int64 storage or shape");
 }
 
-__global__ void notify_counts_kernel(const int64_t* peer_addresses,
-                                     int64_t* local_counts,
-                                     const int64_t* send_counts,
-                                     const int64_t* send_expert_counts,
-                                     int64_t* recv_counts,
-                                     int rank,
-                                     int world_size,
-                                     int64_t num_experts,
-                                     int64_t count_offset,
-                                     unsigned long long timeout_cycles) {
-    using Count = cuda::atomic_ref<int64_t, cuda::thread_scope_system>;
-    const int64_t experts_per_rank = num_experts / world_size;
-    const int64_t num_counts = world_size + num_experts;
+struct DispatchMainResult {
+    torch::Tensor dst_slots;
+    torch::Tensor send_counts;
+    torch::Tensor recv_rank_prefix;
+    torch::Tensor recv_expert_counts;
+    torch::Tensor expert_offsets;
+};
 
-    // Publish every outgoing entry before entering any receive spin loop.
-    for (int64_t i = threadIdx.x; i < num_counts; i += blockDim.x) {
-        const bool rank_count = i < world_size;
-        const int64_t expert = i - world_size;
-        const int destination = rank_count ? static_cast<int>(i) : static_cast<int>(expert / experts_per_rank);
-        const int64_t dst_index = rank_count ? rank : world_size + rank * experts_per_rank + expert % experts_per_rank;
-        const int64_t value = rank_count ? send_counts[i] : send_expert_counts[expert];
-        auto* peer_window = reinterpret_cast<uint8_t*>(peer_addresses[destination]);
-        auto* peer_counts = reinterpret_cast<int64_t*>(peer_window + count_offset);
-        Count outgoing(peer_counts[dst_index]);
-        outgoing.store(value, cuda::memory_order_release);
-    }
-    __syncthreads();
+DispatchMainResult launch_dispatch_main(PeerRuntime& runtime,
+                                        const torch::Tensor& x,
+                                        const torch::Tensor& indices,
+                                        const c10::optional<torch::Tensor>& weights,
+                                        int64_t num_experts,
+                                        const c10::optional<torch::Tensor>& cached_dst_slots,
+                                        const DispatchMainSpecialization& specialization) {
+    const auto window = runtime.local_window();
+    int rank = runtime.rank();
+    int world_size = runtime.world_size();
 
-    const auto start = clock64();
-    for (int64_t i = threadIdx.x; i < num_counts; i += blockDim.x) {
-        Count incoming(local_counts[i]);
-        while (true) {
-            const auto count = incoming.load(cuda::memory_order_acquire);
-            if (count >= 0) {
-                recv_counts[i] = count;
-                incoming.store(WindowLayout::kCountNotReady, cuda::memory_order_relaxed);
-                break;
-            }
-            if (clock64() - start > timeout_cycles) {
-                printf("NanoEP notify timeout: rank=%d index=%lld count=%lld\n",
-                       rank,
-                       static_cast<long long>(i),
-                       static_cast<long long>(count));
-                asm volatile("trap;");
-            }
-            __nanosleep(64);
-        }
-    }
-}
+    int64_t num_tokens = x.size(0);
+    const auto stream = c10::cuda::getCurrentCUDAStream();
+    const auto addresses = runtime.peer_addresses();
+    const bool cached_mode = cached_dst_slots.has_value();
+    auto dst_slots = cached_mode ? *cached_dst_slots : torch::full({num_tokens, world_size}, -1, indices.options());
+    auto send_counts = cached_mode ? torch::Tensor() : torch::empty({world_size}, indices.options());
+    const int64_t local_experts = num_experts / world_size;
+    auto recv_rank_prefix = cached_mode ? torch::Tensor() : torch::empty({world_size}, indices.options());
+    auto recv_expert_counts = cached_mode ? torch::Tensor() : torch::empty({local_experts}, indices.options());
+    auto expert_offsets = cached_mode ? torch::Tensor() : torch::empty({local_experts + 1}, indices.options());
 
-template <typename data_t, bool kReuseSlots>
-__global__ void reserve_and_put_kernel(const int64_t* peer_addresses,
-                                       const data_t* x,         // [T, H]
-                                       const int64_t* indices,  // [T, K]
-                                       const float* weights,    // [T, K]，allow nullptr
-                                       int64_t* dst_slots,      // [T, R], fresh output or read-only cached mapping
-                                       int rank,
-                                       int world_size,
-                                       int64_t num_tokens,  // T
-                                       int64_t hidden,      // H
-                                       int64_t num_topk,    // K
-                                       int64_t experts_per_rank,
-                                       int64_t max_tokens,  // max tokens per source rank
-                                       int64_t recv_next_offset,
-                                       int64_t payload_offset,
-                                       int64_t payload_row_bytes) {
-    // Each warp is responsible for one token
-    const int lane = threadIdx.x % 32;
-    const int64_t token = (static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
-    if (token >= num_tokens)
-        return;
+    if (num_tokens == 0 && cached_mode)
+        return {dst_slots, send_counts, recv_rank_prefix, recv_expert_counts, expert_offsets};
 
-    // Fist K lane handle one routing
-    // Expert[0, 1, 2, 3, 4, 5, 6, 7] -> Rank[0, 0, 1, 1, 2, 2, 3, 3]
-    int destination = -1;
-    if (lane < num_topk) {
-        const int64_t expert_id = indices[token * num_topk + lane];
-        if (expert_id < -1 || expert_id >= world_size * experts_per_rank) {
-            printf("NanoEP reserve_and_put invalid expert: token=%lld expert=%lld\n",
-                   static_cast<long long>(token),
-                   static_cast<long long>(expert_id));
-            asm volatile("trap;");
-            return;
-        }
-        if (expert_id >= 0) {
-            destination = expert_id / experts_per_rank;
-        }
-    }
-
-    // e.g. for lane 0, same_destination = 0x00000003
-    const unsigned same_destination = __match_any_sync(0xffffffffu, destination);
-
-    const int leader = 31 - __clz(same_destination);
-    const bool is_sender = (destination >= 0 && lane == leader);
-
-    unsigned long long slot = 0;
-    if (is_sender) {
-        if constexpr (kReuseSlots) {
-            slot = static_cast<unsigned long long>(dst_slots[token * world_size + destination]);
-
-        } else {
-            auto* target_window = reinterpret_cast<uint8_t*>(peer_addresses[destination]);
-            auto* recv_next = reinterpret_cast<unsigned long long*>(target_window + recv_next_offset);
-            using Counter = cuda::atomic_ref<unsigned long long, cuda::thread_scope_system>;
-            Counter counter(*recv_next);
-            slot = counter.fetch_add(1ULL, cuda::memory_order_relaxed);
-            dst_slots[token * world_size + destination] = static_cast<int64_t>(slot);
-        }
-
-        if (!(slot < static_cast<unsigned long long>(world_size) * max_tokens)) {
-            printf("Invalid destination slot\n");
-            asm volatile("trap;");
-        }
-    }
-
-    // e.g. senders = 0b00000000000000000000000010101010
-    unsigned senders = __ballot_sync(0xffffffffu, is_sender);
-    while (senders != 0) {
-        // find the first sender in the warp
-        const int sender = __ffs(senders) - 1;
-
-        // broadcast the destination
-        const int64_t dst = __shfl_sync(0xffffffffu, destination, sender);
-        const int64_t dst_slot = __shfl_sync(0xffffffffu, slot, sender);
-        auto* peer_window = reinterpret_cast<uint8_t*>(peer_addresses[dst]);
-
-        // write payload together
-        auto* row = peer_window + payload_offset + dst_slot * payload_row_bytes;
-        auto* row_src_rank = reinterpret_cast<int64_t*>(row);
-        auto* row_src_token = reinterpret_cast<int64_t*>(row + 8);
-        auto* row_topk = reinterpret_cast<int64_t*>(row + WindowLayout::kPayloadTopkOffset);
-        auto* row_weights = reinterpret_cast<float*>(row + WindowLayout::payload_weights_offset(num_topk));
-        auto* row_x = reinterpret_cast<data_t*>(row + WindowLayout::payload_x_offset(num_topk));
-
-        if (lane == 0) {
-            row_src_rank[0] = rank;
-            row_src_token[0] = token;
-        }
-        for (int64_t k = lane; k < num_topk; k += 32) {
-            row_topk[k] = indices[token * num_topk + k];
-            if (weights != nullptr) {
-                row_weights[k] = weights[token * num_topk + k];
-            }
-        }
-        for (int64_t h = lane; h < hidden; h += 32) {
-            row_x[h] = x[token * hidden + h];
-        }
-
-        // clear the first sender
-        senders &= senders - 1;
-    }
+    specialization.launch(addresses,
+                          window,
+                          x,
+                          indices,
+                          weights,
+                          dst_slots,
+                          send_counts,
+                          recv_rank_prefix,
+                          recv_expert_counts,
+                          expert_offsets,
+                          rank,
+                          cached_mode,
+                          stream.stream());
+    return {dst_slots, send_counts, recv_rank_prefix, recv_expert_counts, expert_offsets};
 }
 
 }  // namespace
-
-std::vector<torch::Tensor> notify_counts(PeerRuntime& runtime,
-                                         const torch::Tensor& send_counts,
-                                         const torch::Tensor& send_expert_counts,
-                                         int64_t count_offset) {
-    const auto window = runtime.local_window();
-    const int world_size = runtime.world_size();
-    constexpr int threads = 256;
-
-    TORCH_CHECK(send_counts.device() == window.device() && send_counts.scalar_type() == torch::kInt64 && send_counts.dim() == 1 &&
-                    send_counts.numel() == world_size && send_counts.is_contiguous(),
-                "send_counts must be contiguous CUDA int64 [world_size] on the runtime device");
-    TORCH_CHECK(send_expert_counts.device() == window.device() && send_expert_counts.scalar_type() == torch::kInt64 &&
-                    send_expert_counts.dim() == 1 && send_expert_counts.numel() > 0 && send_expert_counts.numel() % world_size == 0 &&
-                    send_expert_counts.is_contiguous(),
-                "send_expert_counts must be contiguous CUDA int64 [E], with positive E divisible by world_size");
-    const int64_t num_experts = send_expert_counts.numel();
-    const int64_t num_counts = world_size + num_experts;
-    TORCH_CHECK(count_offset >= world_size * 8 && count_offset % 8 == 0 && count_offset <= window.numel() &&
-                    num_counts <= (window.numel() - count_offset) / 8,
-                "count slots must be aligned, inside the window and separate from barrier signals");
-
-    c10::cuda::CUDAGuard guard(window.device());
-    const auto stream = c10::cuda::getCurrentCUDAStream();
-    auto recv_counts = torch::empty({num_counts}, send_counts.options());
-    const auto addresses = runtime.peer_addresses();
-
-    constexpr unsigned long long timeout_cycles = 20'000'000'000ULL;
-    notify_counts_kernel<<<1, threads, 0, stream.stream()>>>(addresses.data_ptr<int64_t>(),
-                                                             reinterpret_cast<int64_t*>(window.data_ptr<uint8_t>() + count_offset),
-                                                             send_counts.data_ptr<int64_t>(),
-                                                             send_expert_counts.data_ptr<int64_t>(),
-                                                             recv_counts.data_ptr<int64_t>(),
-                                                             runtime.rank(),
-                                                             world_size,
-                                                             num_experts,
-                                                             count_offset,
-                                                             timeout_cycles);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    auto recv_rank_counts = recv_counts.narrow(0, 0, world_size);
-    auto recv_expert_counts = recv_counts.narrow(0, world_size, num_experts).view({world_size, num_experts / world_size}).sum(0);
-    return {recv_rank_counts, recv_expert_counts};
-}
-
-torch::Tensor reserve_and_put(PeerRuntime& runtime,
-                              const torch::Tensor& x,
-                              const torch::Tensor& indices,
-                              const c10::optional<torch::Tensor>& weights,
-                              int64_t num_experts,
-                              int64_t max_tokens,
-                              const WindowLayout& layout,
-                              const c10::optional<torch::Tensor>& cached_dst_slots) {
-    const auto window = runtime.local_window();
-    const int rank = runtime.rank();
-    const int world_size = runtime.world_size();
-    check_payload_inputs(window, x, indices, weights, world_size, num_experts, max_tokens);
-
-    const int64_t num_tokens = x.size(0);
-    const int64_t hidden = x.size(1);
-    const int64_t num_topk = indices.size(1);
-    TORCH_CHECK(layout.num_bytes <= window.numel(), "runtime window is smaller than the payload layout");
-    if (cached_dst_slots.has_value()) {
-        const auto& slots = *cached_dst_slots;
-        TORCH_CHECK(slots.device() == x.device() && slots.scalar_type() == torch::kInt64 && slots.dim() == 2 &&
-                        slots.size(0) == num_tokens && slots.size(1) == world_size && slots.is_contiguous(),
-                    "cached_dst_slots must be contiguous CUDA int64 [T,R] on the x device");
-    }
-
-    c10::cuda::CUDAGuard guard(x.device());
-    const auto stream = c10::cuda::getCurrentCUDAStream();
-    const auto addresses = runtime.peer_addresses();
-    const bool reuse_slots = cached_dst_slots.has_value();
-    auto dst_slots = reuse_slots ? *cached_dst_slots : torch::full({num_tokens, world_size}, -1, indices.options());
-
-    if (num_tokens == 0)
-        return dst_slots;
-
-    const int64_t experts_per_rank = num_experts / world_size;
-    const int64_t recv_next_offset = layout.recv_next_offset;
-    const int64_t row_bytes = WindowLayout::payload_row_bytes(hidden, num_topk);
-    const auto* weight_ptr = weights.has_value() ? weights->data_ptr<float>() : nullptr;
-    constexpr int threads = 256;
-    constexpr int warps_per_block = threads / 32;
-    const int64_t blocks = (num_tokens + warps_per_block - 1) / warps_per_block;
-
-    if (reuse_slots) {
-        using scalar_t = at::BFloat16;
-
-        reserve_and_put_kernel<scalar_t, true><<<blocks, threads, 0, stream.stream()>>>(addresses.data_ptr<int64_t>(),
-                                                                                        x.data_ptr<scalar_t>(),
-                                                                                        indices.data_ptr<int64_t>(),
-                                                                                        weight_ptr,
-                                                                                        dst_slots.data_ptr<int64_t>(),
-                                                                                        rank,
-                                                                                        world_size,
-                                                                                        num_tokens,
-                                                                                        hidden,
-                                                                                        num_topk,
-                                                                                        experts_per_rank,
-                                                                                        max_tokens,
-                                                                                        recv_next_offset,
-                                                                                        layout.payload_offset,
-                                                                                        row_bytes);
-    } else {
-        using scalar_t = at::BFloat16;
-
-        reserve_and_put_kernel<scalar_t, false><<<blocks, threads, 0, stream.stream()>>>(addresses.data_ptr<int64_t>(),
-                                                                                         x.data_ptr<scalar_t>(),
-                                                                                         indices.data_ptr<int64_t>(),
-                                                                                         weight_ptr,
-                                                                                         dst_slots.data_ptr<int64_t>(),
-                                                                                         rank,
-                                                                                         world_size,
-                                                                                         num_tokens,
-                                                                                         hidden,
-                                                                                         num_topk,
-                                                                                         experts_per_rank,
-                                                                                         max_tokens,
-                                                                                         recv_next_offset,
-                                                                                         layout.payload_offset,
-                                                                                         row_bytes);
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return dst_slots;
-}
 
 DispatchState dispatch_main(PeerRuntime& runtime,
                             const torch::Tensor& x,                       // [T, H]
@@ -340,7 +112,8 @@ DispatchState dispatch_main(PeerRuntime& runtime,
                             int64_t alignment,
                             const std::vector<torch::Tensor>& cached_meta_data,
                             int64_t cached_expanded_capacity,
-                            bool allow_multiple_reduction) {
+                            bool allow_multiple_reduction,
+                            const DispatchMainSpecialization& specialization) {
     TORCH_CHECK(alignment > 0, "alignment must be positive");
     const auto window = runtime.local_window();
     const int world_size = runtime.world_size();
@@ -350,6 +123,10 @@ DispatchState dispatch_main(PeerRuntime& runtime,
     const auto& routing_input = fresh ? indices : cached_meta_data[8];
     check_payload_inputs(window, x, routing_input, weights, world_size, num_experts, max_tokens);
     const int64_t num_topk = routing_input.size(1);
+    TORCH_CHECK(specialization.hidden == x.size(1) && specialization.topk == num_topk && specialization.world_size == world_size &&
+                    specialization.experts_per_rank == num_experts / world_size && specialization.max_tokens == max_tokens &&
+                    specialization.expert_alignment == alignment,
+                "dispatch main inputs do not match the compiled geometry");
     const auto window_layout = WindowLayout::make(world_size, max_tokens, x.size(1), num_topk, num_experts, allow_multiple_reduction);
     TORCH_CHECK(window_layout.num_bytes <= window.numel(), "runtime window is smaller than the payload layout");
     runtime.peer_addresses();
@@ -358,6 +135,9 @@ DispatchState dispatch_main(PeerRuntime& runtime,
     const auto stream = c10::cuda::getCurrentCUDAStream();
     const auto stream_handle = reinterpret_cast<int64_t>(stream.stream());
     const auto route_indices = fresh ? routing_input.clone() : routing_input;
+    // Validate specialized cooperative resources before mutating the window.
+    if (fresh)
+        specialization.prepare(x);
 
     if (!fresh) {
         TORCH_CHECK(cached_expanded_capacity >= 0, "cached expanded capacity must be nonnegative");
@@ -388,38 +168,30 @@ DispatchState dispatch_main(PeerRuntime& runtime,
 
     torch::Tensor send_counts;
     torch::Tensor dst_slots;
-    torch::Tensor recv_counts;
+    torch::Tensor recv_rank_prefix;
     torch::Tensor recv_expert_counts;
     torch::Tensor expert_offsets;
 
     if (fresh) {
-        auto counts = route_counts(route_indices, num_experts, world_size);
-        send_counts = counts[0];         // GPU int64 [R]
-        auto expert_counts = counts[1];  // GPU int64 [E]
-        auto notified_counts = notify_counts(runtime, send_counts, expert_counts, window_layout.count_offset);
-        recv_counts = notified_counts[0];         // GPU int64 [R]
-        recv_expert_counts = notified_counts[1];  // GPU int64 [E/R]
-        dst_slots = reserve_and_put(runtime, x, route_indices, weights, num_experts, max_tokens, window_layout);
-
-        const int64_t local_experts = recv_expert_counts.numel();
-        // padded counts for each local expert
-        auto padded_counts = torch::floor_divide(recv_expert_counts + alignment - 1, alignment) * alignment;
-        // [L+1] L is the number of local experts
-        expert_offsets = torch::zeros({local_experts + 1}, recv_expert_counts.options());
-        expert_offsets.narrow(0, 1, local_experts).copy_(padded_counts.cumsum(0));
+        auto result = launch_dispatch_main(runtime, x, route_indices, weights, num_experts, c10::nullopt, specialization);
+        send_counts = std::move(result.send_counts);                // GPU int64 [R]
+        dst_slots = std::move(result.dst_slots);                    // GPU int64 [T,R]
+        recv_rank_prefix = std::move(result.recv_rank_prefix);      // GPU int64 [R], inclusive by source
+        recv_expert_counts = std::move(result.recv_expert_counts);  // GPU int64 [L], actual
+        expert_offsets = std::move(result.expert_offsets);          // GPU int64 [L+1], padded exclusive
 
     } else {
         send_counts = cached_meta_data[7];
         dst_slots = cached_meta_data[6];
         recv_expert_counts = cached_meta_data[3];
         expert_offsets = cached_meta_data[4];
-        reserve_and_put(runtime, x, route_indices, weights, num_experts, max_tokens, window_layout, cached_meta_data[6]);
+        launch_dispatch_main(runtime, x, route_indices, weights, num_experts, cached_meta_data[6], specialization);
     }
 
     // Keep all payload writes above this barrier; the epilogue reads completed data.
     runtime.barrier(stream_handle);
 
-    const int64_t recv_count = fresh ? recv_counts.sum().item<int64_t>() : cached_meta_data[0].numel();
+    const int64_t recv_count = fresh ? recv_rank_prefix[world_size - 1].item<int64_t>() : cached_meta_data[0].numel();
     const int64_t local_experts = num_experts / world_size;
     const int64_t expanded_capacity = fresh ? expert_offsets[local_experts].item<int64_t>() : cached_expanded_capacity;
     const int64_t row_bytes = WindowLayout::payload_row_bytes(x.size(1), num_topk);

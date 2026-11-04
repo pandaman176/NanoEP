@@ -56,7 +56,7 @@ def test_two_phase_close(native):
 
 
 @pytest.mark.parametrize("experts", [4, 260])
-def test_automatic_barrier_epochs_and_notify_reuse(native, experts):
+def test_automatic_barrier_epochs_and_notify_reuse(native, payload_probe, experts):
     layout = native.window_layout(1, 8, 4, 2, experts)
     runtime = native.PeerRuntime(0, 1, layout[-1])
     window = runtime.local_window()
@@ -76,9 +76,10 @@ def test_automatic_barrier_epochs_and_notify_reuse(native, experts):
             send_experts[0] = value
             send_experts[-1] = (value + 1) // 2
             runtime.barrier(stream.cuda_stream)
-            received, received_experts = native.notify_counts(
-                runtime, send, send_experts, count_offset
+            received_raw = payload_probe.run_notify_peer_counts(
+                runtime.peer_addresses(), window, send, send_experts, 0, count_offset
             )
+            received, received_experts = received_raw[:1], received_raw[1:]
             assert received.tolist() == [value]
             torch.testing.assert_close(received_experts, send_experts)
             assert counts.tolist() == [-1] * (1 + experts)
@@ -100,9 +101,20 @@ def test_automatic_barrier_epochs_and_notify_reuse(native, experts):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("weighted", [False, True])
-@pytest.mark.parametrize("tokens", [0, 1, 11])
-def test_reserve_and_put_payload(native, dtype, weighted, tokens):
-    hidden, topk, capacity = 256, 3, 11
+@pytest.mark.parametrize(
+    "tokens", [0, 1, 11, pytest.param(None, id="multiple-grid-rounds")]
+)
+def test_dispatch_payload(native, payload_probe, dtype, weighted, tokens):
+    if tokens is None:
+        tokens = (
+            2
+            * torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+            * 8
+            + 3
+        )
+    hidden, topk, capacity = 256, 3, max(11, tokens)
     layout = native.window_layout(1, capacity, hidden, topk, 4)
     runtime = native.PeerRuntime(0, 1, layout[-1])
     runtime.import_peer_handles([runtime.export_local_handle()])
@@ -127,7 +139,18 @@ def test_reserve_and_put_payload(native, dtype, weighted, tokens):
                 else None
             )
             runtime.barrier(stream.cuda_stream)
-            slots = native.reserve_and_put(runtime, x, indices, weights, 4, capacity)
+            slots = torch.full((tokens, 1), -1, device="cuda", dtype=torch.int64)
+            payload_probe.run_dispatch_payload(
+                runtime.peer_addresses(),
+                x,
+                indices,
+                weights,
+                slots,
+                0,
+                4,
+                capacity,
+                False,
+            )
             runtime.barrier(stream.cuda_stream)
             # Read on the producer stream; no default-stream ordering is assumed.
             slots_cpu, indices_cpu, x_cpu = slots.cpu(), indices.cpu(), x.cpu()
@@ -187,9 +210,22 @@ def test_reserve_and_put_payload(native, dtype, weighted, tokens):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("tokens", [0, 11])
-def test_cached_payload_preserves_mapping_and_counter(native, dtype, tokens):
-    hidden, topk, capacity = 256, 3, 11
+@pytest.mark.parametrize(
+    "tokens", [0, 11, pytest.param(None, id="multiple-grid-rounds")]
+)
+def test_cached_payload_preserves_mapping_and_counter(
+    native, payload_probe, dtype, tokens
+):
+    if tokens is None:
+        tokens = (
+            2
+            * torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+            * 8
+            + 3
+        )
+    hidden, topk, capacity = 256, 3, max(11, tokens)
     layout = native.window_layout(1, capacity, hidden, topk, 4)
     runtime = native.PeerRuntime(0, 1, layout[-1])
     runtime.import_peer_handles([runtime.export_local_handle()])
@@ -227,14 +263,20 @@ def test_cached_payload_preserves_mapping_and_counter(native, dtype, tokens):
                     recv_next.zero_()
                 runtime.barrier(stream.cuda_stream)
                 old_slots, old_counter = slots, recv_next.item()
-                slots = native.reserve_and_put(
-                    runtime,
+                if not cached:
+                    slots = torch.full(
+                        (tokens, 1), -1, device="cuda", dtype=torch.int64
+                    )
+                payload_probe.run_dispatch_payload(
+                    runtime.peer_addresses(),
                     x,
                     indices,
                     weights,
+                    slots,
+                    0,
                     4,
                     capacity,
-                    cached_dst_slots=slots if cached else None,
+                    cached,
                 )
                 runtime.barrier(stream.cuda_stream)
                 slots_cpu, received, indices_cpu = (
@@ -292,31 +334,5 @@ def test_cached_payload_preserves_mapping_and_counter(native, dtype, tokens):
     finally:
         torch.cuda.synchronize()
         del recv_next, window
-        runtime.close_peer_mappings()
-        runtime.close()
-
-
-@pytest.mark.parametrize("kind", ["shape", "dtype", "device", "stride", "empty_shape"])
-def test_invalid_cached_slot_storage(native, kind):
-    tokens = 0 if kind == "empty_shape" else 3
-    layout = native.window_layout(1, 3, 256, 2, 4)
-    runtime = native.PeerRuntime(0, 1, layout[-1])
-    runtime.import_peer_handles([runtime.export_local_handle()])
-    x = torch.zeros((tokens, 256), dtype=torch.bfloat16, device="cuda")
-    indices = torch.zeros((tokens, 2), device="cuda", dtype=torch.int64)
-    slots = torch.zeros((tokens, 1), device="cuda", dtype=torch.int64)
-    if kind in ("shape", "empty_shape"):
-        slots = torch.zeros((tokens, 2), device="cuda", dtype=torch.int64)
-    elif kind == "dtype":
-        slots = slots.float()
-    elif kind == "device":
-        slots = slots.cpu()
-    elif kind == "stride":
-        slots = torch.zeros((tokens, 2), device="cuda", dtype=torch.int64)[:, :1]
-    try:
-        with pytest.raises(RuntimeError, match="cached_dst_slots"):
-            native.reserve_and_put(runtime, x, indices, None, 4, 3, slots)
-    finally:
-        torch.cuda.synchronize()
         runtime.close_peer_mappings()
         runtime.close()

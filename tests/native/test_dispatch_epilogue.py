@@ -7,7 +7,11 @@ import pytest
 import torch
 from torch.utils import deterministic
 
-from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
+from nano_ep.backends._build import (
+    load_extension,
+    prepare_dispatch_epilogue,
+    prepare_dispatch_main,
+)
 from nano_ep.testing.cases import make_case
 from nano_ep.testing.native_dispatch import (
     assert_dispatch_output,
@@ -139,6 +143,14 @@ def check_fresh_and_cached(
             [],
             0,
             allow_multiple_reduction,
+            launcher=prepare_dispatch_main(
+                x.shape[1],
+                indices.shape[1],
+                1,
+                (case.num_experts) // 1,
+                case.capacity,
+                alignment,
+            ).launcher,
         )
         outputs = epilogues[False](state, expand, weighted, zero_padding)
         assert_dispatch_state(
@@ -184,6 +196,14 @@ def check_fresh_and_cached(
                 state.metadata,
                 int(state.counts[1]),
                 allow_multiple_reduction,
+                launcher=prepare_dispatch_main(
+                    replay_x.shape[1],
+                    indices.shape[1],
+                    1,
+                    (case.num_experts) // 1,
+                    case.capacity,
+                    alignment,
+                ).launcher,
             )
             assert replay.metadata_prepared
             replay_outputs = epilogues[True](
@@ -281,51 +301,6 @@ def test_dispatch_uses_allocated_reduction_mode(
     )
 
 
-@pytest.mark.parametrize("allow_multiple_reduction", [False, True])
-def test_reserve_binding_uses_allocated_reduction_mode(
-    native, allow_multiple_reduction
-):
-    case = copy_case("mixed", torch.bfloat16, 256, tokens=19)
-    with local_runtime(native, case, allow_multiple_reduction) as (
-        runtime,
-        window,
-        layout,
-    ):
-        x, indices = case.xs[0].cuda(), case.indices[0].cuda()
-        stream = torch.cuda.current_stream()
-        runtime.barrier(stream.cuda_stream)
-        slots = native.reserve_and_put(
-            runtime,
-            x,
-            indices,
-            None,
-            case.num_experts,
-            case.capacity,
-            allow_multiple_reduction=allow_multiple_reduction,
-        )
-        runtime.barrier(stream.cuda_stream)
-        torch.testing.assert_close(slots[:, 0].cpu().sort().values, torch.arange(19))
-        counter = window[
-            layout[1] + (1 + case.num_experts) * 8 : layout[1]
-            + (2 + case.num_experts) * 8
-        ].view(torch.int64)
-        assert counter.item() == 19
-        runtime.barrier(stream.cuda_stream)
-        replay = native.reserve_and_put(
-            runtime,
-            x * 2,
-            indices,
-            None,
-            case.num_experts,
-            case.capacity,
-            cached_dst_slots=slots,
-            allow_multiple_reduction=allow_multiple_reduction,
-        )
-        runtime.barrier(stream.cuda_stream)
-        assert replay.data_ptr() == slots.data_ptr()
-        assert counter.item() == 19
-
-
 @pytest.mark.parametrize("expand,zero_padding", LAYOUTS, ids=LAYOUT_IDS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_dispatch_copy_nonfinite_payload(native, expand, zero_padding, dtype):
@@ -392,6 +367,15 @@ def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighte
                 4,
                 cached,
                 cached_expanded_capacity,
+                allow_multiple_reduction=False,
+                launcher=prepare_dispatch_main(
+                    case.xs[0].shape[1],
+                    case.indices[0].shape[1],
+                    1,
+                    (case.num_experts) // 1,
+                    tokens,
+                    4,
+                ).launcher,
             )
             outputs = epilogues[replay](state, expand, weighted, expand)
             assert_dispatch_state(
@@ -452,6 +436,15 @@ def test_dispatch_geometry_mismatch_preserves_state(native, geometry, prepared):
             4,
             [],
             0,
+            allow_multiple_reduction=False,
+            launcher=prepare_dispatch_main(
+                case.xs[0].shape[1],
+                case.indices[0].shape[1],
+                1,
+                (case.num_experts) // 1,
+                case.capacity,
+                4,
+            ).launcher,
         )
         if prepared:
             correct(state, False, False, False)
@@ -527,6 +520,15 @@ def test_wrong_jit_cache_mode_preserves_state(native, prepared):
             4,
             [],
             0,
+            allow_multiple_reduction=False,
+            launcher=prepare_dispatch_main(
+                case.xs[0].shape[1],
+                case.indices[0].shape[1],
+                1,
+                (case.num_experts) // 1,
+                case.capacity,
+                4,
+            ).launcher,
         )
         if prepared:
             epilogues[False](state, False, False, False)
@@ -577,6 +579,15 @@ def test_prepared_state_retains_layout_without_reserving_again(
             alignment,
             [],
             0,
+            allow_multiple_reduction=False,
+            launcher=prepare_dispatch_main(
+                case.xs[0].shape[1],
+                case.indices[0].shape[1],
+                1,
+                topk,
+                case.capacity,
+                alignment,
+            ).launcher,
         )
         assert not state.metadata_prepared
         initial_offsets = state.metadata[1].clone()

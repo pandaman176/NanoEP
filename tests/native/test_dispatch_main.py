@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -6,7 +7,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from nano_ep.backends._build import load_extension, prepare_dispatch_epilogue
+from nano_ep.backends._build import (
+    load_extension,
+    prepare_dispatch_epilogue,
+    prepare_dispatch_main,
+)
 from nano_ep.testing.cases import make_case
 from nano_ep.testing.native_dispatch import (
     assert_dispatch_output,
@@ -19,19 +24,25 @@ pytestmark = [pytest.mark.cuda]
 
 @pytest.mark.parametrize("hidden", [1, 33, 128, 255, 257])
 @pytest.mark.parametrize("tokens", [0, 2])
-@pytest.mark.parametrize("stage", ["dispatch_main", "reserve_and_put"])
-def test_hidden_constraint_precedes_communication(
-    native, runtime, hidden, tokens, stage
-):
+def test_hidden_constraint_precedes_communication(native, runtime, hidden, tokens):
     peer, _ = runtime
     x = torch.zeros((tokens, hidden), dtype=torch.bfloat16, device="cuda")
     indices = torch.full((tokens, 3), -1, dtype=torch.int64, device="cuda")
     before = peer.local_window().clone()
     with pytest.raises(RuntimeError, match="multiple of 256"):
-        if stage == "dispatch_main":
-            native.dispatch_main(peer, x, indices, None, 3, 5, 1, [], 0)
-        else:
-            native.reserve_and_put(peer, x, indices, None, 3, 5)
+        native.dispatch_main(
+            peer,
+            x,
+            indices,
+            None,
+            3,
+            5,
+            1,
+            [],
+            0,
+            allow_multiple_reduction=False,
+            launcher=prepare_dispatch_main(256, 3, 1, 3, 5, 1).launcher,
+        )
     torch.testing.assert_close(peer.local_window(), before, rtol=0, atol=0)
 
 
@@ -65,6 +76,112 @@ def runtime(native):
     runtime.close()
 
 
+@pytest.mark.parametrize("experts", [3, 260])
+def test_notify_and_payload_warps_across_multiple_token_rounds(native, experts):
+    tokens = (
+        8
+        * torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        + 3
+    )
+    hidden, alignment = 256, 4
+    layout = native.window_layout(1, tokens, hidden, 3, experts)
+    epilogue = prepare_dispatch_epilogue(
+        hidden, 3, experts, cached_mode=False
+    ).dispatch_epilogue
+    runtime = native.PeerRuntime(0, 1, layout[-1])
+    window = runtime.local_window()
+    count_bytes = (1 + experts) * 8
+    window[layout[1] : layout[1] + count_bytes].view(torch.int64).fill_(-1)
+    torch.cuda.synchronize()
+    runtime.import_peer_handles([runtime.export_local_handle()])
+    base = make_case(1, dtype=torch.bfloat16, hidden=hidden)
+    x = (torch.arange(tokens * hidden).reshape(tokens, hidden) % 29).to(torch.bfloat16)
+    weights = torch.arange(tokens * 3).reshape(tokens, 3).float() / 7
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    try:
+        with torch.cuda.stream(stream):
+            for kind in ("mixed", "masked", "empty", "skew"):
+                pattern = {
+                    "mixed": [
+                        [0, 1, experts - 1],
+                        [-1, -1, -1],
+                        [experts - 1, -1, 0],
+                        [-1, 1, -1],
+                    ],
+                    "masked": [[-1, -1, -1]],
+                    "empty": [[-1, -1, -1]],
+                    "skew": [[experts - 1, -1, -1]],
+                }[kind]
+                n = 0 if kind == "empty" else tokens
+                indices = (
+                    torch.tensor(pattern)
+                    .repeat((n + len(pattern) - 1) // len(pattern), 1)[:n]
+                    .contiguous()
+                )
+                case = replace(
+                    base,
+                    xs=[x[:n]],
+                    indices=[indices],
+                    weights=[weights[:n]],
+                    capacity=tokens,
+                    num_experts=experts,
+                    expert_matrices=torch.empty(0),
+                )
+                state = native.dispatch_main(
+                    runtime,
+                    case.xs[0].cuda(),
+                    indices.cuda(),
+                    case.weights[0].cuda(),
+                    experts,
+                    tokens,
+                    alignment,
+                    [],
+                    0,
+                    allow_multiple_reduction=False,
+                    launcher=prepare_dispatch_main(
+                        case.xs[0].shape[1],
+                        indices.shape[1],
+                        1,
+                        experts,
+                        tokens,
+                        alignment,
+                    ).launcher,
+                )
+                outputs = epilogue(state, False, True, False)
+                assert_dispatch_state(
+                    state, case, 0, alignment, case.weights, expand=False
+                )
+                assert_dispatch_output(
+                    state,
+                    outputs,
+                    case,
+                    0,
+                    alignment,
+                    case.weights,
+                    expand=False,
+                    zero_padding=False,
+                )
+                assert window[layout[1] : layout[1] + count_bytes].view(
+                    torch.int64
+                ).tolist() == [-1] * (1 + experts)
+                # One rank's barrier region aligns to 32 bytes; the reduction words follow it.
+                assert torch.count_nonzero(window[32 : 32 + count_bytes]).item() == 0
+    finally:
+        stream.synchronize()
+        del window
+        runtime.close_peer_mappings()
+        runtime.close()
+
+
+def test_static_notify_shared_memory_limit_rejected_at_build(native):
+    # Static notify storage is checked by the CUDA compiler before IPC setup.
+    with pytest.raises(RuntimeError, match="(?i)(shared|smem|local_counts)"):
+        prepare_dispatch_main(256, 3, 1, 1_000_000, 1, 1)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("kind", ["mixed", "empty", "masked", "skew"])
 @pytest.mark.parametrize("alignment", [1, 4, 16])
@@ -79,7 +196,19 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
             case.weights[0].cuda(),
         )
         state = native.dispatch_main(
-            runtime, x, indices, weights, 3, 5, alignment, [], 0
+            runtime,
+            x,
+            indices,
+            weights,
+            3,
+            5,
+            alignment,
+            [],
+            0,
+            allow_multiple_reduction=False,
+            launcher=prepare_dispatch_main(
+                x.shape[1], indices.shape[1], 1, 3, 5, alignment
+            ).launcher,
         )
         assert not state.metadata_prepared
         assert len(state.metadata) == 5
@@ -105,7 +234,19 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
         # A different fresh dispatch overwrites the window and resets recv_next.
         masked = replace(case, indices=[torch.full_like(case.indices[0], -1)])
         fresh = native.dispatch_main(
-            runtime, x, masked.indices[0].cuda(), None, 3, 5, 1, [], 0
+            runtime,
+            x,
+            masked.indices[0].cuda(),
+            None,
+            3,
+            5,
+            1,
+            [],
+            0,
+            allow_multiple_reduction=False,
+            launcher=prepare_dispatch_main(
+                x.shape[1], masked.indices[0].shape[1], 1, 3, 5, 1
+            ).launcher,
         )
         prepare_dispatch_metadata(fresh)
         assert_dispatch_state(fresh, masked, 0, 1, None, expand=False)
@@ -127,6 +268,10 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
             alignment,
             state.metadata,
             int(state.counts[1]),
+            allow_multiple_reduction=False,
+            launcher=prepare_dispatch_main(
+                (x * 2).shape[1], indices.shape[1], 1, 3, 5, alignment
+            ).launcher,
         )
         assert replay.metadata_prepared
         prepare_dispatch_metadata(replay)
@@ -154,6 +299,10 @@ def test_dispatch_state_and_old_cache(native, runtime, dtype, kind, alignment):
             alignment,
             state.metadata,
             int(state.counts[1]),
+            allow_multiple_reduction=False,
+            launcher=prepare_dispatch_main(
+                (x * 3).shape[1], indices.shape[1], 1, 3, 5, alignment
+            ).launcher,
         )
         prepare_dispatch_metadata(replay)
         assert_dispatch_state(
@@ -170,7 +319,19 @@ def test_nonfinite_payload_is_preserved(native, runtime, dtype):
     case.xs[0][0, 0] = float("nan")
     case.xs[0][1, 0] = float("inf")
     state = native.dispatch_main(
-        runtime, case.xs[0].cuda(), case.indices[0].cuda(), None, 3, 5, 4, [], 0
+        runtime,
+        case.xs[0].cuda(),
+        case.indices[0].cuda(),
+        None,
+        3,
+        5,
+        4,
+        [],
+        0,
+        allow_multiple_reduction=False,
+        launcher=prepare_dispatch_main(
+            case.xs[0].shape[1], case.indices[0].shape[1], 1, 3, 5, 4
+        ).launcher,
     )
     prepare_dispatch_metadata(state)
     assert_dispatch_state(state, case, 0, 4, None, expand=False)
@@ -248,7 +409,17 @@ def test_invalid_input_precedes_communication(native, runtime, kind):
         cached = [indices]
     else:
         state = native.dispatch_main(
-            runtime, x, indices, weights, experts, capacity, alignment, [], 0
+            runtime,
+            x,
+            indices,
+            weights,
+            experts,
+            capacity,
+            alignment,
+            [],
+            0,
+            allow_multiple_reduction=False,
+            launcher=prepare_dispatch_main(256, 3, 1, 3, 5, alignment).launcher,
         )
         if kind in ("cache_shape", "cache_slots", "cache_capacity"):
             prepare_dispatch_metadata(state)
@@ -272,6 +443,8 @@ def test_invalid_input_precedes_communication(native, runtime, kind):
             alignment,
             cached,
             cached_expanded_capacity,
+            allow_multiple_reduction=False,
+            launcher=prepare_dispatch_main(256, 3, 1, 3, 5, alignment).launcher,
         )
     torch.testing.assert_close(runtime.local_window().cpu(), before, rtol=0, atol=0)
 
@@ -286,7 +459,21 @@ def test_cached_capacity_without_gpu_scalar_readback(native, runtime, expand, ki
         case.indices[0].cuda(),
         case.weights[0].cuda(),
     )
-    state = native.dispatch_main(peer, x, indices, weights, 3, 5, 16, [], 0)
+    state = native.dispatch_main(
+        peer,
+        x,
+        indices,
+        weights,
+        3,
+        5,
+        16,
+        [],
+        0,
+        allow_multiple_reduction=False,
+        launcher=prepare_dispatch_main(
+            x.shape[1], indices.shape[1], 1, 3, 5, 16
+        ).launcher,
+    )
     fresh = prepare_dispatch_epilogue(256, 3, 3, cached_mode=False).dispatch_epilogue
     cached = prepare_dispatch_epilogue(256, 3, 3, cached_mode=True).dispatch_epilogue
     fresh(state, expand, True, expand)
@@ -299,7 +486,19 @@ def test_cached_capacity_without_gpu_scalar_readback(native, runtime, expand, ki
         activities=[torch.profiler.ProfilerActivity.CPU]
     ) as profile:
         replay = native.dispatch_main(
-            peer, replay_x, indices, weights, 3, 5, 16, state.metadata, capacity
+            peer,
+            replay_x,
+            indices,
+            weights,
+            3,
+            5,
+            16,
+            state.metadata,
+            capacity,
+            allow_multiple_reduction=False,
+            launcher=prepare_dispatch_main(
+                replay_x.shape[1], indices.shape[1], 1, 3, 5, 16
+            ).launcher,
         )
     operations = {event.key for event in profile.key_averages()}
     assert not operations & {"aten::item", "aten::_local_scalar_dense"}
@@ -321,20 +520,24 @@ def test_cached_capacity_without_gpu_scalar_readback(native, runtime, expand, ki
 @pytest.mark.parametrize(
     "stage,kind",
     [
-        ("route_counts", "negative"),
-        ("route_counts", "overflow"),
-        ("reserve_and_put", "negative"),
-        ("reserve_and_put", "overflow"),
+        ("dispatch_payload", "negative"),
+        ("dispatch_payload", "overflow"),
         ("dispatch_main", "negative"),
         ("dispatch_main", "overflow"),
         ("dispatch_epilogue", "duplicate"),
     ],
 )
-def test_routing_device_assert_in_subprocess(native, stage, kind):
+def test_routing_device_assert_in_subprocess(native, stage, kind, request):
     worker = Path(__file__).with_name("routing_assert_worker.py")
+    environment = os.environ.copy()
+    if stage == "dispatch_payload":
+        environment["NANO_EP_PEER_PROBE_PATH"] = request.getfixturevalue(
+            "payload_probe"
+        ).__file__
     result = subprocess.run(
         [sys.executable, str(worker), stage, kind],
         cwd=Path(__file__).resolve().parents[2],
+        env=environment,
         capture_output=True,
         text=True,
         timeout=60,
@@ -343,3 +546,38 @@ def test_routing_device_assert_in_subprocess(native, stage, kind):
     assert f"NANO_EP_ROUTING_ASSERT_OK={stage}:{kind}" in result.stdout, (
         result.stdout + result.stderr
     )
+
+
+@pytest.mark.parametrize(
+    "position,value", [(0, 512), (1, 2), (2, 2), (3, 4), (4, 7), (5, 8)]
+)
+def test_specialization_mismatch_precedes_window_mutation(
+    native, runtime, position, value
+):
+    peer, _ = runtime
+    geometry = [256, 3, 1, 3, 5, 4]
+    geometry[position] = value
+    module = prepare_dispatch_main(*geometry)
+    x = torch.ones((2, 256), dtype=torch.bfloat16, device="cuda")
+    indices = torch.tensor([[0, 1, -1], [2, -1, 0]], device="cuda")
+    before = peer.local_window().clone()
+    with pytest.raises(RuntimeError, match="compiled geometry"):
+        native.dispatch_main(
+            peer, x, indices, None, 3, 5, 4, [], 0, False, module.launcher
+        )
+    torch.testing.assert_close(peer.local_window(), before, rtol=0, atol=0)
+
+
+def test_dispatch_rejects_combine_launcher_before_window_mutation(native, runtime):
+    from nano_ep.backends._build import prepare_combine_main
+
+    peer, _ = runtime
+    x = torch.ones((2, 256), dtype=torch.bfloat16, device="cuda")
+    indices = torch.tensor([[0, 1, -1], [2, -1, 0]], device="cuda")
+    wrong = prepare_combine_main(256, 3, 1, 3, 5)
+    before = peer.local_window().clone()
+    with pytest.raises(ValueError, match="dispatch main specialization launcher"):
+        native.dispatch_main(
+            peer, x, indices, None, 3, 5, 4, [], 0, False, wrong.launcher
+        )
+    torch.testing.assert_close(peer.local_window(), before, rtol=0, atol=0)
