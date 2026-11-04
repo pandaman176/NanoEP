@@ -224,6 +224,10 @@ void run_dispatch_payload(const torch::Tensor& addresses,
         geometry.template operator()<1, 4>();
     else if (world_size == 2 && num_experts == 4)
         geometry.template operator()<2, 2>();
+    else if (world_size == 8 && num_experts == 16)
+        geometry.template operator()<8, 2>();
+    else if (world_size == 32 && num_experts == 32)
+        geometry.template operator()<32, 1>();
     else
         TORCH_CHECK(false, "unsupported payload probe geometry");
     C10_CUDA_KERNEL_LAUNCH_CHECK();

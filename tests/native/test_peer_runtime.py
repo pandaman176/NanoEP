@@ -336,3 +336,88 @@ def test_cached_payload_preserves_mapping_and_counter(
         del recv_next, window
         runtime.close_peer_mappings()
         runtime.close()
+
+
+@pytest.mark.parametrize(
+    "ranks,local_experts,topk", [(1, 4, 3), (2, 2, 3), (8, 2, 3), (32, 1, 1)]
+)
+@pytest.mark.parametrize("weighted", [False, True])
+def test_cached_payload_rank_lanes(
+    native, payload_probe, ranks, local_experts, topk, weighted
+):
+    """Run rank-lane selection with logical peer allocations on one GPU."""
+    tokens, hidden, capacity = 5, 256, 5
+    experts = ranks * local_experts
+    layout = native.window_layout(ranks, capacity, hidden, topk, experts)
+    recv_next_offset = layout[1] + (ranks + experts) * 8
+    row_bytes = dispatch_row_bytes(hidden, topk)
+    topk_offset, weight_offset, x_offset = dispatch_offsets(topk)
+    indices = torch.full((tokens, topk), -1, dtype=torch.int64)
+    n = min(topk, local_experts)
+    indices[0, :n] = torch.arange(n)
+    indices[1, 0] = experts - 1
+    indices[2, 0] = (ranks // 2) * local_experts
+    choices = list(dict.fromkeys([0, experts - 1, *range(experts)]))
+    indices[3] = torch.tensor(choices[:topk])
+
+    slots = torch.full((tokens, ranks), -1, dtype=torch.int64)
+    used = [0] * ranks
+    for token in range(tokens):
+        destinations = {int(e) // local_experts for e in indices[token] if e >= 0}
+        for destination in sorted(destinations):
+            slots[token, destination] = used[destination]
+            used[destination] += 1
+
+    # Each pointer names separate storage; no cross-GPU IPC is exercised here.
+    windows = [
+        torch.full((layout[-1],), 0xA5, dtype=torch.uint8, device="cuda")
+        for _ in range(ranks)
+    ]
+    addresses = torch.tensor(
+        [window.data_ptr() for window in windows], device="cuda", dtype=torch.int64
+    )
+    indices_gpu, slots_gpu = indices.cuda(), slots.cuda()
+    rank = ranks - 1
+    for phase in range(2):
+        x = (torch.arange(tokens * hidden).reshape(tokens, hidden) / 8 + phase * 64).to(
+            torch.bfloat16
+        )
+        weights = torch.arange(tokens * topk).reshape(tokens, topk).float() / 7 + phase
+        expected = []
+        for destination, window in enumerate(windows):
+            window.fill_(0xA5)
+            packet = torch.full((layout[-1],), 0xA5, dtype=torch.uint8)
+            window[recv_next_offset : recv_next_offset + 8].view(torch.int64).fill_(1)
+            packet[recv_next_offset : recv_next_offset + 8].view(torch.int64).fill_(1)
+            for token in range(tokens):
+                slot = int(slots[token, destination])
+                if slot < 0:
+                    continue
+                start = layout[2] + slot * row_bytes
+                row = packet[start : start + row_bytes]
+                row[:16].view(torch.int64).copy_(torch.tensor([rank, token]))
+                row[topk_offset : topk_offset + topk * 8].view(torch.int64).copy_(
+                    indices[token]
+                )
+                row[x_offset : x_offset + hidden * 2].view(torch.bfloat16).copy_(
+                    x[token]
+                )
+                if weighted:
+                    row[weight_offset : weight_offset + topk * 4].view(
+                        torch.float32
+                    ).copy_(weights[token])
+            expected.append(packet)
+        payload_probe.run_dispatch_payload(
+            addresses,
+            x.cuda(),
+            indices_gpu,
+            weights.cuda() if weighted else None,
+            slots_gpu,
+            rank,
+            experts,
+            capacity,
+            True,
+        )
+        for window, packet in zip(windows, expected, strict=True):
+            torch.testing.assert_close(window.cpu(), packet, rtol=0, atol=0)
+        torch.testing.assert_close(slots_gpu.cpu(), slots, rtol=0, atol=0)

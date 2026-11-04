@@ -228,35 +228,42 @@ __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addres
 
     // Warps process disjoint token sequences across the SM-sized grid.
     for (int64_t token = token_start; token < num_tokens; token += token_stride) {
-        // Fist K lane handle one routing
-        // Expert[0, 1, 2, 3, 4, 5, 6, 7] -> Rank[0, 0, 1, 1, 2, 2, 3, 3]
         int destination = -1;
-        if (lane < num_topk) {
-            const int64_t expert_id = indices[token * num_topk + lane];
-            if (expert_id < -1 || expert_id >= kWorldSize * kExpertsPerRank) {
-                printf("NanoEP dispatch invalid expert: token=%lld expert=%lld\n",
-                       static_cast<long long>(token),
-                       static_cast<long long>(expert_id));
-                asm volatile("trap;");
-                return;
-            }
-            if (expert_id >= 0) {
-                destination = expert_id / kExpertsPerRank;
-            }
-        }
-
-        // e.g. for lane 0, same_destination = 0x00000003
-        const unsigned same_destination = __match_any_sync(0xffffffffu, destination);
-
-        const int leader = 31 - __clz(same_destination);
-        const bool is_sender = (destination >= 0 && lane == leader);
-
         unsigned long long slot = 0;
-        if (is_sender) {
-            if constexpr (kReuseSlots) {
-                slot = static_cast<unsigned long long>(dst_slots[token * kWorldSize + destination]);
+        bool is_sender = false;
+        if constexpr (kReuseSlots) {
+            // Each rank lane owns its saved edge; -1 means no payload to send.
+            if (lane < kWorldSize) {
+                const int64_t cached_slot = dst_slots[token * kWorldSize + lane];
+                if (cached_slot >= 0) {
+                    slot = static_cast<unsigned long long>(cached_slot);
+                    is_sender = true;
+                }
+            }
+        } else {
+            // Fist K lane handle one routing
+            // Expert[0, 1, 2, 3, 4, 5, 6, 7] -> Rank[0, 0, 1, 1, 2, 2, 3, 3]
+            if (lane < num_topk) {
+                const int64_t expert_id = indices[token * num_topk + lane];
+                if (expert_id < -1 || expert_id >= kWorldSize * kExpertsPerRank) {
+                    printf("NanoEP dispatch invalid expert: token=%lld expert=%lld\n",
+                           static_cast<long long>(token),
+                           static_cast<long long>(expert_id));
+                    asm volatile("trap;");
+                    return;
+                }
+                if (expert_id >= 0) {
+                    destination = expert_id / kExpertsPerRank;
+                }
+            }
 
-            } else {
+            // e.g. for lane 0, same_destination = 0x00000003
+            const unsigned same_destination = __match_any_sync(0xffffffffu, destination);
+
+            const int leader = 31 - __clz(same_destination);
+            is_sender = (destination >= 0 && lane == leader);
+
+            if (is_sender) {
                 auto* target_window = reinterpret_cast<uint8_t*>(peer_addresses[destination]);
                 auto* recv_next = reinterpret_cast<unsigned long long*>(target_window + recv_next_offset);
                 using Counter = cuda::atomic_ref<unsigned long long, cuda::thread_scope_system>;
@@ -264,11 +271,10 @@ __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addres
                 slot = counter.fetch_add(1ULL, cuda::memory_order_relaxed);
                 dst_slots[token * kWorldSize + destination] = static_cast<int64_t>(slot);
             }
-
-            if (!(slot < static_cast<unsigned long long>(kWorldSize) * max_tokens)) {
-                printf("Invalid destination slot\n");
-                asm volatile("trap;");
-            }
+        }
+        if (is_sender && !(slot < static_cast<unsigned long long>(kWorldSize) * max_tokens)) {
+            printf("Invalid destination slot\n");
+            asm volatile("trap;");
         }
 
         // e.g. senders = 0b00000000000000000000000010101010
@@ -277,8 +283,8 @@ __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addres
             // find the first sender in the warp
             const int sender = __ffs(senders) - 1;
 
-            // broadcast the destination
-            const int64_t dst = __shfl_sync(0xffffffffu, destination, sender);
+            // Cached sender lanes already identify destination ranks.
+            const int64_t dst = kReuseSlots ? sender : __shfl_sync(0xffffffffu, destination, sender);
             const int64_t dst_slot = __shfl_sync(0xffffffffu, slot, sender);
             auto* peer_window = reinterpret_cast<uint8_t*>(peer_addresses[dst]);
 
