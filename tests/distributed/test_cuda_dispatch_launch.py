@@ -1,18 +1,15 @@
 """Validate public dispatch independently of combine execution."""
 
 import os
-from pathlib import Path
 import subprocess
 import sys
+from itertools import product
+from pathlib import Path
 
 import pytest
 import torch
 
-from nano_ep.backends._build import (
-    load_extension,
-    prepare_dispatch_epilogue,
-    prepare_dispatch_main,
-)
+from nano_ep.backends._build import load_extension
 from nano_ep.testing.launcher import run_logged
 
 pytestmark = [pytest.mark.distributed]
@@ -26,14 +23,15 @@ def test_public_cuda_dispatch(request):
         pytest.fail(
             "public dispatch acceptance needs --nproc 1/2/4/8 and that many GPUs"
         )
-    load_extension()
-    for cached_mode in (False, True):
-        prepare_dispatch_epilogue(256, 3, 3, cached_mode=cached_mode)
-    for cached_mode in (False, True):
-        prepare_dispatch_epilogue(512, 3, 3, cached_mode=cached_mode)
-    for hidden in (256, 512):
-        for expert_alignment in (1, 4):
-            prepare_dispatch_main(hidden, 3, nproc, 3, 5, expert_alignment)
+    native = load_extension()
+    for hidden, cached, weighted in product((256, 512), (False, True), (False, True)):
+        geometry = (hidden, 3, nproc, 3, 5)
+        for alignment in (4,) if cached else (1, 4):
+            native.prepare_dispatch(
+                *geometry, alignment, cached, False, weighted, False
+            )
+        for zero_padding in (False, True):
+            native.prepare_dispatch(*geometry, 4, cached, True, weighted, zero_padding)
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["NANO_EP_EXPECTED_WORLD"] = str(nproc)
@@ -51,7 +49,9 @@ def test_public_cuda_dispatch(request):
         str(Path(__file__).with_name("dispatch_worker.py")),
     ]
     try:
-        status = run_logged(command, cwd=repo, env=env, log=log, timeout=180)
+        # A warm cache runs all eight ranks in about 20 seconds; the margin
+        # covers node contention rather than compilation.
+        status = run_logged(command, cwd=repo, env=env, log=log, timeout=300)
     except subprocess.TimeoutExpired:
         pytest.fail(
             f"public dispatch torchrun timed out: {log}\n{log.read_text()[-12000:]}"

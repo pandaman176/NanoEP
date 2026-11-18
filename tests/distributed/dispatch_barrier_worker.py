@@ -8,11 +8,7 @@ import torch
 import torch.distributed as dist
 from peer_worker import load_probe
 
-from nano_ep.backends._build import (
-    load_extension,
-    prepare_dispatch_epilogue,
-    prepare_dispatch_main,
-)
+from nano_ep.backends._build import load_extension
 from nano_ep.testing.cases import Case
 from nano_ep.testing.native_dispatch import assert_dispatch_output
 
@@ -56,11 +52,6 @@ def run():
     dist.init_process_group("gloo", timeout=timedelta(seconds=180))
     native, probe = load_extension(), load_probe()
     capacity, alignment = 2153, 4
-    module = prepare_dispatch_main(256, 3, size, 3, capacity, alignment)
-    epilogues = tuple(
-        prepare_dispatch_epilogue(256, 3, 3, cached_mode=mode).dispatch_epilogue
-        for mode in (False, True)
-    )
     layout = native.window_layout(size, capacity, 256, 3, size * 3)
     runtime = native.PeerRuntime(rank, size, layout[-1])
     handles = [None] * size
@@ -76,7 +67,7 @@ def run():
     with torch.cuda.stream(stream):
         empty_x = torch.empty((0, 256), dtype=torch.bfloat16, device="cuda")
         empty_indices = torch.empty((0, 3), dtype=torch.int64, device="cuda")
-        warm = native.dispatch_main(
+        _, warm_metadata, _, _ = native.dispatch(
             runtime,
             empty_x,
             empty_indices,
@@ -87,10 +78,12 @@ def run():
             [],
             0,
             False,
-            module.launcher,
+            False,
+            False,
+            num_sms=0,
+            comm_stream=stream.cuda_stream,
         )
-        epilogues[False](warm, False, False, False)
-        warm = native.dispatch_main(
+        _, warm_metadata, _, _ = native.dispatch(
             runtime,
             empty_x,
             empty_indices,
@@ -98,16 +91,18 @@ def run():
             size * 3,
             capacity,
             alignment,
-            warm.metadata,
+            warm_metadata,
             0,
             False,
-            module.launcher,
+            False,
+            False,
+            num_sms=0,
+            comm_stream=stream.cuda_stream,
         )
-        epilogues[True](warm, False, False, False)
     epoch += 4
     stream.synchronize()
     dist.barrier()
-    del warm
+    del warm_metadata
 
     for expand in (False, True):
         for kind in ("mixed", "one_empty", "masked", "all_empty"):
@@ -134,7 +129,7 @@ def run():
                         # Peer 1 publishes entry while rank 0's old reader is pending.
                         probe.wait_for_arrival(window, 1, epoch + 1)
                         after = arena.clone()
-                    state = native.dispatch_main(
+                    outputs, received_metadata, counts, _ = native.dispatch(
                         runtime,
                         x,
                         indices,
@@ -145,17 +140,16 @@ def run():
                         metadata if cached else [],
                         expanded_capacity if cached else 0,
                         False,
-                        module.launcher,
+                        expand,
+                        expand,
+                        num_sms=4 if cached else 8,
+                        comm_stream=stream.cuda_stream,
                     )
-                    outputs = epilogues[cached](state, expand, True, expand)
                     if not cached:
-                        metadata, expanded_capacity = (
-                            state.metadata,
-                            int(state.counts[1]),
-                        )
+                        metadata, expanded_capacity = received_metadata, int(counts[1])
                     # The epilogue must see every CTA and every peer's completed writes.
                     assert_dispatch_output(
-                        state,
+                        received_metadata,
                         outputs,
                         current,
                         rank,
@@ -181,7 +175,7 @@ def run():
     stream.synchronize()
     dist.barrier()
     runtime.close_peer_mappings()
-    del state, outputs, arena, window
+    del arena, window
     dist.barrier()
     runtime.close()
     print(f"NANO_EP_DISPATCH_BARRIER_RANK_OK={rank}:{checks}", flush=True)

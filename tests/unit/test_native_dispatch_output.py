@@ -1,7 +1,5 @@
 """Check the output oracle, including deliberately incorrect copy results."""
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -34,17 +32,15 @@ def reordered_output(
         mask = local == expert
         start = int(layout.expert_offsets[expert])
         slots[mask] = 2 * start + count - 1 - slots[mask]
-    state = SimpleNamespace(
-        stage_buffer=torch.empty(0, dtype=torch.uint8),
-        metadata=[
-            layout.src_ranks[order],
-            layout.src_tokens[order],
-            local,
-            layout.expert_counts,
-            layout.expert_offsets,
-            slots if expand else torch.empty(0, dtype=torch.int64),
-        ],
-    )
+    recv = torch.cat(
+        (
+            layout.src_ranks[order, None],
+            layout.src_tokens[order, None],
+            slots if expand else local,
+        ),
+        dim=1,
+    ).int()
+    metadata = [recv, layout.expert_counts, layout.expert_offsets]
     out_weights = torch.empty(0, dtype=torch.float32)
     if expand:
         x = torch.full_like(expected.x, 0 if zero_padding else float("nan"))
@@ -65,12 +61,12 @@ def reordered_output(
         if weighted:
             out_weights = expected.topk_weights[order].clone()
     options = dict(expand=expand, zero_padding=zero_padding)
-    return state, [x, indices, out_weights], case, rank, alignment, weights, options
+    return metadata, [x, indices, out_weights], case, rank, alignment, weights, options
 
 
 def check(fixture):
-    state, outputs, case, rank, alignment, weights, options = fixture
-    assert_dispatch_output(state, outputs, case, rank, alignment, weights, **options)
+    metadata, outputs, case, rank, alignment, weights, options = fixture
+    assert_dispatch_output(metadata, outputs, case, rank, alignment, weights, **options)
 
 
 @pytest.mark.parametrize(
@@ -108,10 +104,10 @@ def test_output_checker_accepts_reordered_assignments(
 )
 def test_output_checker_rejects_incorrect_copy(expand, corruption):
     fixture = reordered_output(expand=expand, weighted=True, zero_padding=True)
-    state, outputs, _, _, _, _, _ = fixture
+    metadata, outputs, _, _, _, _, _ = fixture
     x, indices, weights = outputs
-    valid = state.metadata[2] >= 0
-    slots = state.metadata[5][valid] if expand else None
+    valid = metadata[0][:, 2:] >= 0
+    slots = metadata[0][:, 2:][valid].long() if expand else None
     row = int(slots[0]) if expand else 0
     if corruption == "payload":
         x[row, 0] += 1
@@ -120,24 +116,19 @@ def test_output_checker_rejects_incorrect_copy(expand, corruption):
             weights[row] += 1
         else:
             # Compact copies must preserve masked/nonlocal choices too.
-            masked = (state.metadata[2] < 0).nonzero()[0]
+            masked = (metadata[0][:, 2:] < 0).nonzero()[0]
             weights[masked[0], masked[1]] += 1
     elif corruption == "indices":
         if expand:
-            outputs[1] = state.metadata[2].clone()
+            outputs[1] = metadata[0][:, 2:].clone().long()
         else:
             indices[0, 0] = 99
     elif corruption == "missing_weights":
         outputs[2] = torch.empty(0)
     elif corruption == "duplicate_source":
-        state.metadata[0][1] = state.metadata[0][0]
-        state.metadata[1][1] = state.metadata[1][0]
+        metadata[0][1, :2] = metadata[0][0, :2]
     elif corruption == "slot_shape":
-        state.metadata[5] = (
-            torch.empty(0, dtype=torch.int64)
-            if expand
-            else torch.full_like(state.metadata[2], -1)
-        )
+        metadata[0] = metadata[0][:, :-1].contiguous()
     else:
         if expand:
             padding = torch.ones(len(x), dtype=torch.bool)
@@ -153,9 +144,9 @@ def test_output_checker_rejects_incorrect_copy(expand, corruption):
 
 def test_output_checker_rejects_weight_padding_alone():
     fixture = reordered_output(expand=True, weighted=True, zero_padding=True)
-    state, outputs, *_ = fixture
+    metadata, outputs, *_ = fixture
     padding = torch.ones(len(outputs[0]), dtype=torch.bool)
-    padding[state.metadata[5][state.metadata[2] >= 0]] = False
+    padding[metadata[0][:, 2:][metadata[0][:, 2:] >= 0].long()] = False
     assert padding.any()
     outputs[2][padding] = float("nan")
     with pytest.raises(AssertionError):

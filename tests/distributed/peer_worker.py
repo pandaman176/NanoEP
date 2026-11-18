@@ -11,14 +11,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-from nano_ep.backends._build import (
-    load_extension,
-    prepare_combine_epilogue,
-    prepare_combine_main,
-    prepare_dispatch_epilogue,
-    prepare_dispatch_main,
-    native_source_dir,
-)
+from nano_ep.backends._build import load_extension, native_source_dir
 from nano_ep.testing.oracle import reference_plan
 from nano_ep.testing.wire import dispatch_offsets, dispatch_row_bytes
 
@@ -435,11 +428,15 @@ def check_payload(native, probe, rank):
             )
             received_counts = received_raw[:2]
             received_experts = received_raw[2:].view(2, 2).sum(0)
-            slots = torch.full((x.shape[0], 2), -1, dtype=torch.int64, device="cuda")
+            slots = torch.full(
+                (x.shape[0], 2), 0x5A5A, dtype=torch.int64, device="cuda"
+            )
+            snapshot = torch.full_like(indices, 0x5A5A)
             probe.run_dispatch_payload(
                 runtime.peer_addresses(),
                 x,
                 indices,
+                snapshot,
                 weights,
                 slots,
                 rank,
@@ -449,6 +446,7 @@ def check_payload(native, probe, rank):
             )
             runtime.barrier(stream.cuda_stream)
             received, slots_cpu = window.cpu(), slots.cpu()
+            torch.testing.assert_close(snapshot.cpu(), source_indices, rtol=0, atol=0)
             expected_count = received_counts.sum().item()
             expected_experts = [
                 sum(
@@ -482,6 +480,7 @@ def check_payload(native, probe, rank):
                 runtime.peer_addresses(),
                 x,
                 indices,
+                snapshot,
                 weights,
                 slots,
                 rank,
@@ -508,251 +507,6 @@ def check_payload(native, probe, rank):
     print(f"NANO_EP_PAYLOAD_RANK_OK={rank}", flush=True)
 
 
-def check_dispatch_main(native, rank):
-    from dataclasses import replace
-
-    from nano_ep.testing.cases import make_case
-    from nano_ep.testing.native_dispatch import (
-        assert_dispatch_output,
-        assert_dispatch_state,
-        prepare_dispatch_metadata,
-    )
-
-    epilogues = tuple(
-        prepare_dispatch_epilogue(256, 3, 3, cached_mode=mode).dispatch_epilogue
-        for mode in (False, True)
-    )
-    dist.barrier()
-
-    def check_copy(state, case, weights, alignment=4):
-        for expand, zero_padding in ((False, False), (True, False), (True, True)):
-            outputs = epilogues[state.metadata_prepared](
-                state, expand, weights is not None, zero_padding
-            )
-            assert_dispatch_output(
-                state,
-                outputs,
-                case,
-                rank,
-                alignment,
-                weights,
-                expand=expand,
-                zero_padding=zero_padding,
-            )
-
-    layout = native.window_layout(2, 5, 256, 3, 6)
-    runtime = native.PeerRuntime(rank, 2, layout[-1])
-    window = runtime.local_window()
-    window[layout[1] : layout[1] + 64].view(torch.int64).fill_(-1)
-    torch.cuda.synchronize()
-    handles = [None, None]
-    dist.all_gather_object(handles, runtime.export_local_handle())
-    runtime.import_peer_handles(handles)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    for kind, dtype in (
-        ("mixed", torch.bfloat16),
-        ("empty", torch.bfloat16),
-        ("masked", torch.bfloat16),
-        ("skew", torch.bfloat16),
-    ):
-        case = make_case(2, kind=kind, dtype=dtype, hidden=256)
-        with torch.cuda.stream(stream):
-            x, indices, weights = (
-                case.xs[rank].cuda(),
-                case.indices[rank].cuda(),
-                case.weights[rank].cuda(),
-            )
-            state = native.dispatch_main(
-                runtime,
-                x,
-                indices,
-                weights,
-                6,
-                5,
-                4,
-                [],
-                0,
-                allow_multiple_reduction=False,
-                launcher=prepare_dispatch_main(
-                    x.shape[1], indices.shape[1], 2, (6) // 2, 5, 4
-                ).launcher,
-            )
-            assert not state.metadata_prepared and state.rank == rank
-            prepare_dispatch_metadata(state)
-            assert_dispatch_state(state, case, rank, 4, case.weights, expand=False)
-            check_copy(state, case, case.weights)
-            indices.fill_(99)
-            torch.testing.assert_close(state.metadata[8].cpu(), case.indices[rank])
-            saved_metadata = [tensor.cpu().clone() for tensor in state.metadata]
-
-            # Reuse an older handle after a fresh operation with a different receive count.
-            masked = replace(
-                case, indices=[torch.full_like(idx, -1) for idx in case.indices]
-            )
-            fresh = native.dispatch_main(
-                runtime,
-                x,
-                masked.indices[rank].cuda(),
-                None,
-                6,
-                5,
-                1,
-                [],
-                0,
-                allow_multiple_reduction=False,
-                launcher=prepare_dispatch_main(
-                    x.shape[1], masked.indices[rank].shape[1], 2, (6) // 2, 5, 1
-                ).launcher,
-            )
-            prepare_dispatch_metadata(fresh)
-            assert_dispatch_state(fresh, masked, rank, 1, None, expand=False)
-            check_copy(fresh, masked, None, alignment=1)
-            replay_case = replace(case, xs=[x * 2 for x in case.xs])
-            replay = native.dispatch_main(
-                runtime,
-                x * 2,
-                indices,
-                None,
-                6,
-                5,
-                4,
-                state.metadata,
-                int(state.counts[1]),
-                allow_multiple_reduction=False,
-                launcher=prepare_dispatch_main(
-                    (x * 2).shape[1], indices.shape[1], 2, (6) // 2, 5, 4
-                ).launcher,
-            )
-            assert replay.metadata_prepared
-            prepare_dispatch_metadata(replay)
-            assert_dispatch_state(replay, replay_case, rank, 4, None, expand=False)
-            check_copy(replay, replay_case, None)
-            replay_case = replace(
-                case, xs=[x * 3 for x in case.xs], weights=[w * 4 for w in case.weights]
-            )
-            replay = native.dispatch_main(
-                runtime,
-                x * 3,
-                indices,
-                weights * 4,
-                6,
-                5,
-                4,
-                state.metadata,
-                int(state.counts[1]),
-                allow_multiple_reduction=False,
-                launcher=prepare_dispatch_main(
-                    (x * 3).shape[1], indices.shape[1], 2, (6) // 2, 5, 4
-                ).launcher,
-            )
-            prepare_dispatch_metadata(replay)
-            assert_dispatch_state(
-                replay, replay_case, rank, 4, replay_case.weights, expand=False
-            )
-            check_copy(replay, replay_case, replay_case.weights)
-            for actual, expected in zip(replay.metadata, saved_metadata, strict=True):
-                torch.testing.assert_close(actual.cpu(), expected)
-            assert window[layout[1] + 64 : layout[1] + 72].view(torch.int64).item() == 0
-            assert (
-                (window[layout[1] : layout[1] + 64].view(torch.int64) == -1)
-                .all()
-                .item()
-            )
-    torch.cuda.synchronize()
-    dist.barrier()
-    runtime.close_peer_mappings()
-    del state, fresh, replay, window
-    dist.barrier()
-    runtime.close()
-    print(f"NANO_EP_DISPATCH_MAIN_RANK_OK={rank}", flush=True)
-    print(f"NANO_EP_DISPATCH_COPY_RANK_OK={rank}", flush=True)
-
-
-def check_combine_main(native, rank):
-    from itertools import product
-
-    from nano_ep.testing.native_combine import (
-        assert_combined_output,
-        assert_return_packets,
-        expert_inputs,
-        make_return_case,
-    )
-
-    combine_epilogue = prepare_combine_epilogue(256, 3, 2, 3, 5).combine_epilogue
-    combine_main_launcher = prepare_combine_main(256, 3, 2, 3, 5).launcher
-    for mode in (False, True):
-        layout = native.window_layout(2, 5, 256, 3, 6, mode)
-        runtime = native.PeerRuntime(rank, 2, layout[-1])
-        handles = [None, None]
-        dist.all_gather_object(handles, runtime.export_local_handle())
-        runtime.import_peer_handles(handles)
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            for dtype, expand, weighted, kind in product(
-                (torch.bfloat16,),
-                (False, True),
-                (False, True),
-                ("mixed", "empty", "masked"),
-            ):
-                case = make_return_case(2, 3, 256, dtype, kind=kind)
-                x, weights, metadata = expert_inputs(case, rank, expand)
-                runtime.local_window()[layout[3] :].fill_(165)
-                device_x, device_weights = x.cuda(), weights.cuda()
-                device_metadata = [tensor.cuda() for tensor in metadata]
-                returned = native.combine_main(
-                    runtime,
-                    device_x,
-                    device_metadata,
-                    device_weights if weighted else None,
-                    case.capacity,
-                    expand,
-                    mode,
-                    launcher=combine_main_launcher,
-                )
-                assert_return_packets(returned, case, rank, expand, mode, weighted)
-                bias = (
-                    torch.full(
-                        (len(case.indices[rank]), case.hidden),
-                        rank + 0.125,
-                        dtype=dtype,
-                    )
-                    if weighted
-                    else None
-                )
-                combined = combine_epilogue(
-                    returned,
-                    device_metadata[8],
-                    case.hidden,
-                    dtype,
-                    case.num_experts,
-                    2,
-                    case.capacity,
-                    bias.cuda() if bias is not None else None,
-                    weighted,
-                    expand,
-                    mode,
-                )
-                assert_combined_output(
-                    combined, case, rank, expand, mode, weighted, bias
-                )
-                torch.testing.assert_close(
-                    device_x.cpu(), x, rtol=0, atol=0, equal_nan=True
-                )
-                torch.testing.assert_close(
-                    device_weights.cpu(), weights, rtol=0, atol=0, equal_nan=True
-                )
-        torch.cuda.synchronize()
-        dist.barrier()
-        runtime.close_peer_mappings()
-        del returned
-        dist.barrier()
-        runtime.close()
-    print(f"NANO_EP_COMBINE_MAIN_RANK_OK={rank}", flush=True)
-    print(f"NANO_EP_COMBINE_EPILOGUE_RANK_OK={rank}", flush=True)
-
-
 def run():
     rank, size, local = (
         int(os.environ[key]) for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK")
@@ -766,8 +520,6 @@ def run():
             check_lifetime(native, probe, rank, lifetime)
         check_notify(native, probe, rank)
         check_payload(native, probe, rank)
-        check_dispatch_main(native, rank)
-        check_combine_main(native, rank)
         print(f"NANO_EP_PEER_RANK_OK={rank}", flush=True)
     finally:
         dist.destroy_process_group()

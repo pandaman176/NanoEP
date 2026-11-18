@@ -8,12 +8,14 @@ import torch
 import torch.distributed as dist
 from peer_worker import load_probe
 
-from nano_ep.backends._build import load_extension, prepare_combine_main
+from nano_ep.backends._build import load_extension
 from nano_ep.testing.native_combine import (
+    assert_combined_output,
     assert_return_packets,
     expert_inputs,
     make_return_case,
 )
+from nano_ep.testing.wire import return_row_bytes
 
 
 def run():
@@ -25,7 +27,7 @@ def run():
     dist.init_process_group("gloo", timeout=timedelta(seconds=180))
     native, probe = load_extension(), load_probe()
     hidden, topk, capacity = 256, 3, 2153
-    specialization = prepare_combine_main(hidden, topk, size, 3, capacity)
+    row_bytes = return_row_bytes(hidden, topk)
     stream = torch.cuda.Stream()
     checks = 0
     for mode in (False, True):
@@ -35,6 +37,10 @@ def run():
         dist.all_gather_object(handles, runtime.export_local_handle())
         runtime.import_peer_handles(handles)
         window = runtime.local_window()
+        partitions = min(size, topk) if mode else topk
+        returned = window.narrow(0, layout[3], partitions * capacity * row_bytes).view(
+            partitions, capacity, row_bytes
+        )
         stream.wait_stream(torch.cuda.current_stream())
         epoch = 0
         for expand, weighted in product((False, True), repeat=2):
@@ -44,15 +50,17 @@ def run():
             with torch.cuda.stream(stream):
                 x, w, metadata = expert_inputs(empty, rank, expand)
                 device_metadata = [tensor.cuda() for tensor in metadata]
-                native.combine_main(
+                native.combine(
                     runtime,
                     x.cuda(),
                     device_metadata,
                     w.cuda() if weighted else None,
+                    None,
                     capacity,
                     expand,
                     mode,
-                    launcher=specialization.launcher,
+                    0,
+                    stream.cuda_stream,
                 )
             stream.synchronize()
             epoch += 2
@@ -66,11 +74,11 @@ def run():
                         routing[:] = torch.arange(topk) + (size - 1) * 3
                 x, w, metadata = expert_inputs(case, rank, expand)
                 if kind == "one_receiver":
-                    assert metadata[0].numel() == (
+                    assert metadata[0].size(0) == (
                         size * capacity if rank == size - 1 else 0
                     )
                 elif kind == "masked":
-                    assert metadata[0].numel() == 0
+                    assert metadata[0].size(0) == 0
                 with torch.cuda.stream(stream):
                     device_x, device_w = x.cuda(), w.cuda()
                     device_metadata = [tensor.cuda() for tensor in metadata]
@@ -81,19 +89,22 @@ def run():
                         # Peer 1 must publish its entry before the old reader ends.
                         probe.wait_for_arrival(window, 1, epoch + 1)
                         after = arena.clone()
-                    returned = native.combine_main(
+                    outputs, _ = native.combine(
                         runtime,
                         device_x,
                         device_metadata,
                         device_w if weighted else None,
+                        None,
                         capacity,
                         expand,
                         mode,
-                        launcher=specialization.launcher,
+                        num_sms=8 if kind == "one_receiver" else 0,
+                        comm_stream=stream.cuda_stream,
                     )
                     # Kernel completion must include writes from every local CTA
                     # and every peer, including peers that have no receive rows.
                     assert_return_packets(returned, case, rank, expand, mode, weighted)
+                    assert_combined_output(outputs, case, rank, expand, mode, weighted)
                     if rank == 0:
                         torch.testing.assert_close(after, before, rtol=0, atol=0)
                     epoch += 2

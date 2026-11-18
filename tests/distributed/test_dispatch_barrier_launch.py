@@ -8,11 +8,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from nano_ep.backends._build import (
-    load_extension,
-    prepare_dispatch_epilogue,
-    prepare_dispatch_main,
-)
+from nano_ep.backends._build import load_extension
 from nano_ep.testing.launcher import run_logged
 
 pytestmark = [pytest.mark.distributed]
@@ -28,11 +24,14 @@ def test_cooperative_dispatch_barriers(request):
         pytest.fail("cooperative dispatch acceptance requires 2/4/8 visible GPUs")
     from peer_worker import build_probe
 
-    load_extension()
+    native = load_extension()
     probe = build_probe()
-    prepare_dispatch_main(256, 3, nproc, 3, 2153, 4)
-    for mode in (False, True):
-        prepare_dispatch_epilogue(256, 3, 3, cached_mode=mode)
+    for cached in (False, True):
+        native.prepare_dispatch(256, 3, nproc, 3, 2153, 4, cached, False, False, False)
+        for expand in (False, True):
+            native.prepare_dispatch(
+                256, 3, nproc, 3, 2153, 4, cached, expand, True, expand
+            )
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["NANO_EP_PEER_PROBE_PATH"] = probe.__file__

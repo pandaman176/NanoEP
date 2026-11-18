@@ -1,4 +1,5 @@
 #include <ATen/Dispatch.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -10,26 +11,24 @@
 #include "layout.hpp"
 
 template <bool kExpand, bool kMode, bool kWithWeights>
-__global__ void return_payload_kernel(const int64_t* addresses,
-                                      const at::BFloat16* x,
-                                      const float* weights,
-                                      const int64_t* src_ranks,
-                                      const int64_t* src_tokens,
-                                      const int64_t* local_topk,
-                                      const int64_t* slots,
-                                      int rank,
-                                      int64_t rows,
-                                      int64_t input_rows,
-                                      int64_t return_offset) {
+__global__ void __launch_bounds__(nano_ep::kCombineReturnPlan<NANO_EP_HIDDEN>.max_warps() * 32, 1)
+return_payload_kernel(const int64_t* addresses,
+                      const nv_bfloat16* x,
+                      const float* weights,
+                      const int32_t* recv_metadata,
+                      int rank,
+                      int64_t rows,
+                      int64_t input_rows,
+                      int64_t return_offset) {
     nano_ep::combine_return_rows<NANO_EP_HIDDEN,
                                  NANO_EP_TOPK,
                                  NANO_EP_WORLD_SIZE,
                                  NANO_EP_MAX_TOKENS,
-                                 at::BFloat16,
+                                 nv_bfloat16,
                                  kExpand,
                                  kMode,
                                  kWithWeights>(
-        addresses, x, weights, src_ranks, src_tokens, local_topk, slots, rank, rows, input_rows, return_offset);
+        addresses, x, weights, recv_metadata, rank, rows, input_rows, return_offset);
 }
 
 // Logical peers use distinct allocations on one physical GPU. They execute the
@@ -42,35 +41,37 @@ void run_return_kernel(const std::vector<torch::Tensor>& windows,
                        int rank,
                        int64_t capacity,
                        bool expand,
-                       bool mode) {
+                       bool mode,
+                       int num_sms) {
     c10::cuda::CUDAGuard guard(x.device());
     const int ranks = windows.size();
-    const auto layout = nano_ep::WindowLayout::make(ranks, capacity, x.size(1), metadata[8].size(1), ranks * 3, mode);
+    const auto layout = nano_ep::WindowLayout::make(ranks, capacity, x.size(1), metadata[5].size(1), ranks * 3, mode);
     auto addresses = torch::empty({ranks}, torch::TensorOptions().dtype(torch::kInt64));
     for (int peer = 0; peer < ranks; ++peer)
         addresses.data_ptr<int64_t>()[peer] = reinterpret_cast<int64_t>(windows[peer].data_ptr<uint8_t>());
     addresses = addresses.to(x.device());
     TORCH_CHECK(
-        x.size(1) == NANO_EP_HIDDEN && metadata[8].size(1) == NANO_EP_TOPK && ranks == NANO_EP_WORLD_SIZE && capacity == NANO_EP_MAX_TOKENS,
+        x.size(1) == NANO_EP_HIDDEN && metadata[5].size(1) == NANO_EP_TOPK && ranks == NANO_EP_WORLD_SIZE && capacity == NANO_EP_MAX_TOKENS,
         "probe inputs do not match the compiled geometry");
     if (metadata[0].numel() == 0)
         return;
-    constexpr int threads = 256;
-    const int blocks = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+    constexpr auto plan = nano_ep::kCombineReturnPlan<NANO_EP_HIDDEN>;
+    constexpr int warps = plan.max_warps();
+    constexpr int smem_bytes = static_cast<int>(warps * plan.stage_bytes);
+    const int blocks = num_sms == 0 ? at::cuda::getCurrentDeviceProperties()->multiProcessorCount : num_sms;
     const auto stream = c10::cuda::getCurrentCUDAStream().stream();
     const auto launch = [&]<bool kExpand, bool kMode, bool kWithWeights>() {
-        return_payload_kernel<kExpand, kMode, kWithWeights>
-            <<<blocks, threads, 0, stream>>>(addresses.data_ptr<int64_t>(),
-                                             x.data_ptr<at::BFloat16>(),
-                                             weights.has_value() ? weights->data_ptr<float>() : nullptr,
-                                             metadata[0].data_ptr<int64_t>(),
-                                             metadata[1].data_ptr<int64_t>(),
-                                             metadata[2].data_ptr<int64_t>(),
-                                             kExpand ? metadata[5].data_ptr<int64_t>() : nullptr,
-                                             rank,
-                                             metadata[0].numel(),
-                                             x.size(0),
-                                             layout.return_offset);
+        const auto kernel = return_payload_kernel<kExpand, kMode, kWithWeights>;
+        C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+        kernel<<<blocks, warps * 32, smem_bytes, stream>>>(
+            addresses.data_ptr<int64_t>(),
+            reinterpret_cast<const nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+            weights.has_value() ? weights->data_ptr<float>() : nullptr,
+            metadata[0].data_ptr<int32_t>(),
+            rank,
+            metadata[0].size(0),
+            x.size(0),
+            layout.return_offset);
     };
     const auto launch_with_weights = [&]<bool kExpand, bool kMode>() {
         if (weights.has_value())

@@ -11,21 +11,6 @@ from nano_ep import EPConfig
 
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float64, torch.float16])
-@pytest.mark.parametrize("cached", [False, True])
-def test_non_bf16_dispatch_rejected_before_stream_work(dispatch_runtime, dtype, cached):
-    r = dispatch_runtime
-    handle = None
-    if cached:
-        valid = r.tensor("valid", torch.zeros((2, 256), dtype=torch.bfloat16))
-        handle = r.buffer.dispatch(valid, topk_idx=r.indices).handle
-    r.events.clear()
-    x = r.tensor("invalid", torch.zeros((2, 256), dtype=dtype))
-    with pytest.raises(ValueError, match="bfloat16"):
-        r.buffer.dispatch(x, handle=handle, topk_idx=None if cached else r.indices)
-    assert not r.events
-
-
 @pytest.fixture
 def dispatch_runtime(monkeypatch):
     events, calls = [], []
@@ -34,6 +19,7 @@ def dispatch_runtime(monkeypatch):
     class Stream:
         def __init__(self, name):
             self.name = name
+            self.cuda_stream = {"compute": 10, "comm": 11, "consumer": 12}[name]
 
         def wait_stream(self, other):
             events.append(("wait_stream", self.name, other.name))
@@ -54,8 +40,11 @@ def dispatch_runtime(monkeypatch):
             current[0] = previous
 
     class Event:
+        def __init__(self):
+            self.cuda_event = self
+
         def record(self, stream):
-            assert current[0] is stream is comm
+            assert stream is comm
             events.append(("record_event", stream.name, self))
 
     class Tensor:
@@ -86,10 +75,8 @@ def dispatch_runtime(monkeypatch):
         return Tensor(name, torch.tensor(data, dtype=torch.int64))
 
     runtime = object()
-    main_launcher = object()
-    main_builds = []
 
-    def main(
+    def dispatch(
         actual_runtime,
         x,
         routing,
@@ -100,34 +87,63 @@ def dispatch_runtime(monkeypatch):
         cached,
         cached_expanded_capacity,
         mode,
-        launcher,
+        expand,
+        zero_padding,
+        num_sms,
+        comm_stream,
+        previous_event,
+        async_op,
     ):
-        assert launcher is main_launchers[alignment]
-        assert actual_runtime is runtime and current[0] is comm
-        assert (experts, capacity) == (6, 5)
-        events.append(("main",))
-        if settings["failure"] == "main":
-            raise RuntimeError("injected main failure")
-        if cached:
-            metadata = cached
+        assert actual_runtime is runtime and current[0] is compute
+        assert comm_stream == comm.cuda_stream
+        consumer_stream = -1 if async_op else compute.cuda_stream
+        if previous_event == -1:
+            comm.wait_stream(compute)
         else:
-            metadata = [
-                integers("expert_counts", [1, 1, 1]),
-                integers(
-                    "expert_offsets", [0, alignment, 2 * alignment, 3 * alignment]
-                ),
-                integers("dst_slots", [[0, 1], [-1, -1]]),
-                integers("send_counts", [1, 1]),
-                Tensor("snapshot", routing.payload.clone()),
-                integers("recv_rank_prefix", [1, 2]),
-            ]
-        state = SimpleNamespace(
-            metadata=metadata,
-            counts=torch.tensor(
-                [2, cached_expanded_capacity if cached else 3 * alignment]
+            if not async_op:
+                comm.wait_stream(compute)
+            comm.wait_event(previous_event)
+        assert (experts, capacity) == (6, 5)
+        events.append(("dispatch",))
+        # The native dispatch records inputs after its kernel launches, also on failure.
+        if consumer_stream == -1:
+            for tensor in (
+                x,
+                *((routing,) if not cached else ()),
+                *((weights,) if weights is not None else ()),
+                *cached,
+            ):
+                tensor.record_stream(comm)
+        if settings["failure"] == "dispatch":
+            raise RuntimeError("injected dispatch failure")
+        metadata = cached or [
+            Tensor(
+                "recv_metadata",
+                torch.tensor([[0, 0, 0, 1, -1], [1, 0, -1, -1, 2]], dtype=torch.int32),
             ),
-            metadata_prepared=bool(cached),
-            dtype=x.dtype,
+            integers("expert_counts", [1, 1, 1]),
+            integers("expert_offsets", [0, alignment, 2 * alignment, 3 * alignment]),
+            integers("dst_slots", [[0, 1], [-1, -1]]),
+            integers("send_counts", [1, 1]),
+            Tensor("snapshot", routing.payload.clone()),
+            integers("recv_rank_prefix", [1, 2]),
+        ]
+        n, expanded_capacity = 2, cached_expanded_capacity if cached else 3 * alignment
+        rows = expanded_capacity if expand else n
+        outputs = (
+            Tensor("recv_x", torch.zeros((rows, 256), dtype=x.dtype)),
+            Tensor(
+                "recv_idx",
+                torch.empty(0, dtype=torch.int64)
+                if expand
+                else metadata[0].payload[:, 2:].to(torch.int64).clone(),
+            ),
+            Tensor(
+                "recv_weights",
+                torch.zeros((rows,) if expand else (rows, 3))
+                if weights is not None
+                else torch.empty(0),
+            ),
         )
         calls.append(
             SimpleNamespace(
@@ -138,55 +154,27 @@ def dispatch_runtime(monkeypatch):
                 cached=cached,
                 cached_expanded_capacity=cached_expanded_capacity,
                 mode=mode,
-                state=state,
+                expand=expand,
+                zero_padding=zero_padding,
+                num_sms=num_sms,
+                metadata=metadata,
+                outputs=outputs,
             )
         )
-        return state
 
-    def epilogue(state, expand, weighted, zero_padding):
-        assert current[0] is comm
-        events.append(("epilogue",))
-        if settings["failure"] == "epilogue":
-            raise RuntimeError("injected epilogue failure")
-        if not state.metadata_prepared:
-            counts, offsets, dst, sends, snapshot, prefix = state.metadata
-            alignment = int(offsets.payload[1])
-            state.metadata = [
-                integers("src_ranks", [0, 1]),
-                integers("src_tokens", [0, 0]),
-                integers("local_topk", [[0, 1, -1], [-1, -1, 2]]),
-                counts,
-                offsets,
-                integers(
-                    "expanded_slots",
-                    [[0, alignment, -1], [-1, -1, 2 * alignment]] if expand else [],
-                ),
-                dst,
-                sends,
-                snapshot,
-                prefix,
-            ]
-            state.metadata_prepared = True
-        n, capacity = state.counts.tolist()
-        rows = capacity if expand else n
-        outputs = (
-            Tensor("recv_x", torch.zeros((rows, 256), dtype=state.dtype)),
-            Tensor(
-                "recv_idx",
-                torch.empty(0, dtype=torch.int64)
-                if expand
-                else state.metadata[2].payload.clone(),
-            ),
-            Tensor(
-                "recv_weights",
-                torch.zeros((rows,) if expand else (rows, 3))
-                if weighted
-                else torch.empty(0),
-            ),
-        )
-        state.outputs = outputs
-        state.epilogue_args = (expand, weighted, zero_padding)
-        return outputs
+        class Completion(Event):
+            def current_stream_wait(self):
+                current[0].wait_event(self)
+                for tensor in (*outputs, *metadata):
+                    tensor.record_stream(current[0])
+
+        completed = Completion()
+        completed.record(comm)
+        if consumer_stream != -1:
+            assert consumer_stream == compute.cuda_stream
+            compute.wait_event(completed)
+            completed = None
+        return outputs, metadata, (n, expanded_capacity), completed
 
     monkeypatch.setattr(cuda.torch.cuda, "device", lambda device: nullcontext())
     monkeypatch.setattr(
@@ -197,31 +185,14 @@ def dispatch_runtime(monkeypatch):
     buffer = cuda.CudaBuffer.__new__(cuda.CudaBuffer)
     buffer._config = EPConfig(6, 3, 256, 5)
     buffer._device = buffer._rank = 0
+    buffer._device_sms = 78
+    buffer._gpu_uuids = ("gpu-0", "gpu-1")
+    buffer._auto_num_sms = None
     buffer._closed = False
     buffer._world_size = 2
     buffer._runtime = runtime
     buffer._comm_stream = comm
-    buffer._backend = SimpleNamespace(dispatch_main=main)
-    main_launchers = {1: main_launcher}
-    buffer._dispatch_main_modules = {1: SimpleNamespace(launcher=main_launcher)}
-
-    def prepare_main(hidden, topk, ranks, experts_per_rank, capacity, alignment):
-        assert (hidden, topk, ranks, experts_per_rank, capacity) == (256, 3, 2, 3, 5)
-        assert current[0] is compute
-        main_builds.append(alignment)
-        main_launchers[alignment] = object()
-        return SimpleNamespace(launcher=main_launchers[alignment])
-
-    monkeypatch.setattr(cuda, "prepare_dispatch_main", prepare_main)
-
-    def mode_epilogue(cached_mode):
-        def bound(state, *args):
-            assert state.metadata_prepared is cached_mode
-            return epilogue(state, *args)
-
-        return bound
-
-    buffer._dispatch_epilogues = (mode_epilogue(False), mode_epilogue(True))
+    buffer._backend = SimpleNamespace(dispatch=dispatch)
     buffer._allow_multiple_reduction = False
     return SimpleNamespace(
         buffer=buffer,
@@ -233,7 +204,6 @@ def dispatch_runtime(monkeypatch):
         use_stream=use_stream,
         events=events,
         calls=calls,
-        main_builds=main_builds,
         settings=settings,
         indices=integers("indices", [[0, 1, 3], [-1, -1, -1]]),
     )
@@ -245,7 +215,7 @@ def dispatch_runtime(monkeypatch):
 @pytest.mark.parametrize("mode", [False, True])
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("explicit_event", [False, True])
-def test_fresh_dispatch_wires_state_and_streams(
+def test_fresh_dispatch_wires_metadata_and_streams(
     dispatch_runtime, layout, dtype, weighted, mode, asynchronous, explicit_event
 ):
     r = dispatch_runtime
@@ -270,10 +240,11 @@ def test_fresh_dispatch_wires_state_and_streams(
     assert call.x is x and call.routing is r.indices and call.weights is weights
     assert call.alignment == (1 if alignment is None else alignment)
     expand = layout is True
-    assert call.state.epilogue_args == (expand, weighted, True)
-    metadata = call.state.metadata
-    assert metadata[5].shape == ((2, 3) if expand else (0,))
+    assert call.expand is expand and call.zero_padding is True
+    metadata = call.metadata
+    assert metadata[0].shape == (2, 5)
     h = got.handle
+    assert call.num_sms == h.num_sms == 78
     assert h.owner is r.buffer and h.config == r.buffer._config
     assert (h.rank, h.world_size, h.x_dtype, h.do_expand, h.alignment) == (
         0,
@@ -284,50 +255,38 @@ def test_fresh_dispatch_wires_state_and_streams(
     )
     assert (h.layout.recv_count, h.layout.expanded_capacity) == (2, 3 * call.alignment)
     assert [
-        h.layout.src_ranks,
-        h.layout.src_tokens,
-        h.layout.local_topk_idx,
+        h.layout.recv_metadata,
         h.layout.expert_counts,
         h.layout.expert_offsets,
-        h.layout.expanded_slots,
         h.dst_slots,
         h.send_counts,
         h.topk_idx,
         h.layout.recv_rank_prefix,
     ] == metadata
-    assert got.x is call.state.outputs[0]
-    assert got.topk_idx is (None if expand else call.state.outputs[1])
-    assert got.topk_weights is (call.state.outputs[2] if weighted else None)
-    dependency = (
-        ("wait_event", "comm", ready)
-        if explicit_event
-        else ("wait_stream", "comm", "compute")
-    )
-    assert r.events[0] == dependency
-    assert r.events.index(("record_tensor", "x", "comm")) < r.events.index(("main",))
-    if weighted:
-        assert r.events.index(("record_tensor", "weights", "comm")) < r.events.index(
-            ("main",)
+    assert got.x is call.outputs[0]
+    assert got.topk_idx is (None if expand else call.outputs[1])
+    assert got.topk_weights is (call.outputs[2] if weighted else None)
+    if explicit_event:
+        assert ("wait_event", "comm", ready) in r.events
+    else:
+        assert ("wait_stream", "comm", "compute") in r.events
+    if asynchronous:
+        assert r.events.index(("record_tensor", "x", "comm")) > r.events.index(
+            ("dispatch",)
         )
-    assert (
-        r.events.index(("main",))
-        < r.events.index(("epilogue",))
-        < r.events.index(("record_event", "comm", got.event.event))
-    )
-    compute_wait = ("wait_event", "compute", got.event.event)
-    assert (compute_wait in r.events) is not asynchronous
-    for tensor in (*call.state.outputs, *metadata):
-        assert (
-            ("record_tensor", tensor.name, "compute") in r.events
-        ) is not asynchronous
-    assert any(item is call.state for item in got.event.keepalive)
+        assert got.event is not None
+        assert any(item is h for item in got.event.keepalive)
+        with r.use_stream(r.consumer):
+            got.event.current_stream_wait()
+        assert ("wait_event", "consumer", got.event.event) in r.events
+        for tensor in (*call.outputs, *metadata):
+            assert ("record_tensor", tensor.name, "consumer") in r.events
+    else:
+        assert got.event is None
+        assert not any(event[0] == "record_tensor" for event in r.events)
+        assert any(event[:2] == ("wait_event", "compute") for event in r.events)
     r.indices.payload.fill_(-1)
     assert h.topk_idx.payload[0].tolist() == [0, 1, 3]
-    with r.use_stream(r.consumer):
-        got.event.current_stream_wait()
-    assert ("wait_event", "consumer", got.event.event) in r.events
-    for tensor in (*call.state.outputs, *metadata):
-        assert ("record_tensor", tensor.name, "consumer") in r.events
 
 
 @pytest.mark.parametrize("expand", [False, True])
@@ -347,7 +306,7 @@ def test_cached_dispatch_reuses_handle_with_new_payload(
         alignment=4,
         async_op=True,
     )
-    old_metadata = r.calls[0].state.metadata
+    old_metadata = r.calls[0].metadata
     r.events.clear()
     new_x = r.tensor("new_x", torch.full((2, 256), 7.0, dtype=torch.bfloat16))
     new_weights = None if weighted else weights
@@ -361,49 +320,62 @@ def test_cached_dispatch_reuses_handle_with_new_payload(
         and call.x is new_x
         and call.weights is new_weights
     )
-    assert call.cached == old_metadata and call.state.metadata == old_metadata
+    assert call.cached == old_metadata and call.metadata == old_metadata
     assert call.cached_expanded_capacity == first.handle.layout.expanded_capacity
-    assert call.alignment == 4 and call.state.epilogue_args == (
-        expand,
-        not weighted,
-        False,
-    )
+    assert call.alignment == 4 and call.expand is expand and not call.zero_padding
     for tensor in old_metadata:
-        assert ("record_tensor", tensor.name, "comm") in r.events
+        assert (("record_tensor", tensor.name, "comm") in r.events) is asynchronous
+    assert r.events.count(("record_tensor", first.handle.topk_idx.name, "comm")) == int(
+        asynchronous
+    )
 
 
-@pytest.mark.parametrize("failure", ["main", "epilogue"])
-def test_native_failure_does_not_return_completion(dispatch_runtime, failure):
+def test_native_failure_does_not_return_completion(dispatch_runtime):
     r = dispatch_runtime
-    r.settings["failure"] = failure
+    r.settings["failure"] = "dispatch"
     x = r.tensor("x", torch.zeros((2, 256), dtype=torch.bfloat16))
-    with pytest.raises(RuntimeError, match=f"injected {failure} failure"):
+    with pytest.raises(RuntimeError, match="injected dispatch failure"):
         r.buffer.dispatch(x, topk_idx=r.indices)
-    assert ("record_tensor", "x", "comm") in r.events
+    assert not any(event[0] == "record_tensor" for event in r.events)
     assert not any(event[0] == "record_event" for event in r.events)
 
 
-def test_alignment_modules_reused_by_fresh_and_cached_calls(dispatch_runtime):
+def test_dispatch_sms_auto_is_cached_and_handle_retains_budget(
+    dispatch_runtime, monkeypatch
+):
+    r = dispatch_runtime
+    probes = []
+
+    def bandwidth(gpus):
+        probes.append(gpus)
+        return 400.0
+
+    monkeypatch.setattr(cuda, "nvlink_gbs", bandwidth)
+    x = r.tensor("x", torch.zeros((2, 256), dtype=torch.bfloat16))
+    first = r.buffer.dispatch(x, topk_idx=r.indices, num_sms=0)
+    assert first.handle.num_sms == 24
+    assert r.buffer.dispatch(x, handle=first.handle).handle is first.handle
+    r.buffer.dispatch(x, handle=first.handle, num_sms=17)
+    r.buffer.dispatch(x, topk_idx=r.indices, num_sms=0)
+    assert [call.num_sms for call in r.calls] == [24, 24, 17, 24]
+    assert first.handle.num_sms == 24 and probes == [("gpu-0", "gpu-1")]
+
+
+@pytest.mark.parametrize("num_sms", [-1, 79, True, 4.0])
+def test_dispatch_rejects_invalid_sms_before_stream_work(dispatch_runtime, num_sms):
+    r = dispatch_runtime
+    x = r.tensor("x", torch.zeros((2, 256), dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="num_sms"):
+        r.buffer.dispatch(x, topk_idx=r.indices, num_sms=num_sms)
+    assert not r.events and not r.calls
+
+
+def test_alignment_is_forwarded_by_fresh_and_cached_calls(dispatch_runtime):
     r = dispatch_runtime
     x = r.tensor("x", torch.ones((2, 256), dtype=torch.bfloat16))
     first = r.buffer.dispatch(x, topk_idx=r.indices, alignment=3)
     r.buffer.dispatch(x, topk_idx=r.indices, alignment=16)
     r.buffer.dispatch(x, topk_idx=r.indices, alignment=3)
     replay = r.buffer.dispatch(x, handle=first.handle)
-    assert r.main_builds == [3, 16]
     assert [call.alignment for call in r.calls] == [3, 16, 3, 3]
     assert replay.handle is first.handle
-
-
-def test_alignment_build_failure_precedes_stream_work(dispatch_runtime, monkeypatch):
-    r = dispatch_runtime
-    x = r.tensor("x", torch.ones((2, 256), dtype=torch.bfloat16))
-
-    def fail(*args):
-        raise RuntimeError("alignment build failed")
-
-    monkeypatch.setattr(cuda, "prepare_dispatch_main", fail)
-    with pytest.raises(RuntimeError, match="alignment build failed"):
-        r.buffer.dispatch(x, topk_idx=r.indices, alignment=3)
-    assert not r.events
-    assert set(r.buffer._dispatch_main_modules) == {1}

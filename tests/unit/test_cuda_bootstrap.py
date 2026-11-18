@@ -1,8 +1,8 @@
 """Two CPU participants exercise bootstrap control flow with simulated Gloo/CUDA."""
 
-from concurrent.futures import ThreadPoolExecutor
 import pickle
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -65,7 +65,7 @@ def bootstrap(monkeypatch):
     def properties(device):
         operation("properties")
         uuid = 0 if settings["metadata"] == "duplicate_gpu" else device
-        return SimpleNamespace(uuid=f"gpu-{uuid}")
+        return SimpleNamespace(uuid=f"gpu-{uuid}", multi_processor_count=78)
 
     monkeypatch.setattr(cuda.torch.cuda, "get_device_properties", properties)
     monkeypatch.setattr(
@@ -127,12 +127,6 @@ def bootstrap(monkeypatch):
         assert allow_multiple_reduction is settings["allow_multiple_reduction"]
         return [0, 96, 160, 160, 9888]
 
-    def dispatch_epilogue(*args):
-        raise AssertionError("bootstrap must not execute dispatch epilogue")
-
-    def combine_epilogue(*args):
-        raise AssertionError("bootstrap must not execute combine epilogue")
-
     native = SimpleNamespace(
         PeerRuntime=Runtime,
         window_layout=window_layout,
@@ -149,40 +143,6 @@ def bootstrap(monkeypatch):
 
     monkeypatch.setattr(cuda, "load_extension", load)
 
-    def prepare(hidden, topk, ranks, experts_per_rank, capacity):
-        operation("specialization")
-        assert (hidden, topk, ranks, experts_per_rank, capacity) == (256, 2, 2, 2, 8)
-        return SimpleNamespace(combine_epilogue=combine_epilogue)
-
-    def prepare_dispatch(hidden, topk, experts_per_rank, *, cached_mode):
-        operation(
-            "dispatch_cached_specialization"
-            if cached_mode
-            else "dispatch_specialization"
-        )
-        assert (hidden, topk, experts_per_rank) == (256, 2, 2)
-        return SimpleNamespace(dispatch_epilogue=dispatch_epilogue)
-
-    monkeypatch.setattr(cuda, "prepare_dispatch_epilogue", prepare_dispatch)
-
-    monkeypatch.setattr(cuda, "prepare_combine_epilogue", prepare)
-
-    def prepare_main(hidden, topk, ranks, experts_per_rank, capacity):
-        operation("main_specialization")
-        assert (hidden, topk, ranks, experts_per_rank, capacity) == (256, 2, 2, 2, 8)
-        return SimpleNamespace(launcher="main-launcher")
-
-    monkeypatch.setattr(cuda, "prepare_combine_main", prepare_main)
-
-    def prepare_dispatch_main(
-        hidden, topk, ranks, experts_per_rank, capacity, alignment
-    ):
-        operation("dispatch_main_specialization")
-        assert alignment == 1
-        assert (hidden, topk, ranks, experts_per_rank, capacity) == (256, 2, 2, 2, 8)
-        return SimpleNamespace(launcher="dispatch-main-launcher")
-
-    monkeypatch.setattr(cuda, "prepare_dispatch_main", prepare_dispatch_main)
     monkeypatch.setattr(cuda.torch.cuda, "Stream", stream)
     monkeypatch.setattr(
         cuda.torch.cuda,
@@ -208,16 +168,6 @@ def bootstrap(monkeypatch):
                     group,
                     EPConfig(experts, 2, settings["hidden"], 8),
                     allow_multiple_reduction=mode,
-                )
-                assert buffer._dispatch_epilogues == (
-                    dispatch_epilogue,
-                    dispatch_epilogue,
-                )
-                assert buffer._combine_epilogue is combine_epilogue
-                assert buffer._combine_main_module.launcher == "main-launcher"
-                assert (
-                    buffer._dispatch_main_modules[1].launcher
-                    == "dispatch-main-launcher"
                 )
                 if close:
                     buffer.close()
@@ -262,15 +212,6 @@ def test_bootstrap_and_collective_close(bootstrap, allow_multiple_reduction):
         operations = [
             name for name, actual_rank in bootstrap.events if actual_rank == rank
         ]
-        assert operations.index("dispatch_specialization") < operations.index(
-            "allocate"
-        )
-        assert operations.index("dispatch_cached_specialization") < operations.index(
-            "allocate"
-        )
-        assert operations.index("dispatch_main_specialization") < operations.index(
-            "allocate"
-        )
         assert (
             operations.index("initialize")
             < operations.index("window_ready")
@@ -284,11 +225,6 @@ def test_bootstrap_and_collective_close(bootstrap, allow_multiple_reduction):
         "properties",
         "extension",
         "layout",
-        "specialization",
-        "main_specialization",
-        "dispatch_main_specialization",
-        "dispatch_specialization",
-        "dispatch_cached_specialization",
         "allocate",
         "initialize",
         "window_ready",
@@ -307,11 +243,6 @@ def test_one_rank_failure_reaches_both_ranks(bootstrap, failure):
     if failure in (
         "extension",
         "layout",
-        "specialization",
-        "main_specialization",
-        "dispatch_main_specialization",
-        "dispatch_specialization",
-        "dispatch_cached_specialization",
         "allocate",
         "initialize",
         "window_ready",

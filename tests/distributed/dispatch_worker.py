@@ -25,19 +25,14 @@ def check_output(got, case, rank, alignment, weights, zero_padding):
     assert (got.topk_idx is None) is handle.do_expand
     assert (got.topk_weights is None) is (weights is None)
     metadata = [
-        layout.src_ranks,
-        layout.src_tokens,
-        layout.local_topk_idx,
+        layout.recv_metadata,
         layout.expert_counts,
         layout.expert_offsets,
-        layout.expanded_slots,
         handle.dst_slots,
         handle.send_counts,
         handle.topk_idx,
         layout.recv_rank_prefix,
     ]
-    # The shared checker uses device and receive mappings; it never reads raw staging here.
-    state = SimpleNamespace(stage_buffer=got.x, metadata=metadata)
     outputs = (
         got.x,
         got.topk_idx
@@ -48,7 +43,7 @@ def check_output(got, case, rank, alignment, weights, zero_padding):
         else got.x.new_empty((0,), dtype=torch.float32),
     )
     assert_dispatch_output(
-        state,
+        metadata,
         outputs,
         case,
         rank,
@@ -83,15 +78,17 @@ def make_payloads(size, kind, dtype, hidden):
 
 
 def check_rounds(buffer, rank, size):
-    dispatch_epilogues = buffer._dispatch_epilogues
+    backend = buffer._backend
     delay = [False]
 
-    def epilogue(*args):
+    def delayed_dispatch(*args):
         if delay[0]:
             torch.cuda._sleep(20_000_000)
-        return dispatch_epilogues[args[0].metadata_prepared](*args)
+        return backend.dispatch(*args)
 
-    buffer._dispatch_epilogues = (epilogue, epilogue)
+    buffer._backend = SimpleNamespace(
+        dispatch=delayed_dispatch, combine=backend.combine
+    )
     for expand, dtype, weighted, asynchronous, kind in product(
         (False, True),
         (torch.bfloat16,),

@@ -1,18 +1,15 @@
 """Run shared-arena ownership checks on 2/4/8 independently scheduled GPUs."""
 
 import os
-from pathlib import Path
 import subprocess
 import sys
+from itertools import product
+from pathlib import Path
 
 import pytest
 import torch
 
-from nano_ep.backends._build import (
-    load_extension,
-    prepare_dispatch_epilogue,
-    prepare_dispatch_main,
-)
+from nano_ep.backends._build import load_extension
 from nano_ep.testing.launcher import run_logged
 
 pytestmark = [pytest.mark.distributed]
@@ -28,14 +25,13 @@ def test_shared_arena_lifecycle(request):
         pytest.fail("shared arena acceptance requires nproc 2/4/8 and that many GPUs")
     from peer_worker import build_probe
 
-    load_extension()
-    for cached_mode in (False, True):
-        prepare_dispatch_epilogue(256, 3, 8, cached_mode=cached_mode)
-    for cached_mode in (False, True):
-        prepare_dispatch_epilogue(256, 8, 8, cached_mode=cached_mode)
-    for topk in (3, 8):
-        for expert_alignment in (1, 16):
-            prepare_dispatch_main(256, topk, nproc, 8, 11, expert_alignment)
+    native = load_extension()
+    for topk, expand, weighted in product((3, 8), (False, True), (False, True)):
+        geometry = (256, topk, nproc, 8, 11)
+        for cached in (False, True):
+            native.prepare_dispatch(*geometry, 16, cached, expand, weighted, expand)
+        for multiple in (False, True):
+            native.prepare_combine(*geometry, expand, multiple, weighted)
     probe = build_probe()
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()

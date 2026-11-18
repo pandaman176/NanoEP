@@ -92,6 +92,7 @@ def check_kernel(
     *,
     expected_first_recv_count=None,
     packet_check=None,
+    num_sms=0,
 ):
     ranks = len(case.indices)
     probe = probe(case.hidden, case.topk, ranks, case.capacity)
@@ -107,7 +108,7 @@ def check_kernel(
         for owner in range(ranks):
             x, weights, metadata = expert_inputs(case, owner, expand)
             if owner == 0 and expected_first_recv_count is not None:
-                assert metadata[0].numel() == expected_first_recv_count
+                assert metadata[0].size(0) == expected_first_recv_count
             device_x, device_weights = x.cuda(), weights.cuda()
             device_metadata = [tensor.cuda() for tensor in metadata]
             probe.run(
@@ -119,6 +120,7 @@ def check_kernel(
                 case.capacity,
                 expand,
                 mode,
+                num_sms,
             )
             torch.testing.assert_close(
                 device_x.cpu(), x, rtol=0, atol=0, equal_nan=True
@@ -221,10 +223,9 @@ def test_expanded_single_assignment_preserves_payload_bits(
 def test_return_kernel_across_sm_grid_iterations(
     probe, ranks, topk, expand, mode, weighted, boundary
 ):
-    sms = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
-    wave = sms * 8
+    sms = 2
+    # At H=256 the TMA staging plan fits 32 warps per CTA.
+    wave = sms * 32
     receive_count = {
         "sm": sms + 1,
         "wave_minus_one": wave - 1,
@@ -263,5 +264,30 @@ def test_return_kernel_across_sm_grid_iterations(
         case.weights[source][routing < 0] = float("nan")
 
     check_kernel(
-        probe, case, expand, mode, weighted, expected_first_recv_count=receive_count
+        probe,
+        case,
+        expand,
+        mode,
+        weighted,
+        expected_first_recv_count=receive_count,
+        num_sms=sms,
+    )
+
+
+def test_expanded_return_reuses_warp_staging_for_large_hidden(probe):
+    # H=4096 gives 28 staged warps per CTA, so 60 rows span three waves.
+    ranks, topk, hidden, tokens = 4, 8, 4096, 15
+    case = make_return_case(ranks, topk, hidden, torch.bfloat16, tokens=tokens)
+    for source, routing in enumerate(case.indices):
+        valid = torch.arange(topk) <= (torch.arange(tokens)[:, None] + source) % topk
+        routing.copy_(torch.arange(topk).expand_as(routing).masked_fill(~valid, -1))
+
+    check_kernel(
+        probe,
+        case,
+        expand=True,
+        mode=False,
+        weighted=False,
+        expected_first_recv_count=ranks * tokens,
+        num_sms=1,
     )

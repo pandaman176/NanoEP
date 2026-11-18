@@ -2,14 +2,12 @@
 
 import torch
 
-from nano_ep.backends._build import prepare_dispatch_epilogue
-
 from nano_ep.testing.wire import dispatch_offsets, dispatch_row_bytes
 
 from .oracle import reference_dispatch, reference_layout, reference_plan
 
 
-def assert_dispatch_output(state, outputs, case, rank, alignment, weights, *, expand, zero_padding):
+def assert_dispatch_output(metadata, outputs, case, rank, alignment, weights, *, expand, zero_padding):
     """Compare actual copy outputs by source identity and assignment, not arrival order.
 
     Expanded slot order may differ inside each expert segment. Only valid slots
@@ -20,12 +18,27 @@ def assert_dispatch_output(state, outputs, case, rank, alignment, weights, *, ex
     x, indices, out_weights = outputs
     rows = expected.layout.expanded_capacity if expand else expected.layout.recv_count
     assert x.shape == (rows, case.hidden) and x.dtype == case.xs[rank].dtype
-    assert x.device == state.stage_buffer.device and x.is_contiguous()
+    assert x.device == metadata[0].device and x.is_contiguous()
     assert indices.device == out_weights.device == x.device
     assert indices.dtype == torch.int64 and out_weights.dtype == torch.float32
     assert indices.is_contiguous() and out_weights.is_contiguous()
     actual_x, actual_indices, actual_weights = (tensor.cpu() for tensor in outputs)
-    sources, tokens, local = (tensor.cpu() for tensor in state.metadata[:3])
+    recv = metadata[0].cpu().long()
+    assert recv.shape == (expected.layout.recv_count, case.num_topk + 2)
+    sources, tokens = recv[:, 0], recv[:, 1]
+    local = (
+        recv[:, 2:]
+        if not expand
+        else torch.stack([case.indices[src][tok] for src, tok in zip(sources.tolist(), tokens.tolist())])
+        if len(sources)
+        else torch.empty((0, case.num_topk), dtype=torch.int64)
+    )
+    if expand:
+        local = torch.where(
+            (local >= rank * (case.num_experts // len(case.xs))) & (local < (rank + 1) * (case.num_experts // len(case.xs))),
+            local - rank * (case.num_experts // len(case.xs)),
+            -1,
+        )
     keys = list(zip(sources.tolist(), tokens.tolist(), strict=True))
     order = torch.tensor(sorted(range(len(keys)), key=keys.__getitem__), dtype=torch.int64)
     layout = expected.layout
@@ -35,8 +48,8 @@ def assert_dispatch_output(state, outputs, case, rank, alignment, weights, *, ex
 
     if expand:
         assert actual_indices.shape == (0,)
-        assert state.metadata[5].shape == (layout.recv_count, case.num_topk)
-        slots = state.metadata[5].cpu()[order]
+        assert metadata[0].shape == (layout.recv_count, case.num_topk + 2)
+        slots = recv[:, 2:][order]
         valid = layout.local_topk_idx >= 0
         assert (slots[~valid] == -1).all()
         for expert, count in enumerate(layout.expert_counts.tolist()):
@@ -54,7 +67,6 @@ def assert_dispatch_output(state, outputs, case, rank, alignment, weights, *, ex
             if weights is not None:
                 torch.testing.assert_close(actual_weights[padding], torch.zeros_like(actual_weights[padding]), rtol=0, atol=0)
     else:
-        assert state.metadata[5].shape == (0,)
         torch.testing.assert_close(actual_x[order], expected.x, rtol=0, atol=0, equal_nan=True)
         torch.testing.assert_close(actual_indices, local)
         if weights is not None:
@@ -64,16 +76,7 @@ def assert_dispatch_output(state, outputs, case, rank, alignment, weights, *, ex
         assert actual_weights.shape == (0,)
 
 
-def prepare_dispatch_metadata(state):
-    """Prepare compact receive metadata with empty expanded slots."""
-    experts = state.metadata[3 if state.metadata_prepared else 0].numel()
-    topk = state.metadata[8 if state.metadata_prepared else 4].shape[1]
-    epilogue = prepare_dispatch_epilogue(state.hidden, topk, experts, cached_mode=state.metadata_prepared).dispatch_epilogue
-    epilogue(state, False, False, False)
-    assert state.metadata_prepared
-
-
-def assert_dispatch_state(state, case, rank, alignment, weights, *, expand):
+def assert_dispatch_wire(stage_buffer, metadata, host_counts, case, rank, alignment, weights, *, expand):
     expected = reference_layout(case.indices, rank, case.num_experts, alignment)
     world_size = len(case.xs)
     local_experts = case.num_experts // world_size
@@ -81,17 +84,25 @@ def assert_dispatch_state(state, case, rank, alignment, weights, *, expand):
     dtype = case.xs[rank].dtype
     payload_bytes = case.xs[rank].element_size() * case.hidden
     row_bytes = dispatch_row_bytes(case.hidden, topk)
-    assert state.metadata_prepared and state.rank == rank
-    assert state.hidden == case.hidden and state.x_dtype == case.xs[rank].dtype
-    assert state.counts.device.type == "cpu" and state.counts.dtype == torch.int64
-    assert state.counts.tolist() == [rows, expected.expanded_capacity]
-    assert state.stage_buffer.dtype == torch.uint8
-    assert state.stage_buffer.shape == (world_size * case.capacity, row_bytes)
-    assert len(state.metadata) == 10
-    for tensor in state.metadata:
-        assert tensor.device == state.stage_buffer.device and tensor.dtype == torch.int64
+    assert list(host_counts) == [rows, expected.expanded_capacity]
+    assert stage_buffer.dtype == torch.uint8
+    assert stage_buffer.shape == (world_size * case.capacity, row_bytes)
+    assert len(metadata) == 7
+    for i, tensor in enumerate(metadata):
+        assert tensor.device == stage_buffer.device and tensor.dtype == (torch.int32 if i == 0 else torch.int64)
         assert tensor.is_contiguous()
-    src_ranks, src_tokens, local, counts, offsets, slots, dst_slots, sends, snapshot, prefix = [t.cpu() for t in state.metadata]
+    recv, counts, offsets, dst_slots, sends, snapshot, prefix = [t.cpu() for t in metadata]
+    recv = recv.long()
+    src_ranks, src_tokens = recv[:, 0], recv[:, 1]
+    local = (
+        torch.stack([case.indices[src][tok] for src, tok in zip(src_ranks.tolist(), src_tokens.tolist())])
+        if rows
+        else torch.empty((0, topk), dtype=torch.int64)
+    )
+    local = torch.where((local >= rank * local_experts) & (local < (rank + 1) * local_experts), local - rank * local_experts, -1)
+    slots = recv[:, 2:] if expand else torch.empty(0, dtype=torch.int64)
+    if not expand:
+        torch.testing.assert_close(recv[:, 2:], local)
     expected_prefix = torch.bincount(expected.src_ranks, minlength=world_size).cumsum(0)
     torch.testing.assert_close(prefix, expected_prefix)
     assert src_ranks.shape == src_tokens.shape == (rows,)
@@ -120,7 +131,7 @@ def assert_dispatch_state(state, case, rank, alignment, weights, *, expand):
             if destination == rank and destination in destinations:
                 start = int(prefix[rank - 1]) if rank else 0
                 assert keys[start + slot - rank * case.capacity] == (rank, token)
-    payload = state.stage_buffer.cpu()
+    payload = stage_buffer.cpu()
     for row, (source, token) in enumerate(keys):
         start = int(prefix[source - 1]) if source else 0
         record = payload[source * case.capacity + row - start]

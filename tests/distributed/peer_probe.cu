@@ -70,6 +70,7 @@ __global__ void probe_finalize_receive_counts_kernel(const int64_t* incoming,
                                                      int64_t* rank_prefix,
                                                      int64_t* expert_counts,
                                                      int64_t* expert_offsets,
+                                                     int64_t* expert_cursor,
                                                      int64_t* totals) {
     constexpr int threads = 128;
     constexpr int num_counts = kWorldSize + kWorldSize * kExpertsPerRank;
@@ -77,7 +78,7 @@ __global__ void probe_finalize_receive_counts_kernel(const int64_t* incoming,
     for (int i = threadIdx.x; i < num_counts; i += threads)
         counts[i] = static_cast<uint32_t>(incoming[i]);
     nano_ep::notify_group_barrier<threads>();
-    nano_ep::finalize_receive_counts<kWorldSize, kExpertsPerRank, kExpertAlignment>(counts, rank_prefix, expert_counts, expert_offsets, totals);
+    nano_ep::finalize_receive_counts<kWorldSize, kExpertsPerRank, kExpertAlignment>(counts, rank_prefix, expert_counts, expert_offsets, expert_cursor, totals);
 }
 
 template <int kWorldSize, typename Launch>
@@ -112,6 +113,7 @@ std::vector<torch::Tensor> run_finalize_receive_counts(const torch::Tensor& inco
     auto rank_prefix = torch::full({ranks}, -777, incoming.options());
     auto expert_counts = torch::full({experts}, -777, incoming.options());
     auto expert_offsets = torch::full({experts + 1}, -777, incoming.options());
+    auto expert_cursor = torch::full({experts}, -777, incoming.options());
     // Numerical probes retain totals on-device; runtime uses mapped host storage.
     auto totals = torch::full({2}, -777, incoming.options());
     const auto select_alignment = [&]<int64_t kExpertAlignment>() {
@@ -121,6 +123,7 @@ std::vector<torch::Tensor> run_finalize_receive_counts(const torch::Tensor& inco
                                                                             rank_prefix.data_ptr<int64_t>(),
                                                                             expert_counts.data_ptr<int64_t>(),
                                                                             expert_offsets.data_ptr<int64_t>(),
+                                                                            expert_cursor.data_ptr<int64_t>(),
                                                                             totals.data_ptr<int64_t>());
         };
         switch (ranks) {
@@ -157,13 +160,15 @@ std::vector<torch::Tensor> run_finalize_receive_counts(const torch::Tensor& inco
             TORCH_CHECK(false, "unsupported test alignment");
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return {rank_prefix, expert_counts, expert_offsets, totals};
+    return {rank_prefix, expert_counts, expert_offsets, totals, expert_cursor};
 }
 
 template <int kHidden, int kTopk, int kWorldSize, int kExpertsPerRank, bool kReuseSlots>
-__global__ void probe_payload_kernel(const int64_t* addresses,
-                                     const at::BFloat16* x,
+__global__ void __launch_bounds__(nano_ep::kDispatchPayloadPlan<kHidden, kTopk, kWorldSize, kExpertsPerRank, 0>.total_warps * 32, 1)
+probe_payload_kernel(const int64_t* addresses,
+                                     const nv_bfloat16* x,
                                      const int64_t* indices,
+                                     int64_t* topk_snapshot,
                                      const float* weights,
                                      int64_t* slots,
                                      int rank,
@@ -173,7 +178,7 @@ __global__ void probe_payload_kernel(const int64_t* addresses,
                                      int64_t payload_offset,
                                      int64_t row_bytes) {
     nano_ep::dispatch_payload_rows<kHidden, kTopk, kWorldSize, kExpertsPerRank, kReuseSlots, 0>(
-        addresses, x, indices, weights, slots, rank, tokens, capacity, send_next_offset, payload_offset, row_bytes);
+        addresses, x, indices, topk_snapshot, weights, slots, rank, tokens, capacity, send_next_offset, payload_offset, row_bytes);
 }
 
 // Exercise the production payload device helper with caller-owned slots.
@@ -181,6 +186,7 @@ __global__ void probe_payload_kernel(const int64_t* addresses,
 void run_dispatch_payload(const torch::Tensor& addresses,
                           const torch::Tensor& x,
                           const torch::Tensor& indices,
+                          const torch::Tensor& topk_snapshot,
                           const c10::optional<torch::Tensor>& weights,
                           const torch::Tensor& slots,
                           int rank,
@@ -192,23 +198,25 @@ void run_dispatch_payload(const torch::Tensor& addresses,
     const auto layout = nano_ep::WindowLayout::make(world_size, max_tokens, x.size(1), indices.size(1), num_experts);
     if (x.size(0) == 0)
         return;
-    constexpr int threads = 256;
     const int blocks = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
     const auto stream = c10::cuda::getCurrentCUDAStream().stream();
     const auto geometry = [&]<int kHidden, int kTopk, int kWorldSize, int kExpertsPerRank>() {
         const auto launch = [&]<bool kReuseSlots>() {
-            probe_payload_kernel<kHidden, kTopk, kWorldSize, kExpertsPerRank, kReuseSlots>
-                <<<blocks, threads, 0, stream>>>(addresses.data_ptr<int64_t>(),
-                                                 x.data_ptr<at::BFloat16>(),
-                                                 indices.data_ptr<int64_t>(),
-                                                 weights.has_value() ? weights->data_ptr<float>() : nullptr,
-                                                 slots.data_ptr<int64_t>(),
-                                                 rank,
-                                                 x.size(0),
-                                                 max_tokens,
-                                                 layout.send_next_offset,
-                                                 layout.payload_offset,
-                                                 nano_ep::WindowLayout::payload_row_bytes(x.size(1), indices.size(1)));
+            constexpr auto plan = nano_ep::kDispatchPayloadPlan<kHidden, kTopk, kWorldSize, kExpertsPerRank, 0>;
+            const auto kernel = probe_payload_kernel<kHidden, kTopk, kWorldSize, kExpertsPerRank, kReuseSlots>;
+            C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(plan.num_bytes)));
+            kernel<<<blocks, plan.total_warps * 32, plan.num_bytes, stream>>>(addresses.data_ptr<int64_t>(),
+                                                                            reinterpret_cast<const nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                                                                            indices.data_ptr<int64_t>(),
+                                                                            kReuseSlots ? nullptr : topk_snapshot.data_ptr<int64_t>(),
+                                                                            weights.has_value() ? weights->data_ptr<float>() : nullptr,
+                                                                            slots.data_ptr<int64_t>(),
+                                                                            rank,
+                                                                            x.size(0),
+                                                                            max_tokens,
+                                                                            layout.send_next_offset,
+                                                                            layout.payload_offset,
+                                                                            nano_ep::WindowLayout::payload_row_bytes(x.size(1), indices.size(1)));
         };
         if (reuse_slots)
             launch.template operator()<true>();
@@ -279,14 +287,6 @@ void wait_for_arrival(const torch::Tensor& window, int peer, int64_t epoch) {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
-    module.def("make_dispatch_state", [](const torch::Tensor& stage,
-                                          const std::vector<torch::Tensor>& metadata,
-                                          const torch::Tensor& counts,
-                                          int64_t hidden,
-                                          int64_t rank,
-                                          bool prepared) {
-        return nano_ep::DispatchState{metadata, counts, stage, hidden, torch::kBFloat16, rank, prepared};
-    });
     module.def("run_finalize_receive_counts", &run_finalize_receive_counts);
     module.def("run_notify_peer_counts", &run_notify_peer_counts);
     module.def("run_dispatch_payload", &run_dispatch_payload);

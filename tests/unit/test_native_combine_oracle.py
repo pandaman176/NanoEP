@@ -26,8 +26,10 @@ def materialize_packets(case, expand, mode, weighted):
     ]
     for owner in range(ranks):
         x, weights, metadata = expert_inputs(case, owner, expand)
-        sources, tokens, local, _, _, slots, *_ = metadata
-        assert slots.shape == ((len(sources), case.topk) if expand else (0,))
+        recv = metadata[0].long()
+        sources, tokens, mapping = recv[:, 0], recv[:, 1], recv[:, 2:]
+        local = mapping
+        slots = mapping
         for row, (source, token) in enumerate(
             zip(sources.tolist(), tokens.tolist(), strict=True)
         ):

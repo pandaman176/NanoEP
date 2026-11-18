@@ -139,11 +139,13 @@ def test_dispatch_payload(native, payload_probe, dtype, weighted, tokens):
                 else None
             )
             runtime.barrier(stream.cuda_stream)
-            slots = torch.full((tokens, 1), -1, device="cuda", dtype=torch.int64)
+            slots = torch.full((tokens, 1), 0x5A5A, device="cuda", dtype=torch.int64)
+            snapshot = torch.full_like(indices, 0x5A5A)
             payload_probe.run_dispatch_payload(
                 runtime.peer_addresses(),
                 x,
                 indices,
+                snapshot,
                 weights,
                 slots,
                 0,
@@ -154,6 +156,7 @@ def test_dispatch_payload(native, payload_probe, dtype, weighted, tokens):
             runtime.barrier(stream.cuda_stream)
             # Read on the producer stream; no default-stream ordering is assumed.
             slots_cpu, indices_cpu, x_cpu = slots.cpu(), indices.cpu(), x.cpu()
+            torch.testing.assert_close(snapshot.cpu(), indices_cpu, rtol=0, atol=0)
             weights_cpu = weights.cpu() if weighted else None
             received = window.cpu()
 
@@ -265,12 +268,14 @@ def test_cached_payload_preserves_mapping_and_counter(
                 old_slots, old_counter = slots, send_next.item()
                 if not cached:
                     slots = torch.full(
-                        (tokens, 1), -1, device="cuda", dtype=torch.int64
+                        (tokens, 1), 0x5A5A, device="cuda", dtype=torch.int64
                     )
+                snapshot = torch.full_like(indices, 0x5A5A)
                 payload_probe.run_dispatch_payload(
                     runtime.peer_addresses(),
                     x,
                     indices,
+                    snapshot,
                     weights,
                     slots,
                     0,
@@ -283,6 +288,12 @@ def test_cached_payload_preserves_mapping_and_counter(
                     slots.cpu(),
                     window.cpu(),
                     indices.cpu(),
+                )
+                torch.testing.assert_close(
+                    snapshot.cpu(),
+                    torch.full_like(indices_cpu, 0x5A5A) if cached else indices_cpu,
+                    rtol=0,
+                    atol=0,
                 )
                 x_cpu = x.cpu()
                 expected_count = int((indices_cpu >= 0).any(dim=1).sum())
@@ -400,17 +411,25 @@ def test_source_partitioned_payload(
             windows[rank][send_next_offset : send_next_offset + ranks * 8].view(
                 torch.int64
             ).zero_()
-            slots_gpu.fill_(-1)
+            slots_gpu.fill_(0x5A5A)
+        snapshot = torch.full_like(indices_gpu, 0x5A5A)
         payload_probe.run_dispatch_payload(
             addresses,
             x.cuda(),
             indices_gpu,
+            snapshot,
             weights.cuda() if weighted else None,
             slots_gpu,
             rank,
             experts,
             capacity,
             cached,
+        )
+        torch.testing.assert_close(
+            snapshot.cpu(),
+            torch.full_like(indices, 0x5A5A) if cached else indices,
+            rtol=0,
+            atol=0,
         )
         actual_slots = slots_gpu.cpu()
         if cached:
@@ -423,9 +442,10 @@ def test_source_partitioned_payload(
                     published[published >= 0].sort().values,
                     rank * capacity + torch.arange(used[destination]),
                 )
-        expected = []
+        expected, comparable = [], []
         for destination, window in enumerate(windows):
             packet = torch.full((layout[-1],), 0xA5, dtype=torch.uint8)
+            mask = torch.ones(layout[-1], dtype=torch.bool)
             packet[send_next_offset : send_next_offset + ranks * 8].view(
                 torch.int64
             ).fill_(1)
@@ -438,6 +458,18 @@ def test_source_partitioned_payload(
                 if slot < 0:
                     continue
                 start = layout[2] + slot * row_bytes
+                # A row travels as one block, so its alignment gaps and an absent
+                # optional weight field carry staging bytes instead of a sentinel.
+                for gap_start, gap_end in (
+                    (16, topk_offset),
+                    (topk_offset + topk * 8, weight_offset),
+                    (weight_offset + topk * 4, x_offset),
+                ):
+                    mask[start + gap_start : start + gap_end] = False
+                if not weighted:
+                    mask[start + weight_offset : start + weight_offset + topk * 4] = (
+                        False
+                    )
                 row = packet[start : start + row_bytes]
                 row[:16].view(torch.int64).copy_(torch.tensor([rank, token]))
                 row[topk_offset : topk_offset + topk * 8].view(torch.int64).copy_(
@@ -451,5 +483,6 @@ def test_source_partitioned_payload(
                         torch.float32
                     ).copy_(weights[token])
             expected.append(packet)
-        for window, packet in zip(windows, expected, strict=True):
-            torch.testing.assert_close(window.cpu(), packet, rtol=0, atol=0)
+            comparable.append(mask)
+        for window, packet, mask in zip(windows, expected, comparable, strict=True):
+            torch.testing.assert_close(window.cpu()[mask], packet[mask], rtol=0, atol=0)

@@ -3,12 +3,13 @@
 import os
 import subprocess
 import sys
+from itertools import product
 from pathlib import Path
 
 import pytest
 import torch
 
-from nano_ep.backends._build import load_extension, prepare_combine_main
+from nano_ep.backends._build import load_extension
 from nano_ep.testing.launcher import run_logged
 
 pytestmark = [pytest.mark.distributed]
@@ -24,9 +25,10 @@ def test_cooperative_combine_barriers(request):
         pytest.fail("cooperative combine acceptance requires 2/4/8 visible GPUs")
     from peer_worker import build_probe
 
-    load_extension()
+    native = load_extension()
     probe = build_probe()
-    prepare_combine_main(256, 3, nproc, 3, 2153)
+    for expand, multiple, weighted in product((False, True), repeat=3):
+        native.prepare_combine(256, 3, nproc, 3, 2153, expand, multiple, weighted)
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["NANO_EP_PEER_PROBE_PATH"] = probe.__file__

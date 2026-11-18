@@ -92,13 +92,11 @@ def expert_inputs(case, rank, expand, *, alignment=4):
             if source == rank:
                 dst_slots[token, destination] = rank * case.capacity + local_slot
                 local_slot += 1
+    recv_metadata = torch.cat((sources[:, None], tokens[:, None], slots if expand else local), dim=1).to(torch.int32)
     metadata = [
-        sources,
-        tokens,
-        local,
+        recv_metadata,
         layout.expert_counts,
         layout.expert_offsets,
-        slots if expand else torch.empty(0, dtype=torch.int64),
         dst_slots,
         reference_plan(case.indices[rank], case.num_experts, ranks).send_counts,
         case.indices[rank].clone(),

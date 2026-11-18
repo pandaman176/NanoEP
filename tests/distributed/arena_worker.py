@@ -4,6 +4,7 @@ import os
 from dataclasses import replace
 from datetime import timedelta
 from itertools import product
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -55,11 +56,12 @@ def check_dispatch(got, case, rank, expand, weighted):
         alignment=16,
     )[rank]
     layout, ref = got.handle.layout, expected.layout
-    order = (layout.src_ranks * case.capacity + layout.src_tokens).argsort()
-    for name in ("src_ranks", "src_tokens", "local_topk_idx"):
-        torch.testing.assert_close(
-            getattr(layout, name)[order].cpu(), getattr(ref, name)
-        )
+    metadata = layout.recv_metadata
+    order = (metadata[:, 0] * case.capacity + metadata[:, 1]).argsort()
+    torch.testing.assert_close(metadata[order, 0].cpu().long(), ref.src_ranks)
+    torch.testing.assert_close(metadata[order, 1].cpu().long(), ref.src_tokens)
+    if not expand:
+        torch.testing.assert_close(metadata[order, 2:].cpu().long(), ref.local_topk_idx)
     for name in ("expert_counts", "expert_offsets"):
         torch.testing.assert_close(getattr(layout, name).cpu(), getattr(ref, name))
     assert (layout.recv_count, layout.expanded_capacity) == (
@@ -67,7 +69,7 @@ def check_dispatch(got, case, rank, expand, weighted):
         ref.expanded_capacity,
     )
     if expand:
-        actual_slots = layout.expanded_slots[order].cpu()
+        actual_slots = metadata[order, 2:].cpu().long()
         mask = ref.expanded_slots >= 0
         assert torch.equal(actual_slots >= 0, mask)
         actual, target = actual_slots[mask].cuda(), ref.expanded_slots[mask]
@@ -121,8 +123,7 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
     other = make_case(size, topk, dtype, 1)
     config = EPConfig(original.num_experts, topk, original.hidden, original.capacity)
     with CudaBuffer(dist.group.WORLD, config, allow_multiple_reduction=mode) as buffer:
-        dispatch_copies = buffer._dispatch_epilogues
-        combine_reduce = buffer._combine_epilogue
+        backend = buffer._backend
         assert buffer._payload_offset == buffer._return_offset
         payload_bytes = (
             size * original.capacity * dispatch_row_bytes(original.hidden, topk)
@@ -145,24 +146,25 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
             after.copy_(stage)
             snapshots.append((before, after))
 
-        def dispatch_epilogue(*args):
-            outputs = dispatch_copies[args[0].metadata_prepared](*args)
+        def delayed_dispatch(*args):
+            outputs = backend.dispatch(*args)
             if rank == 0 and not dispatch_gates:
                 # Keep an old arena reader pending until peer 1 attempts combine.
-                delay_reader(args[0].stage_buffer, 3)
+                delay_reader(window.narrow(0, buffer._payload_offset, payload_bytes), 3)
                 dispatch_gates.append(3)
             return outputs
 
-        def combine_epilogue(*args):
-            outputs = combine_reduce(*args)
+        def delayed_combine(*args):
+            outputs = backend.combine(*args)
             if rank == 0 and not combine_gates:
                 # Peer 1 attempts fresh dispatch while this return read is pending.
-                delay_reader(args[0], 5)
+                delay_reader(window.narrow(0, buffer._return_offset, return_bytes), 5)
                 combine_gates.append(5)
             return outputs
 
-        buffer._dispatch_epilogues = (dispatch_epilogue, dispatch_epilogue)
-        buffer._combine_epilogue = combine_epilogue
+        buffer._backend = SimpleNamespace(
+            dispatch=delayed_dispatch, combine=delayed_combine
+        )
         with torch.cuda.stream(buffer._comm_stream):
             # All-one FP32 bytes are NaN. Unwritten records must never contribute.
             window[buffer._payload_offset :].fill_(255)
@@ -202,10 +204,7 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
         saved_metadata = [
             tensor.cpu().clone()
             for tensor in (
-                first.handle.layout.src_ranks,
-                first.handle.layout.src_tokens,
-                first.handle.layout.local_topk_idx,
-                first.handle.layout.expanded_slots,
+                first.handle.layout.recv_metadata,
                 first.handle.dst_slots,
                 first.handle.topk_idx,
                 first.handle.layout.recv_rank_prefix,
@@ -236,10 +235,7 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
         check_dispatch(second, other, rank, expand, weighted)
         for tensor, expected in zip(
             (
-                first.handle.layout.src_ranks,
-                first.handle.layout.src_tokens,
-                first.handle.layout.local_topk_idx,
-                first.handle.layout.expanded_slots,
+                first.handle.layout.recv_metadata,
                 first.handle.dst_slots,
                 first.handle.topk_idx,
                 first.handle.layout.recv_rank_prefix,

@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import timedelta
 import os
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -49,16 +50,18 @@ def assert_dispatch(got, expected, config, rank):
     layout = got.handle.layout
     assert layout.recv_count == expected.layout.recv_count
     assert layout.expanded_capacity == expected.layout.expanded_capacity
-    keys = layout.src_ranks * config.num_max_tokens_per_rank + layout.src_tokens
+    meta = layout.recv_metadata
+    keys = meta[:, 0].long() * config.num_max_tokens_per_rank + meta[:, 1].long()
     perm = keys.argsort()
     torch.testing.assert_close(
         keys[perm].cpu(),
         expected.layout.src_ranks * config.num_max_tokens_per_rank
         + expected.layout.src_tokens,
     )
-    torch.testing.assert_close(
-        layout.local_topk_idx[perm].cpu(), expected.layout.local_topk_idx
-    )
+    if not got.handle.do_expand:
+        torch.testing.assert_close(
+            meta[perm, 2:].cpu().long(), expected.layout.local_topk_idx
+        )
     torch.testing.assert_close(
         layout.expert_counts.cpu(), expected.layout.expert_counts
     )
@@ -66,13 +69,12 @@ def assert_dispatch(got, expected, config, rank):
         layout.expert_offsets.cpu(), expected.layout.expert_offsets
     )
     if not got.handle.do_expand:
-        assert layout.expanded_slots.shape == (0,)
         torch.testing.assert_close(got.x[perm].cpu(), expected.x, rtol=0, atol=0)
         torch.testing.assert_close(got.topk_idx[perm].cpu(), expected.topk_idx)
         torch.testing.assert_close(got.topk_weights[perm].cpu(), expected.topk_weights)
     else:
         assert got.topk_idx is None
-        slots = layout.expanded_slots[perm].cpu()
+        slots = meta[perm, 2:].cpu().long()
         assert torch.equal(slots >= 0, expected.layout.expanded_slots >= 0)
         valid = slots >= 0
         assert slots[valid].unique().numel() == valid.sum()
@@ -98,10 +100,15 @@ def expert_output(received):
         else torch.zeros_like(received.x, dtype=torch.float32)
     )
     for row in range(layout.recv_count):
-        for k, expert in enumerate(layout.local_topk_idx[row].tolist()):
-            if expert < 0:
+        for k, value in enumerate(layout.recv_metadata[row, 2:].tolist()):
+            if value < 0:
                 continue
-            slot = int(layout.expanded_slots[row, k]) if handle.do_expand else row
+            slot = value if handle.do_expand else row
+            expert = (
+                int(torch.searchsorted(layout.expert_offsets[1:], value, right=True))
+                if handle.do_expand
+                else value
+            )
             weight = (
                 received.topk_weights[slot]
                 if handle.do_expand
@@ -141,14 +148,6 @@ def source_reference(case, rank, expand, multiple, bias):
     if bias is not None:
         result += bias.float()
     return result.bfloat16()
-
-
-def delayed_epilogue(function):
-    def epilogue(*args):
-        torch.cuda._sleep(20_000_000)
-        return function(*args)
-
-    return epilogue
 
 
 def combine_experts(buffer, received, bias, *, explicit_event, asynchronous):
@@ -210,7 +209,15 @@ def run():
             buffer = CudaBuffer(
                 dist.group.WORLD, cfg, allow_multiple_reduction=bool(lifetime)
             )
-            buffer._combine_epilogue = delayed_epilogue(buffer._combine_epilogue)
+            native = buffer._backend
+
+            def delayed_combine(*args):
+                torch.cuda._sleep(20_000_000)
+                return native.combine(*args)
+
+            buffer._backend = SimpleNamespace(
+                dispatch=native.dispatch, combine=delayed_combine
+            )
             for expand in (False, True):
                 for kind in ("mixed", "empty", "masked", "skew"):
                     c = make_case(

@@ -2,9 +2,9 @@
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -39,20 +39,18 @@ def test_delivery_profile(request, profile, tmp_path):
     nproc = request.config.getoption("--nproc")
     if nproc not in (1, 2, 4, 8) or torch.cuda.device_count() < nproc:
         pytest.fail(f"need {nproc} visible GPUs and nproc in 1/2/4/8")
-    from nano_ep.backends._build import (
-        load_extension,
-        prepare_dispatch_epilogue,
-        prepare_dispatch_main,
-    )
+    from nano_ep.backends._build import load_extension
 
-    load_extension()
+    native = load_extension()
     name, layout, dtype, tokens, hidden, topk, pattern, iterations, asynchronous = (
         profile
     )
-    for cached_mode in (False, True):
-        prepare_dispatch_epilogue(hidden, topk, 8, cached_mode=cached_mode)
-    for expert_alignment in (1, 16):
-        prepare_dispatch_main(hidden, topk, nproc, 8, max(1, tokens), expert_alignment)
+    geometry = (hidden, topk, nproc, 8, max(1, tokens))
+    expand = layout == "expanded"
+    native.prepare_dispatch(*geometry, 16, False, expand, True, expand)
+    if asynchronous:
+        native.prepare_dispatch(*geometry, 16, True, expand, True, expand)
+    native.prepare_combine(*geometry, expand, False, True)
     command = [
         sys.executable,
         "-m",
