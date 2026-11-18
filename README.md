@@ -14,11 +14,14 @@ Requires Linux, Python 3.11+, CUDA-enabled PyTorch 2.10+, Ninja, a C++20 toolcha
 Install a CUDA build of PyTorch appropriate for your system, then run from this checkout:
 
 ```bash
+git submodule update --init --recursive
 python -m pip install .
 TORCH_CUDA_ARCH_LIST=9.0 python -m nano_ep.build
 ```
 
 Installation packages the CUDA sources. The host extension builds once through PyTorch. DeepJIT compiles the requested CUDA kernel variants on first use.
+DeepJIT is pinned as a Git submodule; source distributions and wheels include its required headers.
+Initialize the submodule before building from a checkout. Git archives do not include submodule contents; use the source distribution for a self-contained archive.
 Set `NANO_EP_JIT_CACHE_DIR` to reuse their CUBINs across runs. For cold measurements, point it at a fresh directory. DeepEP, NVSHMEM and NCCL Gin are not required.
 
 To build distributable source and wheel packages:
