@@ -1,18 +1,17 @@
 #pragma once
 
-#include <ATen/cuda/CUDAContextLight.h>
-#include <c10/cuda/CUDAException.h>
 #include <cooperative_groups.h>
-#include <torch/extension.h>
+#include <cuda_bf16.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cuda/atomic>
+#include <layout.hpp>
 #include <limits>
 #include <nano_ep/barrier.cuh>
 #include <nano_ep/math.cuh>
-
-#include "layout.hpp"
+#include <nano_ep/tma.cuh>
 
 namespace nano_ep {
 
@@ -73,6 +72,7 @@ __device__ __forceinline__ void finalize_receive_counts(const uint32_t* counts,
                                                         int64_t* recv_rank_prefix,       // [R], inclusive
                                                         int64_t* expert_counts,          // [L], actual assignments
                                                         int64_t* expert_offsets,         // [L+1], padded exclusive
+                                                        int64_t* expert_cursor,          // [L], fresh expanded only, or nullptr
                                                         volatile int64_t* mapped_counts  // host [2], independently ready N/C
 ) {
     static_assert(kExpertAlignment > 0);
@@ -101,8 +101,11 @@ __device__ __forceinline__ void finalize_receive_counts(const uint32_t* counts,
             }
             const int64_t padded = (actual + kExpertAlignment - 1) / kExpertAlignment * kExpertAlignment;
             const int64_t prefix = carry + warp_inclusive_sum(padded, lane);
-            if (expert < kExpertsPerRank)
+            if (expert < kExpertsPerRank) {
                 expert_offsets[expert + 1] = prefix;
+                if (expert_cursor != nullptr)
+                    expert_cursor[expert] = prefix - padded;
+            }
             carry = __shfl_sync(0xffffffffu, prefix, kWarpSize - 1);
         }
         if (lane == 0)
@@ -119,6 +122,7 @@ __device__ __forceinline__ void count_and_notify(const int64_t* peer_addresses,
                                                  int64_t* recv_rank_prefix,
                                                  int64_t* recv_expert_counts,
                                                  int64_t* expert_offsets,
+                                                 int64_t* expert_cursor,
                                                  volatile int64_t* mapped_counts,
                                                  int rank,
                                                  int64_t num_tokens,
@@ -201,14 +205,18 @@ __device__ __forceinline__ void count_and_notify(const int64_t* peer_addresses,
 
         // calculate expert_offsets and recv_expert_counts
         finalize_receive_counts<kWorldSize, kExpertsPerRank, kExpertAlignment>(
-            local_counts, recv_rank_prefix, recv_expert_counts, expert_offsets, mapped_counts);
+            local_counts, recv_rank_prefix, recv_expert_counts, expert_offsets, expert_cursor, mapped_counts);
     }
 }
 
+template <int kHidden, int kTopk, int kWorldSize, int kExpertsPerRank, int kNumNotifyWarps>
+inline constexpr auto kDispatchPayloadPlan = make_dispatch_payload_plan(kHidden, kTopk, kWorldSize, kExpertsPerRank, kNumNotifyWarps);
+
 template <int kHidden, int kTopk, int kWorldSize, int kExpertsPerRank, bool kReuseSlots, int kNumNotifyWarps>
 __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addresses,
-                                                      const at::BFloat16* x,
+                                                      const nv_bfloat16* x,
                                                       const int64_t* indices,
+                                                      int64_t* topk_snapshot,
                                                       const float* weights,
                                                       int64_t* dst_slots,
                                                       int rank,
@@ -218,24 +226,40 @@ __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addres
                                                       int64_t payload_offset,
                                                       int64_t payload_row_bytes) {
     constexpr int kWarpSize = 32;
-    constexpr int kElemsPerVector = sizeof(int4) / sizeof(at::BFloat16);
-    constexpr int kVectorsPerLane = kHidden / (kWarpSize * kElemsPerVector);
-    static_assert(kHidden > 0 && kHidden % (kWarpSize * kElemsPerVector) == 0);
+    constexpr auto kPlan = kDispatchPayloadPlan<kHidden, kTopk, kWorldSize, kExpertsPerRank, kNumNotifyWarps>;
+    static_assert(kPlan.payload_warps >= 1, "payload row staging does not fit in shared memory");
+    constexpr int64_t kXOffset = WindowLayout::payload_x_offset(kTopk);
+    constexpr int kXBytes = kHidden * static_cast<int>(sizeof(nv_bfloat16));
     static_assert(kTopk > 0 && kTopk <= kWarpSize);
-    constexpr int kUnrollFactor = [] {
-        for (int factor = 4; factor >= 1; --factor)
-            if (kVectorsPerLane % factor == 0)
-                return factor;
-        return 1;
-    }();
+    // Bulk copies move a 16-byte-multiple size between 16-byte-aligned addresses.
+    static_assert(kXOffset % 16 == 0 && kXBytes % 16 == 0 && kPlan.row_bytes % 16 == 0 && kPlan.stage_bytes % 16 == 0);
+
     const int lane = threadIdx.x % kWarpSize;
-    const int warp_idx = threadIdx.x / kWarpSize;
+    const int payload_warp_idx = threadIdx.x / kWarpSize - kNumNotifyWarps;
+    extern __shared__ __align__(32) uint8_t payload_smem[];
+
+    auto* row = payload_smem + kPlan.stage_offset(payload_warp_idx);
+    auto* mbar = reinterpret_cast<uint64_t*>(row + kPlan.row_bytes);
+    if (elect_one_sync())
+        tma_mbarrier_init(mbar);
+    __syncwarp();
+
     // reserve slots and write payloads to the peer windows.
-    const int64_t token_start = static_cast<int64_t>(warp_idx - kNumNotifyWarps) * gridDim.x + blockIdx.x;
-    const int64_t token_stride = static_cast<int64_t>(blockDim.x / kWarpSize - kNumNotifyWarps) * gridDim.x;
+    const int64_t token_start = static_cast<int64_t>(payload_warp_idx) * gridDim.x + blockIdx.x;
+    const int64_t token_stride = static_cast<int64_t>(kPlan.payload_warps) * gridDim.x;
+    uint32_t phase = 0;
 
     // Warps process disjoint token sequences across the SM-sized grid.
     for (int64_t token = token_start; token < num_tokens; token += token_stride) {
+        // Drain prior stores before reusing the stage, then overlap the load with routing.
+        tma_store_wait<0>();
+        __syncwarp();
+        if (elect_one_sync()) {
+            tma_mbarrier_expect_tx(mbar, kXBytes);
+            tma_load_1d(row + kXOffset, x + token * kHidden, mbar, kXBytes);
+        }
+        __syncwarp();
+
         int destination = -1;
         int64_t expert_id = -1;
         unsigned long long slot = 0;
@@ -250,10 +274,14 @@ __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addres
                 }
             }
         } else {
+            // Each token warp initializes its complete rank map before publishing slots.
+            if (lane < kWorldSize)
+                dst_slots[token * kWorldSize + lane] = -1;
             // Fist K lane handle one routing
             // Expert[0, 1, 2, 3, 4, 5, 6, 7] -> Rank[0, 0, 1, 1, 2, 2, 3, 3]
             if (lane < kTopk) {
                 expert_id = indices[token * kTopk + lane];
+                topk_snapshot[token * kTopk + lane] = expert_id;
                 if (expert_id < -1 || expert_id >= kWorldSize * kExpertsPerRank) {
                     printf("NanoEP dispatch invalid expert: token=%lld expert=%lld\n",
                            static_cast<long long>(token),
@@ -265,6 +293,7 @@ __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addres
                     destination = expert_id / kExpertsPerRank;
                 }
             }
+            __syncwarp();
 
             // e.g. for lane 0, same_destination = 0x00000003
             const unsigned same_destination = __match_any_sync(0xffffffffu, destination);
@@ -287,73 +316,41 @@ __device__ __forceinline__ void dispatch_payload_rows(const int64_t* peer_addres
             asm volatile("trap;");
         }
 
-        // e.g. senders = 0b00000000000000000000000010101010
-        const unsigned senders = __ballot_sync(0xffffffffu, is_sender);
-        if (senders == 0)
-            continue;
-
-        if constexpr (kReuseSlots) {
-            if (lane < kTopk)
-                expert_id = indices[token * kTopk + lane];
-        }
-        const float route_weight = weights != nullptr && lane < kTopk ? weights[token * kTopk + lane] : 0.0f;
-        unsigned long long row_address = 0;
-        if (is_sender) {
-            const int dst = kReuseSlots ? lane : destination;
-            auto* peer_window = reinterpret_cast<uint8_t*>(peer_addresses[dst]);
-            row_address = reinterpret_cast<unsigned long long>(peer_window + payload_offset + slot * payload_row_bytes);
-        }
-
-        // Header fields and row addresses stay in registers across all targets.
-        unsigned remaining = senders;
-        while (remaining != 0) {
-            // find the first sender in the warp
-            const int sender = __ffs(remaining) - 1;
-
-            // write payload together
-            auto* row = reinterpret_cast<uint8_t*>(__shfl_sync(0xffffffffu, row_address, sender));
-            auto* row_src_rank = reinterpret_cast<int64_t*>(row);
-            auto* row_src_token = reinterpret_cast<int64_t*>(row + 8);
-            auto* row_topk = reinterpret_cast<int64_t*>(row + WindowLayout::kPayloadTopkOffset);
-            auto* row_weights = reinterpret_cast<float*>(row + WindowLayout::payload_weights_offset(kTopk));
-
+        if (__any_sync(0xffffffffu, is_sender)) {
+            // Every routing lane publishes the header once; each destination reads this copy.
             if (lane == 0) {
-                row_src_rank[0] = rank;
-                row_src_token[0] = token;
+                *reinterpret_cast<int64_t*>(row) = rank;
+                *reinterpret_cast<int64_t*>(row + 8) = token;
             }
             if (lane < kTopk) {
-                row_topk[lane] = expert_id;
-                if (weights != nullptr) {
-                    row_weights[lane] = route_weight;
-                }
+                if constexpr (kReuseSlots)
+                    expert_id = indices[token * kTopk + lane];
+                *reinterpret_cast<int64_t*>(row + WindowLayout::kPayloadTopkOffset + lane * 8) = expert_id;
+                if (weights != nullptr)
+                    reinterpret_cast<float*>(row + WindowLayout::payload_weights_offset(kTopk))[lane] = weights[token * kTopk + lane];
             }
-            remaining &= remaining - 1;
+            tma_fence_shared();
         }
+        // Retire the load and advance the phase even when the token has no destination.
+        if (elect_one_sync())
+            tma_mbarrier_wait(mbar, phase);
+        __syncwarp();
+        phase ^= 1;
 
-        // Load one bounded tile once, then copy its BF16 bits to every target.
-        const auto* input_vectors = reinterpret_cast<const int4*>(x + token * kHidden);
-        const auto x_address = row_address + WindowLayout::payload_x_offset(kTopk);
-#pragma unroll 1
-        for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
-            int4 slices[kUnrollFactor];
-#pragma unroll
-            for (int u = 0; u < kUnrollFactor; ++u) {
-                const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
-                slices[u] = input_vectors[index];
-            }
-            remaining = senders;
-            while (remaining != 0) {
-                const int sender = __ffs(remaining) - 1;
-                auto* output_vectors = reinterpret_cast<int4*>(__shfl_sync(0xffffffffu, x_address, sender));
-#pragma unroll
-                for (int u = 0; u < kUnrollFactor; ++u) {
-                    const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
-                    output_vectors[index] = slices[u];
-                }
-                remaining &= remaining - 1;
-            }
+        // Each sender lane bulk-copies the staged row into its own destination slot.
+        if (is_sender) {
+            const int dst = kReuseSlots ? lane : destination;
+            auto* peer_row = reinterpret_cast<uint8_t*>(peer_addresses[dst]) + payload_offset + slot * payload_row_bytes;
+            tma_store_1d(peer_row, row, static_cast<int>(payload_row_bytes));
+            tma_store_commit();
         }
+        __syncwarp();
     }
+
+    // Bulk stores are per-thread groups: drain them and order them to system scope before the
+    // exit epoch tells peers the rows are ready.
+    tma_store_wait<0>();
+    tma_fence_system();
 }
 
 template <int kHidden,
@@ -364,21 +361,27 @@ template <int kHidden,
           int64_t kExpertAlignment,
           bool kReuseSlots,
           uint64_t kTimeoutCycles = kBarrierTimeoutCycles>
-__global__ void dispatch_main_kernel(const int64_t* peer_addresses,
-                                     const at::BFloat16* x,            // [T,H]
-                                     const int64_t* indices,           // [T,K]
-                                     const float* weights,             // [T,K], or nullptr
-                                     int64_t* dst_slots,               // [T,R], fresh output or cached mapping
-                                     int64_t* send_counts,             // [R], fresh only
-                                     uint64_t* reduction,              // [R+E], fresh only
-                                     int64_t* recv_rank_prefix,        // [R], fresh inclusive prefix
-                                     int64_t* recv_expert_counts,      // [L], fresh actual counts
-                                     int64_t* expert_offsets,          // [L+1], fresh padded exclusive prefix
-                                     volatile int64_t* mapped_counts,  // host [2], fresh N/C publication
-                                     int rank,
-                                     int64_t num_tokens,
-                                     int64_t entry_epoch) {
-    constexpr int kNumNotifyWarps = kReuseSlots ? 0 : 4;
+// Every payload warp holds a shared stage for the whole kernel, so one block per SM is the shape
+// the plan sizes for and the cooperative launch relies on.
+__global__ void __launch_bounds__(
+    kDispatchPayloadPlan<kHidden, kTopk, kWorldSize, kExpertsPerRank, dispatch_notify_warps(kReuseSlots)>.total_warps * 32, 1)
+    dispatch_main_kernel(const int64_t* peer_addresses,
+                         const nv_bfloat16* x,             // [T,H]
+                         const int64_t* indices,           // [T,K]
+                         int64_t* topk_snapshot,           // [T,K], fresh output; cached nullptr
+                         const float* weights,             // [T,K], or nullptr
+                         int64_t* dst_slots,               // [T,R], fresh output or cached mapping
+                         int64_t* send_counts,             // [R], fresh only
+                         uint64_t* reduction,              // [R+E], fresh only
+                         int64_t* recv_rank_prefix,        // [R], fresh inclusive prefix
+                         int64_t* recv_expert_counts,      // [L], fresh actual counts
+                         int64_t* expert_offsets,          // [L+1], fresh padded exclusive prefix
+                         int64_t* expert_cursor,           // [L], fresh expanded only, or nullptr
+                         volatile int64_t* mapped_counts,  // host [2], fresh N/C publication
+                         int rank,
+                         int64_t num_tokens,
+                         int64_t entry_epoch) {
+    constexpr int kNumNotifyWarps = dispatch_notify_warps(kReuseSlots);
     constexpr int kNumExperts = kWorldSize * kExpertsPerRank;
     constexpr auto kLayout = WindowLayout::make(kWorldSize, kMaxTokens, kHidden, kTopk, kNumExperts);
     constexpr int64_t kRowBytes = WindowLayout::payload_row_bytes(kHidden, kTopk);
@@ -390,17 +393,8 @@ __global__ void dispatch_main_kernel(const int64_t* peer_addresses,
     auto grid = cooperative_groups::this_grid();
     auto* local_window = reinterpret_cast<uint8_t*>(peer_addresses[rank]);
     auto* local_signals = reinterpret_cast<uint64_t*>(local_window);
-    if (blockIdx.x == 0) {
-        if constexpr (!kReuseSlots) {
-            // All local CTAs reserve within one source-owned segment per peer.
-            if (threadIdx.x < kWorldSize) {
-                auto* send_next = reinterpret_cast<unsigned long long*>(local_window + kLayout.send_next_offset);
-                send_next[threadIdx.x] = 0ULL;
-            }
-            __syncthreads();
-        }
+    if (blockIdx.x == 0)
         peer_barrier(peer_addresses, local_signals, rank, kWorldSize, static_cast<uint64_t>(entry_epoch));
-    }
     grid.sync();
 
     const int warp_idx = threadIdx.x / 32;
@@ -415,6 +409,7 @@ __global__ void dispatch_main_kernel(const int64_t* peer_addresses,
                                                                                                                     recv_rank_prefix,
                                                                                                                     recv_expert_counts,
                                                                                                                     expert_offsets,
+                                                                                                                    expert_cursor,
                                                                                                                     mapped_counts,
                                                                                                                     rank,
                                                                                                                     num_tokens,
@@ -425,6 +420,7 @@ __global__ void dispatch_main_kernel(const int64_t* peer_addresses,
         dispatch_payload_rows<kHidden, kTopk, kWorldSize, kExpertsPerRank, kReuseSlots, kNumNotifyWarps>(peer_addresses,
                                                                                                          x,
                                                                                                          indices,
+                                                                                                         topk_snapshot,
                                                                                                          weights,
                                                                                                          dst_slots,
                                                                                                          rank,
@@ -438,90 +434,22 @@ __global__ void dispatch_main_kernel(const int64_t* peer_addresses,
     // Order all writers before CTA 0's cumulative system-scope release.
     // All warp roles participate, including empty source ranks.
     grid.sync();
-    if (blockIdx.x == 0)
-        peer_barrier(peer_addresses, local_signals, rank, kWorldSize, static_cast<uint64_t>(entry_epoch + 1));
-}
-
-template <int kHidden, int kTopk, int kWorldSize, int kExpertsPerRank, int64_t kMaxTokens, int64_t kExpertAlignment>
-void prepare_dispatch_launch(const torch::Tensor& x, bool cached_mode) {
-    if (!cached_mode)
-        TORCH_CHECK(x.size(0) <= std::numeric_limits<uint32_t>::max(), "fresh dispatch token count exceeds packed notify count capacity");
-    // Each specialization and cache mode has fixed cooperative resource requirements.
-    const auto prepare = [&]<bool kReuseSlots>() {
-        static thread_local int checked_device = -1;
-        if (checked_device != x.get_device()) {
-            int supported = 0;
-            C10_CUDA_CHECK(cudaDeviceGetAttribute(&supported, cudaDevAttrCooperativeLaunch, x.get_device()));
-            TORCH_CHECK(supported, "dispatch main requires CUDA cooperative launch support");
-            const auto kernel =
-                dispatch_main_kernel<kHidden, kTopk, kWorldSize, kExpertsPerRank, kMaxTokens, kExpertAlignment, kReuseSlots>;
-            int active_blocks_per_sm = 0;
-            C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_sm, kernel, 256, 0));
-            TORCH_CHECK(active_blocks_per_sm >= 1, "dispatch main cannot fit a 256-thread cooperative block on an SM");
-            checked_device = x.get_device();
+    if (threadIdx.x < 32) {
+        if (blockIdx.x == 0) {
+            peer_barrier(peer_addresses, local_signals, rank, kWorldSize, static_cast<uint64_t>(entry_epoch + 1));
+            // Every peer must arrive before CTA 0 signals launch completion.
+            __syncwarp();
         }
-    };
-    if (cached_mode)
-        prepare.template operator()<true>();
-    else
-        prepare.template operator()<false>();
-}
+        cudaTriggerProgrammaticLaunchCompletion();
 
-template <int kHidden, int kTopk, int kWorldSize, int kExpertsPerRank, int64_t kMaxTokens, int64_t kExpertAlignment>
-void launch_dispatch(const torch::Tensor& addresses,
-                     const torch::Tensor& window,
-                     const torch::Tensor& x,
-                     const torch::Tensor& indices,
-                     const c10::optional<torch::Tensor>& weights,
-                     const torch::Tensor& dst_slots,
-                     const torch::Tensor& send_counts,
-                     const torch::Tensor& recv_rank_prefix,
-                     const torch::Tensor& recv_expert_counts,
-                     const torch::Tensor& expert_offsets,
-                     int64_t* mapped_counts,
-                     int rank,
-                     bool cached_mode,
-                     int64_t entry_epoch,
-                     cudaStream_t stream) {
-    const auto launch = [&]<bool kReuseSlots>() {
-        const auto kernel = dispatch_main_kernel<kHidden, kTopk, kWorldSize, kExpertsPerRank, kMaxTokens, kExpertAlignment, kReuseSlots>;
-        const auto* address_ptr = addresses.data_ptr<int64_t>();
-        const auto* x_ptr = x.data_ptr<at::BFloat16>();
-        const auto* indices_ptr = indices.data_ptr<int64_t>();
-        const auto* weight_ptr = weights.has_value() ? weights->data_ptr<float>() : nullptr;
-        auto* slots_ptr = dst_slots.data_ptr<int64_t>();
-        auto* send_ptr = kReuseSlots ? nullptr : send_counts.data_ptr<int64_t>();
-        constexpr auto kLayout = WindowLayout::make(kWorldSize, kMaxTokens, kHidden, kTopk, kWorldSize * kExpertsPerRank);
-        auto* reduction_ptr =
-            kReuseSlots ? nullptr : reinterpret_cast<uint64_t*>(window.data_ptr<uint8_t>() + kLayout.notify_reduction_offset);
-        auto* recv_ptr = kReuseSlots ? nullptr : recv_rank_prefix.data_ptr<int64_t>();
-        auto* expert_ptr = kReuseSlots ? nullptr : recv_expert_counts.data_ptr<int64_t>();
-        auto* offsets_ptr = kReuseSlots ? nullptr : expert_offsets.data_ptr<int64_t>();
-        volatile int64_t* counts_ptr = kReuseSlots ? nullptr : mapped_counts;
-        int64_t num_tokens = x.size(0);
-        void* args[] = {&address_ptr,
-                        &x_ptr,
-                        &indices_ptr,
-                        &weight_ptr,
-                        &slots_ptr,
-                        &send_ptr,
-                        &reduction_ptr,
-                        &recv_ptr,
-                        &expert_ptr,
-                        &offsets_ptr,
-                        &counts_ptr,
-                        &rank,
-                        &num_tokens,
-                        &entry_epoch};
-        constexpr int threads = 256;
-        const int blocks = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-        C10_CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(kernel), dim3(blocks), dim3(threads), args, 0, stream));
-    };
-    if (cached_mode)
-        launch.template operator()<true>();
-    else
-        launch.template operator()<false>();
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+        if constexpr (!kReuseSlots) {
+            // Prepare the local counters for the next fresh dispatch on this stream.
+            if (blockIdx.x == 0 && threadIdx.x < kWorldSize) {
+                auto* send_next = reinterpret_cast<unsigned long long*>(local_window + kLayout.send_next_offset);
+                send_next[threadIdx.x] = 0ULL;
+            }
+        }
+    }
 }
 
 }  // namespace nano_ep

@@ -1,4 +1,5 @@
 #include <cstring>
+#include <nano_ep/jit.hpp>
 #include <nano_ep/peer.hpp>
 #include <nano_ep/pipeline.hpp>
 #include <string>
@@ -8,77 +9,41 @@
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
-    py::class_<nano_ep::DispatchState>(module, "DispatchState")
-        .def(py::init<>())
-        .def_readwrite("metadata", &nano_ep::DispatchState::metadata)
-        .def_readwrite("counts", &nano_ep::DispatchState::counts)
-        .def_readwrite("stage_buffer", &nano_ep::DispatchState::stage_buffer)
-        .def_readwrite("hidden", &nano_ep::DispatchState::hidden)
-        .def_readwrite("x_dtype", &nano_ep::DispatchState::x_dtype)
-        .def_readonly("rank", &nano_ep::DispatchState::rank)
-        .def_readonly("metadata_prepared", &nano_ep::DispatchState::metadata_prepared);
-    module.def(
-        "dispatch_main",
-        [](nano_ep::PeerRuntime& runtime,
-           const torch::Tensor& x,
-           const torch::Tensor& indices,
-           const c10::optional<torch::Tensor>& weights,
-           int64_t num_experts,
-           int64_t max_tokens,
-           int64_t alignment,
-           const std::vector<torch::Tensor>& cached_metadata,
-           int64_t cached_expanded_capacity,
-           bool allow_multiple_reduction,
-           const py::capsule& launcher) {
-            if (!PyCapsule_IsValid(launcher.ptr(), "nano_ep.DispatchMainSpecialization"))
-                throw py::value_error("expected a dispatch main specialization launcher");
-            const auto* specialization = static_cast<const nano_ep::DispatchMainSpecialization*>(launcher.get_pointer());
-            return nano_ep::dispatch_main(runtime,
-                                          x,
-                                          indices,
-                                          weights,
-                                          num_experts,
-                                          max_tokens,
-                                          alignment,
-                                          cached_metadata,
-                                          cached_expanded_capacity,
-                                          allow_multiple_reduction,
-                                          *specialization);
-        },
-        py::arg("runtime"),
-        py::arg("x"),
-        py::arg("indices"),
-        py::arg("weights"),
-        py::arg("num_experts"),
-        py::arg("max_tokens"),
-        py::arg("alignment"),
-        py::arg("cached_metadata"),
-        py::arg("cached_expanded_capacity"),
-        py::arg("allow_multiple_reduction"),
-        py::arg("launcher"));
-    module.def(
-        "combine_main",
-        [](nano_ep::PeerRuntime& runtime,
-           const torch::Tensor& x,
-           const std::vector<torch::Tensor>& metadata,
-           const c10::optional<torch::Tensor>& weights,
-           int64_t max_tokens,
-           bool expand,
-           bool allow_multiple_reduction,
-           const py::capsule& launcher) {
-            if (!PyCapsule_IsValid(launcher.ptr(), "nano_ep.CombineMainSpecialization"))
-                throw py::value_error("expected a combine main specialization launcher");
-            const auto* specialization = static_cast<const nano_ep::CombineMainSpecialization*>(launcher.get_pointer());
-            return nano_ep::combine_main(runtime, x, metadata, weights, max_tokens, expand, allow_multiple_reduction, *specialization);
-        },
-        py::arg("runtime"),
-        py::arg("x"),
-        py::arg("metadata"),
-        py::arg("weights"),
-        py::arg("max_tokens"),
-        py::arg("expand"),
-        py::arg("allow_multiple_reduction"),
-        py::arg("launcher"));
+    module.def("init_jit", &nano_ep::init_jit);
+    module.def("prepare_dispatch", &nano_ep::prepare_dispatch);
+    module.def("prepare_combine", &nano_ep::prepare_combine);
+    module.def("dispatch",
+               &nano_ep::dispatch,
+               py::arg("runtime"),
+               py::arg("x"),
+               py::arg("indices"),
+               py::arg("weights"),
+               py::arg("num_experts"),
+               py::arg("max_tokens"),
+               py::arg("alignment"),
+               py::arg("cached_metadata"),
+               py::arg("cached_expanded_capacity"),
+               py::arg("allow_multiple_reduction"),
+               py::arg("expand"),
+               py::arg("zero_padding"),
+               py::arg("num_sms"),
+               py::arg("comm_stream"),
+               py::arg("previous_event") = -1,
+               py::arg("async_op") = true);
+    module.def("combine",
+               &nano_ep::combine,
+               py::arg("runtime"),
+               py::arg("x"),
+               py::arg("metadata"),
+               py::arg("weights"),
+               py::arg("bias"),
+               py::arg("max_tokens"),
+               py::arg("expand"),
+               py::arg("allow_multiple_reduction"),
+               py::arg("num_sms"),
+               py::arg("comm_stream"),
+               py::arg("previous_event") = -1,
+               py::arg("async_op") = true);
     module.def(
         "window_layout",
         [](int ranks, int64_t tokens, int hidden, int topk, int64_t num_experts, bool allow_multiple_reduction) {
@@ -116,4 +81,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
         .def("barrier", py::overload_cast<int64_t, int64_t>(&nano_ep::PeerRuntime::barrier))
         .def("close_peer_mappings", &nano_ep::PeerRuntime::close_peer_mappings)
         .def("close", &nano_ep::PeerRuntime::close);
+    py::class_<nano_ep::CompletionEvent, std::shared_ptr<nano_ep::CompletionEvent>>(module, "CompletionEvent")
+        .def("current_stream_wait", &nano_ep::CompletionEvent::current_stream_wait);
 }

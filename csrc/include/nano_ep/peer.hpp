@@ -52,6 +52,7 @@ private:
     void* local_ptr_ = nullptr;
     std::vector<void*> peer_ptrs_;
     torch::Tensor peer_addresses_;
+    torch::Tensor local_window_;
     mutable bool exported_ = false;
     bool closing_ = false;
     bool peer_mappings_closed_ = false;

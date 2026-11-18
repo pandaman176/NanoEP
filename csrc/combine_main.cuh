@@ -1,17 +1,14 @@
 #pragma once
 
-#include <ATen/cuda/CUDAContextLight.h>
-#include <c10/cuda/CUDAException.h>
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
-#include <torch/extension.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cuda/std/bit>
+#include <layout.hpp>
 #include <nano_ep/barrier.cuh>
-
-#include "layout.hpp"
+#include <nano_ep/tma.cuh>
 
 namespace nano_ep {
 
@@ -34,6 +31,10 @@ __device__ __forceinline__ int compute_expanded_slots(int64_t lane_slot, unsigne
     return count;
 }
 
+// One activation row staged per warp, so the peer write leaves the warp as a single bulk copy.
+template <int kHidden>
+inline constexpr auto kCombineReturnPlan = HiddenRowPlan::make(kHidden, true);
+
 template <int kHidden,
           int kTopk,
           int kWorldSize,
@@ -45,10 +46,7 @@ template <int kHidden,
 __device__ __forceinline__ void combine_return_rows(const int64_t* peer_addresses,  // [R], includes self
                                                     const data_t* x,                // compact [N,H], expanded [C,H]
                                                     const float* weights,           // compact [N,K], expanded [C], or nullptr
-                                                    const int64_t* src_ranks,       // [N]
-                                                    const int64_t* src_tokens,      // [N]
-                                                    const int64_t* local_topk_idx,  // [N,K], nonlocal/masked = -1
-                                                    const int64_t* expanded_slots,  // expanded [N,K], compact nullptr
+                                                    const int32_t* recv_metadata,   // [N,K+2]
                                                     int rank,
                                                     int64_t recv_count,    // N, one warp per row
                                                     int64_t input_rows,    // N or C; bounds for expanded x/weights reads
@@ -74,9 +72,24 @@ __device__ __forceinline__ void combine_return_rows(const int64_t* peer_addresse
     const int64_t global_warp_idx = static_cast<int64_t>(warp_idx) * gridDim.x + blockIdx.x;
     const int64_t token_stride = static_cast<int64_t>(blockDim.x / kWarpSize) * gridDim.x;
 
+    constexpr auto kPlan = kCombineReturnPlan<kHidden>;
+    static_assert(kPlan.stage_bytes <= kMaxSmemBytes, "one staged row must fit in shared memory");
+    constexpr int kXBytes = static_cast<int>(kPlan.row_bytes);
+    // Bulk copies move a 16-byte-multiple size between 16-byte-aligned addresses.
+    static_assert(kXBytes % 16 == 0 && kPlan.stage_bytes % 16 == 0);
+
+    extern __shared__ __align__(32) uint8_t stage_smem[];
+    uint8_t* const stage = stage_smem + kPlan.stage_offset(warp_idx);
+    auto* mbar = reinterpret_cast<uint64_t*>(stage + kPlan.row_bytes);
+    if (elect_one_sync())
+        tma_mbarrier_init(mbar);
+    __syncwarp();
+    // Full-warp elections select the same lane, which owns phase and the bulk stores.
+    uint32_t phase = 0;
+
     for (int64_t row = global_warp_idx; row < recv_count; row += token_stride) {
-        const int64_t src_rank = src_ranks[row];
-        const int64_t src_token = src_tokens[row];
+        const int64_t src_rank = recv_metadata[row * (kTopk + 2)];
+        const int64_t src_token = recv_metadata[row * (kTopk + 2) + 1];
         if (src_rank < 0 || src_rank >= kWorldSize || src_token < 0 || src_token >= kMaxTokens) {
             if (lane == 0)
                 printf("NanoEP combine_return invalid source: row=%lld rank=%lld token=%lld\n",
@@ -87,12 +100,12 @@ __device__ __forceinline__ void combine_return_rows(const int64_t* peer_addresse
             return;
         }
 
-        const bool valid_k = lane < kTopk && local_topk_idx[row * kTopk + lane] >= 0;
+        const bool valid_k = lane < kTopk && recv_metadata[row * (kTopk + 2) + 2 + lane] >= 0;
         const unsigned valid_mask = __ballot_sync(0xffffffffu, valid_k);
         int64_t lane_slot = -1;
         if constexpr (kExpand) {
             if (valid_k) {
-                lane_slot = expanded_slots[row * kTopk + lane];
+                lane_slot = recv_metadata[row * (kTopk + 2) + 2 + lane];
             }
         }
 
@@ -120,6 +133,7 @@ __device__ __forceinline__ void combine_return_rows(const int64_t* peer_addresse
         auto* peer_window = reinterpret_cast<uint8_t*>(peer_addresses[src_rank]);
         if constexpr (kExpand && !kAllowMultipleReduction) {
             // Keep assignments separate until the source's final reduction.
+#pragma unroll
             for (int64_t k = 0; k < kTopk; ++k) {
                 // check if current k is valid
                 if ((valid_mask & (1u << k)) == 0)
@@ -127,16 +141,16 @@ __device__ __forceinline__ void combine_return_rows(const int64_t* peer_addresse
                 const int64_t slot = __shfl_sync(0xffffffffu, lane_slot, k);
                 const int64_t peer_idx = k * kMaxTokens + src_token;
                 auto* peer_row = peer_window + return_offset + peer_idx * return_row_bytes;
-                auto* output_vectors = reinterpret_cast<int4*>(peer_row);
-                const auto* input_vectors = reinterpret_cast<const int4*>(x + slot * kHidden);
-#pragma unroll
-                for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
-#pragma unroll
-                    for (int u = 0; u < kUnrollFactor; ++u) {
-                        const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
-                        output_vectors[index] = input_vectors[index];
-                    }
+                if (elect_one_sync()) {
+                    tma_store_wait<0>();
+                    tma_mbarrier_expect_tx(mbar, kXBytes);
+                    tma_load_1d(stage, x + slot * kHidden, mbar, kXBytes);
+                    tma_mbarrier_wait(mbar, phase);
+                    phase ^= 1;
+                    tma_store_1d(peer_row, stage, kXBytes);
+                    tma_store_commit();
                 }
+                __syncwarp();
                 if constexpr (kWithWeights) {
                     if (lane == 0) {
                         auto* peer_weights = reinterpret_cast<float*>(peer_row + WindowLayout::return_weights_offset(hidden));
@@ -151,7 +165,6 @@ __device__ __forceinline__ void combine_return_rows(const int64_t* peer_addresse
             const int partition = use_rank_layout ? rank : first_valid_k;
             const int64_t peer_idx = partition * kMaxTokens + src_token;
             auto* peer_row = peer_window + return_offset + peer_idx * return_row_bytes;
-            auto* peer_x = reinterpret_cast<at::BFloat16*>(peer_row);
 
             const bool no_local_reduce = !kExpand || (kAllowMultipleReduction && __popc(valid_mask) == 1);
             if (no_local_reduce) {
@@ -160,22 +173,22 @@ __device__ __forceinline__ void combine_return_rows(const int64_t* peer_addresse
                     // Broadcast the only valid assignment's slot to the whole warp.
                     input_row = __shfl_sync(0xffffffffu, lane_slot, first_valid_k);
                 }
-                auto* output_vectors = reinterpret_cast<int4*>(peer_row);
-                const auto* input_vectors = reinterpret_cast<const int4*>(x + input_row * kHidden);
-#pragma unroll
-                for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
-#pragma unroll
-                    for (int u = 0; u < kUnrollFactor; ++u) {
-                        const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
-                        output_vectors[index] = input_vectors[index];
-                    }
+                if (elect_one_sync()) {
+                    tma_store_wait<0>();
+                    tma_mbarrier_expect_tx(mbar, kXBytes);
+                    tma_load_1d(stage, x + input_row * kHidden, mbar, kXBytes);
+                    tma_mbarrier_wait(mbar, phase);
+                    phase ^= 1;
+                    tma_store_1d(peer_row, stage, kXBytes);
+                    tma_store_commit();
                 }
+                __syncwarp();
             } else if constexpr (kExpand) {
                 int64_t slots[kTopk];
                 // number of valid k's in this row
                 const int count = compute_expanded_slots(lane_slot, valid_mask, slots);
 
-                auto* output_vectors = reinterpret_cast<int4*>(peer_x);
+                auto* output_vectors = reinterpret_cast<int4*>(stage);
                 for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
                     float2 accum[kUnrollFactor][kElemsPerVector / 2] = {};
                     for (int k = 0; k < count; ++k) {
@@ -191,6 +204,11 @@ __device__ __forceinline__ void combine_return_rows(const int64_t* peer_addresse
                             }
                         }
                     }
+                    // Overlap the first input loads with the previous store before reusing the stage.
+                    if (step == 0) {
+                        tma_store_wait<0>();
+                        __syncwarp();
+                    }
                     for (int u = 0; u < kUnrollFactor; ++u) {
                         const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
                         PackedBf16 value;
@@ -201,6 +219,13 @@ __device__ __forceinline__ void combine_return_rows(const int64_t* peer_addresse
                         output_vectors[index] = cuda::std::bit_cast<int4>(value);
                     }
                 }
+                tma_fence_shared();
+                __syncwarp();
+                if (elect_one_sync()) {
+                    tma_store_1d(peer_row, stage, kXBytes);
+                    tma_store_commit();
+                }
+                __syncwarp();
             }
             if constexpr (kWithWeights) {
                 // One lane writes each original top-k position in the same return row.
@@ -211,7 +236,13 @@ __device__ __forceinline__ void combine_return_rows(const int64_t* peer_addresse
                 }
             }
         }
+        __syncwarp();
     }
+
+    // Flush every issuing lane before the cooperative exit barrier.
+    tma_store_commit();
+    tma_store_wait<0>();
+    __syncwarp();
 }
 
 template <int kHidden,
@@ -222,18 +253,17 @@ template <int kHidden,
           bool kExpand,
           bool kAllowMultipleReduction,
           bool kWithWeights>
-__global__ void combine_return_kernel(const int64_t* peer_addresses,
-                                      const data_t* x,
-                                      const float* weights,
-                                      const int64_t* src_ranks,
-                                      const int64_t* src_tokens,
-                                      const int64_t* local_topk_idx,
-                                      const int64_t* expanded_slots,
-                                      int rank,
-                                      int64_t recv_count,
-                                      int64_t input_rows,
-                                      int64_t return_offset,
-                                      int64_t entry_epoch) {
+// One warp owns one staged row for the whole kernel, so the block shape is whatever the
+// shared-memory budget holds up to the 32-warp cap.
+__global__ void __launch_bounds__(kCombineReturnPlan<kHidden>.max_warps() * 32, 1) combine_main_kernel(const int64_t* peer_addresses,
+                                                                                                       const data_t* x,
+                                                                                                       const float* weights,
+                                                                                                       const int32_t* recv_metadata,
+                                                                                                       int rank,
+                                                                                                       int64_t recv_count,
+                                                                                                       int64_t input_rows,
+                                                                                                       int64_t return_offset,
+                                                                                                       int64_t entry_epoch) {
     auto grid = cooperative_groups::this_grid();
     auto* local_signals = reinterpret_cast<uint64_t*>(peer_addresses[rank]);
 
@@ -246,7 +276,7 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,
     grid.sync();
 
     combine_return_rows<kHidden, kTopk, kWorldSize, kMaxTokens, data_t, kExpand, kAllowMultipleReduction, kWithWeights>(
-        peer_addresses, x, weights, src_ranks, src_tokens, local_topk_idx, expanded_slots, rank, recv_count, input_rows, return_offset);
+        peer_addresses, x, weights, recv_metadata, rank, recv_count, input_rows, return_offset);
 
     // Order all writers before CTA 0's cumulative system-scope release.
     // Empty ranks participate too. Stream ordering delays the epilogue until
@@ -254,84 +284,6 @@ __global__ void combine_return_kernel(const int64_t* peer_addresses,
     grid.sync();
     if (blockIdx.x == 0)
         peer_barrier(peer_addresses, local_signals, rank, kWorldSize, static_cast<uint64_t>(entry_epoch + 1));
-}
-
-template <int kHidden, int kTopk, int kWorldSize, int64_t kMaxTokens>
-void launch_combine_return(const torch::Tensor& addresses,
-                           const torch::Tensor& x,
-                           const std::vector<torch::Tensor>& metadata,
-                           const c10::optional<torch::Tensor>& weights,
-                           int rank,
-                           const WindowLayout& layout,
-                           bool expand,
-                           bool allow_multiple_reduction,
-                           int64_t entry_epoch,
-                           cudaStream_t stream) {
-    int64_t recv_count = metadata[0].numel();
-    const auto* weight_ptr = weights.has_value() ? weights->data_ptr<float>() : nullptr;
-    constexpr int threads = 256;
-
-    using scalar_t = at::BFloat16;
-
-    const auto launch = [&]<bool kExpand, bool kAllowMultipleReduction, bool kWithWeights>() {
-        const auto kernel =
-            combine_return_kernel<kHidden, kTopk, kWorldSize, kMaxTokens, scalar_t, kExpand, kAllowMultipleReduction, kWithWeights>;
-        // Each host thread uses a fixed GPU; check each compiled variant once.
-        static thread_local bool has_pass = false;
-        if (!has_pass) {
-            int supported = 0;
-            C10_CUDA_CHECK(cudaDeviceGetAttribute(&supported, cudaDevAttrCooperativeLaunch, x.get_device()));
-            TORCH_CHECK(supported, "combine main requires CUDA cooperative launch support");
-
-            // combine_main will launch num_sm blocks, so each block must at least allow one active block to enable grid sync.
-            int active_blocks_per_sm = 0;
-            C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_sm, kernel, threads, 0));
-            TORCH_CHECK(active_blocks_per_sm >= 1, "combine main cannot fit a 256-thread cooperative block on an SM");
-
-            has_pass = true;
-        }
-        const int blocks = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
-
-        auto* address_ptr = addresses.data_ptr<int64_t>();
-        const auto* x_ptr = x.data_ptr<scalar_t>();
-        const auto* src_ranks = metadata[0].data_ptr<int64_t>();
-        const auto* src_tokens = metadata[1].data_ptr<int64_t>();
-        const auto* local_topk = metadata[2].data_ptr<int64_t>();
-        const auto* expanded_slots = kExpand ? metadata[5].data_ptr<int64_t>() : nullptr;
-        int64_t input_rows = x.size(0);
-        int64_t return_offset = layout.return_offset;
-        void* args[] = {&address_ptr,
-                        &x_ptr,
-                        &weight_ptr,
-                        &src_ranks,
-                        &src_tokens,
-                        &local_topk,
-                        &expanded_slots,
-                        &rank,
-                        &recv_count,
-                        &input_rows,
-                        &return_offset,
-                        &entry_epoch};
-        C10_CUDA_CHECK(cudaLaunchCooperativeKernel(reinterpret_cast<const void*>(kernel), dim3(blocks), dim3(threads), args, 0, stream));
-    };
-    const auto launch_with_weights = [&]<bool kExpand, bool kAllowMultipleReduction>() {
-        if (weights.has_value())
-            launch.template operator()<kExpand, kAllowMultipleReduction, true>();
-        else
-            launch.template operator()<kExpand, kAllowMultipleReduction, false>();
-    };
-    if (expand) {
-        if (allow_multiple_reduction)
-            launch_with_weights.template operator()<true, true>();
-        else
-            launch_with_weights.template operator()<true, false>();
-    } else {
-        if (allow_multiple_reduction)
-            launch_with_weights.template operator()<false, true>();
-        else
-            launch_with_weights.template operator()<false, false>();
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace nano_ep

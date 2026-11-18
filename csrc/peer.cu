@@ -29,6 +29,8 @@ PeerRuntime::PeerRuntime(int rank, int world_size, int64_t num_bytes) : rank_(ra
     C10_CUDA_CHECK(cudaMalloc(&local_ptr_, static_cast<size_t>(num_bytes_)));
 
     try {
+        local_window_ =
+            torch::from_blob(local_ptr_, {num_bytes_}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA, device_));
         C10_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&host_counts_), 2 * sizeof(int64_t), cudaHostAllocMapped));
         C10_CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&mapped_counts_), host_counts_, 0));
         host_counts_[0] = -1;
@@ -159,7 +161,7 @@ torch::Tensor PeerRuntime::peer_addresses() const {
 torch::Tensor PeerRuntime::local_window() const {
     TORCH_CHECK(!closing_ && !closed_, "PeerRuntime is closing or closed");
 
-    return torch::from_blob(local_ptr_, {num_bytes_}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA, device_));
+    return local_window_;
 }
 
 __global__ void barrier_kernel(const int64_t* peer_addresses, uint64_t* local_window, int64_t rank, int64_t world_size, uint64_t epoch) {
@@ -271,6 +273,7 @@ void PeerRuntime::close() {
     c10::cuda::CUDAGuard device_guard(device_);
 
     C10_CUDA_CHECK(cudaFree(local_ptr_));
+    local_window_ = torch::Tensor();
     local_ptr_ = nullptr;
     peer_ptrs_[rank_] = nullptr;
     C10_CUDA_CHECK(cudaFreeHost(host_counts_));

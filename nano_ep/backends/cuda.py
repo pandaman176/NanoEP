@@ -7,26 +7,16 @@ from dataclasses import asdict, dataclass
 import torch
 import torch.distributed as dist
 
-from nano_ep.backends._build import (
-    load_extension,
-    prepare_combine_epilogue,
-    prepare_combine_main,
-    prepare_dispatch_epilogue,
-    prepare_dispatch_main,
-)
+from nano_ep.backends._build import load_extension
+from nano_ep.backends._sms import nvlink_gbs, theoretical_num_sms
 from nano_ep.config import EPConfig
 
 
 @dataclass
 class NativeLayout:
-    """CUDA metadata with source prefix [R]; expanded_slots is [N,K] or compact [0]."""
-
-    src_ranks: torch.Tensor
-    src_tokens: torch.Tensor
-    local_topk_idx: torch.Tensor
+    recv_metadata: torch.Tensor
     expert_counts: torch.Tensor
     expert_offsets: torch.Tensor
-    expanded_slots: torch.Tensor
     recv_rank_prefix: torch.Tensor
     recv_count: int
     expanded_capacity: int
@@ -45,6 +35,7 @@ class NativeHandle:
     send_counts: torch.Tensor
     owner: object
     x_dtype: torch.dtype
+    num_sms: int | None = None
 
 
 @dataclass
@@ -53,28 +44,24 @@ class NativeDispatchResult:
     topk_idx: torch.Tensor | None
     topk_weights: torch.Tensor | None
     handle: NativeHandle
-    event: "CudaEvent"
+    event: "CudaEvent | None"
 
 
 @dataclass
 class NativeCombineResult:
     x: torch.Tensor
     topk_weights: torch.Tensor | None
-    event: "CudaEvent"
+    event: "CudaEvent | None"
 
 
 class CudaEvent:
-    def __init__(self, event: torch.cuda.Event, keepalive: tuple = (), tensors: tuple[torch.Tensor, ...] = ()):
+    def __init__(self, event, keepalive: tuple = ()):
         self.event = event
         self.keepalive = keepalive
-        self._tensors = tensors
 
     def current_stream_wait(self):
         """Wait on the consumer stream and protect tensors used on that stream."""
-        stream = torch.cuda.current_stream()
-        stream.wait_event(self.event)
-        for tensor in self._tensors:
-            tensor.record_stream(stream)
+        self.event.current_stream_wait()
 
 
 def close_peer_runtime(runtime, group, device):
@@ -100,10 +87,6 @@ class CudaBuffer:
         self._world_size = dist.get_world_size(group=group)
         self._rank = dist.get_rank(group=group)
         self._runtime = None
-        self._dispatch_epilogues = None
-        self._combine_epilogue = None
-        self._combine_main_module = None
-        self._dispatch_main_modules = {}
         self._comm_stream = None
         self._closed = True
         if dist.get_backend(group) != "gloo":
@@ -115,6 +98,7 @@ class CudaBuffer:
                 raise TypeError("allow_multiple_reduction must be bool")
             self._device = torch.cuda.current_device()
             properties = torch.cuda.get_device_properties(self._device)
+            self._device_sms = properties.multi_processor_count
             local_info.update(
                 config=asdict(config),
                 allow_multiple_reduction=allow_multiple_reduction,
@@ -145,6 +129,8 @@ class CudaBuffer:
         gpu_uuids = [info["gpu_uuid"] for info in all_info]
         if len(set(gpu_uuids)) != self._world_size:
             raise ValueError(f"Ranks must use distinct GPUs: {gpu_uuids}")
+        self._gpu_uuids = tuple(gpu_uuids)
+        self._auto_num_sms = None
 
         if any(info["local_world_size"] != self._world_size for info in all_info):
             raise ValueError("Group must contain all local workers")
@@ -161,12 +147,6 @@ class CudaBuffer:
         allocation = {"handle": None, "error": None}
         try:
             self._backend = load_extension()
-            self._dispatch_epilogues = tuple(
-                prepare_dispatch_epilogue(
-                    config.hidden, config.num_topk, config.num_experts // self._world_size, cached_mode=cached_mode
-                ).dispatch_epilogue
-                for cached_mode in (False, True)
-            )
             (
                 self._signal_offset,
                 self._count_offset,
@@ -180,28 +160,6 @@ class CudaBuffer:
                 config.num_topk,
                 config.num_experts,
                 allow_multiple_reduction,
-            )
-            self._combine_epilogue = prepare_combine_epilogue(
-                config.hidden,
-                config.num_topk,
-                self._world_size,
-                config.num_experts // self._world_size,
-                config.num_max_tokens_per_rank,
-            ).combine_epilogue
-            self._combine_main_module = prepare_combine_main(
-                config.hidden,
-                config.num_topk,
-                self._world_size,
-                config.num_experts // self._world_size,
-                config.num_max_tokens_per_rank,
-            )
-            self._dispatch_main_modules[1] = prepare_dispatch_main(
-                config.hidden,
-                config.num_topk,
-                self._world_size,
-                config.num_experts // self._world_size,
-                config.num_max_tokens_per_rank,
-                1,
             )
             self._runtime = self._backend.PeerRuntime(self._rank, self._world_size, self._num_bytes)
             # All-one bytes represent int64 -1; send_next and barrier signals stay zero.
@@ -264,6 +222,19 @@ class CudaBuffer:
 
         self._closed = False
 
+    def _resolve_num_sms(self, num_sms: int | None, handle: NativeHandle | None) -> int:
+        if num_sms is None:
+            return self._device_sms if handle is None or handle.num_sms is None else handle.num_sms
+        if isinstance(num_sms, bool) or not isinstance(num_sms, int) or not 0 <= num_sms <= self._device_sms:
+            raise ValueError(f"num_sms must be an integer between 0 and {self._device_sms}")
+        if num_sms > 0:
+            return num_sms
+        if self._auto_num_sms is None:
+            self._auto_num_sms = theoretical_num_sms(
+                self._device_sms, self._world_size, self._config.num_experts, self._config.num_topk, nvlink_gbs(self._gpu_uuids)
+            )
+        return self._auto_num_sms
+
     def dispatch(
         self,
         x: torch.Tensor,
@@ -276,6 +247,7 @@ class CudaBuffer:
         zero_padding: bool = False,
         previous_event: torch.cuda.Event | None = None,
         async_op: bool = False,
+        num_sms: int | None = None,
     ) -> NativeDispatchResult:
         'Dispatch payloads using fresh or cached routing; return exact receive layouts.'
         if self._closed:
@@ -283,8 +255,6 @@ class CudaBuffer:
         if handle is not None:
             if handle.owner is not self:
                 raise ValueError("cached handle belongs to another CudaBuffer")
-            if handle.config != self._config:
-                raise ValueError("cached handle configuration does not match this CudaBuffer")
             if topk_idx is not None:
                 raise ValueError("cached dispatch uses the handle snapshot; omit topk_idx")
             if alignment is not None and alignment != handle.alignment:
@@ -298,24 +268,11 @@ class CudaBuffer:
         if do_expand is not None and not isinstance(do_expand, bool):
             raise ValueError("do_expand must be bool or None")
 
-        device = torch.device("cuda", self._device)
-        if x.device != device or x.ndim != 2 or not x.is_contiguous() or x.dtype != torch.bfloat16:
-            raise ValueError("x must be contiguous CUDA bfloat16 [T,H] on this buffer's device")
-        if x.shape[1] != self._config.hidden or x.shape[0] > self._config.num_max_tokens_per_rank:
-            raise ValueError("x hidden dimension or source token count does not match the buffer configuration")
-        if x.shape[1] % 256 != 0:
-            raise ValueError("CUDA EP hidden must be a positive multiple of 256")
         routing = handle.topk_idx if handle is not None else topk_idx
-        shape = (x.shape[0], self._config.num_topk)
-        if routing.device != device or routing.dtype != torch.int64 or routing.shape != shape or not routing.is_contiguous():
-            raise ValueError("routing snapshot/topk_idx must be contiguous CUDA int64 [T,K] matching the buffer configuration")
-        if weights is not None and (
-            weights.device != device or weights.dtype != torch.float32 or weights.shape != shape or not weights.is_contiguous()
-        ):
-            raise ValueError("weights must be contiguous CUDA float32 [T,K] matching x and routing")
-
-        if handle is not None and x.dtype != handle.x_dtype:
-            raise ValueError("cached dispatch must retain the handle x dtype")
+        if x.shape[1] != self._config.hidden:
+            raise ValueError("x hidden dimension does not match the buffer configuration")
+        if routing.shape != (x.shape[0], self._config.num_topk):
+            raise ValueError("routing snapshot/topk_idx shape must match the buffer configuration")
 
         if handle is None:
             expand = False if do_expand is None else do_expand
@@ -328,94 +285,61 @@ class CudaBuffer:
             layout = handle.layout
             cached_expanded_capacity = layout.expanded_capacity
             cached_metadata = [
-                layout.src_ranks,
-                layout.src_tokens,
-                layout.local_topk_idx,
+                layout.recv_metadata,
                 layout.expert_counts,
                 layout.expert_offsets,
-                layout.expanded_slots,
                 handle.dst_slots,
                 handle.send_counts,
                 handle.topk_idx,
                 layout.recv_rank_prefix,
             ]
 
-        with torch.cuda.device(self._device):
-            if expert_alignment not in self._dispatch_main_modules:
-                self._dispatch_main_modules[expert_alignment] = prepare_dispatch_main(
-                    self._config.hidden,
-                    self._config.num_topk,
-                    self._world_size,
-                    self._config.num_experts // self._world_size,
-                    self._config.num_max_tokens_per_rank,
-                    expert_alignment,
-                )
-            main_module = self._dispatch_main_modules[expert_alignment]
-            compute_stream = torch.cuda.current_stream(self._device)
-            if previous_event is None:
-                self._comm_stream.wait_stream(compute_stream)
-            else:
-                self._comm_stream.wait_event(previous_event)
+        main_sms = self._resolve_num_sms(num_sms, handle)
+        outputs, metadata, counts, completed = self._backend.dispatch(
+            self._runtime,
+            x,
+            routing,
+            weights,
+            self._config.num_experts,
+            self._config.num_max_tokens_per_rank,
+            expert_alignment,
+            cached_metadata,
+            cached_expanded_capacity,
+            self._allow_multiple_reduction,
+            expand,
+            zero_padding,
+            main_sms,
+            self._comm_stream.cuda_stream,
+            -1 if previous_event is None else previous_event.cuda_event,
+            async_op,
+        )
+        recv_count, expanded_capacity = counts
 
-            with torch.cuda.stream(self._comm_stream):
-                # Inputs can be released on their allocation stream while comm reads them.
-                input_tensors = (x, routing) + ((weights,) if weights is not None else ())
-                for tensor in (*input_tensors, *cached_metadata):
-                    tensor.record_stream(self._comm_stream)
-
-                state = self._backend.dispatch_main(
-                    self._runtime,
-                    x,
-                    routing,
-                    weights,
-                    self._config.num_experts,
-                    self._config.num_max_tokens_per_rank,
-                    expert_alignment,
-                    cached_metadata,
-                    cached_expanded_capacity,
-                    self._allow_multiple_reduction,
-                    main_module.launcher,
-                )
-                outputs = self._dispatch_epilogues[state.metadata_prepared](state, expand, weights is not None, zero_padding)
-                metadata = state.metadata
-                recv_count, expanded_capacity = state.counts.tolist()  # Native-owned CPU int64 [2].
-
-                if handle is None:
-                    layout = NativeLayout(
-                        src_ranks=metadata[0],
-                        src_tokens=metadata[1],
-                        local_topk_idx=metadata[2],
-                        expert_counts=metadata[3],
-                        expert_offsets=metadata[4],
-                        expanded_slots=metadata[5],
-                        recv_rank_prefix=metadata[9],
-                        recv_count=recv_count,
-                        expanded_capacity=expanded_capacity,
-                    )
-                    handle = NativeHandle(
-                        config=self._config,
-                        rank=self._rank,
-                        world_size=self._world_size,
-                        do_expand=expand,
-                        alignment=expert_alignment,
-                        topk_idx=metadata[8],
-                        layout=layout,
-                        dst_slots=metadata[6],
-                        send_counts=metadata[7],
-                        owner=self,
-                        x_dtype=x.dtype,
-                    )
-
-                completed = torch.cuda.Event()
-                completed.record(self._comm_stream)
-
-            event = CudaEvent(
-                completed,
-                keepalive=(self, x, routing, weights, state, handle),
-                tensors=(*outputs, *metadata),
+        if handle is None:
+            layout = NativeLayout(
+                recv_metadata=metadata[0],
+                expert_counts=metadata[1],
+                expert_offsets=metadata[2],
+                recv_rank_prefix=metadata[6],
+                recv_count=recv_count,
+                expanded_capacity=expanded_capacity,
             )
-            if not async_op:
-                event.current_stream_wait()
+            handle = NativeHandle(
+                config=self._config,
+                rank=self._rank,
+                world_size=self._world_size,
+                do_expand=expand,
+                alignment=expert_alignment,
+                topk_idx=metadata[5],
+                layout=layout,
+                dst_slots=metadata[3],
+                send_counts=metadata[4],
+                owner=self,
+                x_dtype=x.dtype,
+                num_sms=main_sms,
+            )
+
+        event = CudaEvent(completed, keepalive=(self, x, routing, weights, handle)) if async_op else None
 
         return NativeDispatchResult(
             x=outputs[0],
@@ -434,6 +358,7 @@ class CudaBuffer:
         bias: torch.Tensor | None = None,
         previous_event: torch.cuda.Event | None = None,
         async_op: bool = False,
+        num_sms: int | None = None,
     ) -> NativeCombineResult:
         'Return expert outputs to their source and reduce in FP32, without gate weighting.'
         if self._closed:
@@ -461,63 +386,32 @@ class CudaBuffer:
             raise ValueError("combine bias must be contiguous source [T,H], with the x dtype on this buffer's device")
 
         metadata = [
-            layout.src_ranks,
-            layout.src_tokens,
-            layout.local_topk_idx,
+            layout.recv_metadata,
             layout.expert_counts,
             layout.expert_offsets,
-            layout.expanded_slots,
             handle.dst_slots,
             handle.send_counts,
             handle.topk_idx,
             layout.recv_rank_prefix,
         ]
+        main_sms = self._resolve_num_sms(num_sms, handle)
         with torch.cuda.device(self._device):
-            compute_stream = torch.cuda.current_stream(self._device)
-            if previous_event is None:
-                self._comm_stream.wait_stream(compute_stream)
-            else:
-                self._comm_stream.wait_event(previous_event)
+            outputs, completed = self._backend.combine(
+                self._runtime,
+                x,
+                metadata,
+                weights,
+                bias,
+                self._config.num_max_tokens_per_rank,
+                handle.do_expand,
+                self._allow_multiple_reduction,
+                main_sms,
+                self._comm_stream.cuda_stream,
+                -1 if previous_event is None else previous_event.cuda_event,
+                async_op,
+            )
 
-            with torch.cuda.stream(self._comm_stream):
-                input_tensors = (x, *metadata)
-                if weights is not None:
-                    input_tensors += (weights,)
-                if bias is not None:
-                    input_tensors += (bias,)
-                for tensor in input_tensors:
-                    tensor.record_stream(self._comm_stream)
-
-                returned = self._backend.combine_main(
-                    self._runtime,
-                    x,
-                    metadata,
-                    weights,
-                    self._config.num_max_tokens_per_rank,
-                    handle.do_expand,
-                    self._allow_multiple_reduction,
-                    self._combine_main_module.launcher,
-                )
-                outputs = self._combine_epilogue(
-                    returned,
-                    handle.topk_idx,
-                    hidden,
-                    x.dtype,
-                    self._config.num_experts,
-                    self._world_size,
-                    self._config.num_max_tokens_per_rank,
-                    bias,
-                    weights is not None,
-                    handle.do_expand,
-                    self._allow_multiple_reduction,
-                )
-                completed = torch.cuda.Event()
-                completed.record(self._comm_stream)
-
-            # The borrowed window is owned by runtime, not the PyTorch allocator.
-            event = CudaEvent(completed, keepalive=(self, x, handle, weights, bias, returned), tensors=tuple(outputs))
-            if not async_op:
-                event.current_stream_wait()
+            event = CudaEvent(completed, keepalive=(self, x, handle, weights, bias)) if async_op else None
 
         return NativeCombineResult(x=outputs[0], topk_weights=outputs[1] if weights is not None else None, event=event)
 

@@ -4,8 +4,8 @@
 
 #include <cstdint>
 #include <cuda/std/bit>
-
-#include "layout.hpp"
+#include <layout.hpp>
+#include <nano_ep/tma.cuh>
 
 namespace nano_ep {
 
@@ -54,6 +54,10 @@ __device__ __forceinline__ void restore_weights(const uint8_t* stage_buffer,  //
     }
 }
 
+// One reduced output row is assembled per warp and published with a bulk store.
+template <int kHidden>
+inline constexpr auto kCombineOutputPlan = HiddenRowPlan::make(kHidden);
+
 template <int kHidden,  // H
           int kTopk,    // K
           int kWorldSize,
@@ -62,18 +66,23 @@ template <int kHidden,  // H
           bool kExpand,
           bool kAllowMultipleReduction,
           bool kWithWeights>
-__global__ void combine_reduce_epilogue_kernel(const uint8_t* stage_buffer,  // [P,Tmax,row_bytes], BF16 x[H], aligned FP32 weights[K]
-                                               const int64_t* source_topk,   // [T,K], global expert IDs, masked = -1
-                                               const nv_bfloat16* bias,      // [T,H], or nullptr
-                                               nv_bfloat16* combined_x,      // [T,H], write every element
-                                               float* combined_weights,      // [T,K], or nullptr; masked slots must be zero
-                                               int64_t num_tokens) {         // actual source T
+__global__ void __launch_bounds__(kCombineOutputPlan<kHidden>.max_warps() * 32, 1)
+    combine_epilogue_kernel(const uint8_t* stage_buffer,  // [P,Tmax,row_bytes], BF16 x[H], aligned FP32 weights[K]
+                            const int64_t* source_topk,   // [T,K], global expert IDs, masked = -1
+                            const nv_bfloat16* bias,      // [T,H], or nullptr
+                            nv_bfloat16* combined_x,      // [T,H], write every element
+                            float* combined_weights,      // [T,K], or nullptr; masked slots must be zero
+                            int64_t num_tokens,           // actual source T
+                            bool use_pdl) {
     constexpr int kWarpSize = 32;
     constexpr int kElemsPerVector = sizeof(int4) / sizeof(nv_bfloat16);
     constexpr bool kRankLayout = kAllowMultipleReduction && kWorldSize <= kTopk;
     constexpr int kNumPartitionsInLayout = kAllowMultipleReduction ? (kWorldSize < kTopk ? kWorldSize : kTopk) : kTopk;
     constexpr int64_t kWeightOffset = kHidden * sizeof(nv_bfloat16);
     constexpr int64_t kReturnRowBytes = kWeightOffset + ((kTopk * sizeof(float) + 31) / 32) * 32;
+    constexpr auto kPlan = kCombineOutputPlan<kHidden>;
+    static_assert(kPlan.stage_bytes <= kMaxSmemBytes, "one staged row must fit in shared memory");
+    constexpr int kOutputBytes = static_cast<int>(kPlan.row_bytes);
     constexpr int kVectorsPerLane = kHidden / (kWarpSize * kElemsPerVector);
     constexpr int kUnrollFactor = [] {
         for (int factor = 4; factor >= 1; --factor)
@@ -88,14 +97,22 @@ __global__ void combine_reduce_epilogue_kernel(const uint8_t* stage_buffer,  // 
     // Each warp processes one source token per iteration; lanes stride over hidden coordinates in int4 vectors.
     const int lane = threadIdx.x % kWarpSize;
     const int warp_idx = threadIdx.x / kWarpSize;
+    // One reduced row per warp is assembled in shared memory, so a single bulk
+    // store publishes it while the warp starts the next row.
+    extern __shared__ __align__(16) uint8_t stage_smem[];
+    uint8_t* const stage = stage_smem + kPlan.stage_offset(warp_idx);
     // Distribute the first tokens across blocks before assigning another warp to each block.
     const int64_t global_warp_idx = static_cast<int64_t>(warp_idx) * gridDim.x + blockIdx.x;
     const int64_t token_stride = static_cast<int64_t>(blockDim.x / kWarpSize) * gridDim.x;
 
+    // The main kernel completes the peer barrier before the return window can be read.
+    if (use_pdl)
+        cudaGridDependencySynchronize();
+
     for (int64_t row = global_warp_idx; row < num_tokens; row += token_stride) {
         // Expanded without local reduction reads each valid k partition. Otherwise
         // deduplicate destination ranks, selecting rank or first-k partitions exactly
-        // as combine_return_kernel does. Never read unpublished rows or weight fields.
+        // as combine_main_kernel does. Never read unpublished rows or weight fields.
         // Accumulate x in FP32, add optional bias once, then cast once to BF16.
         // Restore valid weights independently at their original k; write masked zeros.
         const int64_t expert = lane < kTopk ? source_topk[row * kTopk + lane] : -1;
@@ -122,13 +139,8 @@ __global__ void combine_reduce_epilogue_kernel(const uint8_t* stage_buffer,  // 
             weight_partition = expert >= 0 ? lane : -1;
         }
 
-        // Restore weights once, outside the hidden-coordinate loop.
-        if constexpr (kWithWeights) {
-            restore_weights(stage_buffer, combined_weights, lane, weight_partition, row, kHidden, kTopk, kMaxTokens, kReturnRowBytes);
-        }
-
         // Each int4 covers eight BF16 coordinates; H % 256 == 0 leaves no hidden tail.
-        auto* output_vectors = reinterpret_cast<int4*>(combined_x + row * kHidden);
+        auto* output_vectors = reinterpret_cast<int4*>(stage);
         for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
             float2 accum[kUnrollFactor][kElemsPerVector / 2] = {};
 #pragma unroll
@@ -150,6 +162,11 @@ __global__ void combine_reduce_epilogue_kernel(const uint8_t* stage_buffer,  // 
                     }
                 }
             }
+            // Overlap the first input loads with the previous store before reusing the stage.
+            if (step == 0) {
+                tma_store_wait<0>();
+                __syncwarp();
+            }
 #pragma unroll
             for (int u = 0; u < kUnrollFactor; ++u) {
                 const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
@@ -168,7 +185,21 @@ __global__ void combine_reduce_epilogue_kernel(const uint8_t* stage_buffer,  // 
                 output_vectors[index] = cuda::std::bit_cast<int4>(value);
             }
         }
+        tma_fence_shared();
+        __syncwarp();
+        if (elect_one_sync()) {
+            tma_store_1d(combined_x + row * kHidden, stage, kOutputBytes);
+            tma_store_commit();
+        }
+        __syncwarp();
+
+        // Restore weights once, outside the hidden-coordinate loop.
+        if constexpr (kWithWeights) {
+            restore_weights(stage_buffer, combined_weights, lane, weight_partition, row, kHidden, kTopk, kMaxTokens, kReturnRowBytes);
+            __syncwarp();
+        }
     }
+    tma_store_wait<0>();
 }
 
 }  // namespace nano_ep

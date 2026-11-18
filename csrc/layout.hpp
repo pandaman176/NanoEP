@@ -120,6 +120,57 @@ private:
     }
 };
 
+// Hopper admits 227KB of shared memory per block, static and dynamic together.
+inline constexpr int64_t kMaxSmemBytes = 227 * 1024;
+
+// One payload row staged in shared memory per warp; rows are broadcast with bulk copies, so a row
+// crosses the memory system once instead of once per destination.
+struct PayloadRowPlan {
+    int64_t row_bytes;    // one wire-format payload row, 32-byte aligned
+    int64_t stage_bytes;  // one row plus its mbarrier slot
+    int64_t num_bytes;    // dynamic shared memory request
+    int payload_warps;
+    int total_warps;
+
+    // reserved_bytes is the static shared memory kept alongside the stages.
+    static constexpr PayloadRowPlan make(int hidden, int topk, int notify_warps = 0, int64_t reserved_bytes = 0) {
+        const int64_t row_bytes = WindowLayout::payload_row_bytes(hidden, topk);
+        const int64_t stage_bytes = row_bytes + 32;  // one mbarrier slot
+        const int payload_warps = std::min<int64_t>(32 - notify_warps, (kMaxSmemBytes - reserved_bytes) / stage_bytes);
+        return {row_bytes, stage_bytes, payload_warps * stage_bytes, payload_warps, notify_warps + payload_warps};
+    }
+
+    NANO_EP_HOST_DEVICE constexpr int64_t stage_offset(int warp) const { return static_cast<int64_t>(warp) * stage_bytes; }
+};
+
+// Fresh dispatch reserves warps for counting and notification.
+constexpr int dispatch_notify_warps(bool cached) {
+    return cached ? 0 : 4;
+}
+
+constexpr PayloadRowPlan make_dispatch_payload_plan(int hidden, int topk, int64_t ranks, int64_t experts_per_rank, int notify_warps) {
+    const int64_t count_entries = ranks + ranks * experts_per_rank;
+    const int64_t reserved_bytes = notify_warps == 0 ? 0 : count_entries * static_cast<int64_t>(sizeof(uint32_t));
+    return PayloadRowPlan::make(hidden, topk, notify_warps, reserved_bytes);
+}
+
+// One BF16 row and its optional load barrier in shared memory per warp.
+struct HiddenRowPlan {
+    int64_t row_bytes;    // one BF16 row
+    int64_t stage_bytes;  // one row plus its per-warp bookkeeping
+
+    static constexpr HiddenRowPlan make(int hidden, bool incoming = false) {
+        const int64_t row_bytes = static_cast<int64_t>(hidden) * 2;  // BF16 hidden dimension
+        return {row_bytes, row_bytes + (incoming ? 32 : 0)};
+    }
+
+    constexpr int max_warps(int64_t smem_budget = kMaxSmemBytes) const {
+        return static_cast<int>(std::min<int64_t>(32, smem_budget / stage_bytes));
+    }
+
+    NANO_EP_HOST_DEVICE constexpr int64_t stage_offset(int warp) const { return static_cast<int64_t>(warp) * stage_bytes; }
+};
+
 }  // namespace nano_ep
 
 #undef NANO_EP_HOST_DEVICE

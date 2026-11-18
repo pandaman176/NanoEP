@@ -1,147 +1,48 @@
-"""Load the CUDA extension lazily from self-contained native sources."""
+"""Build the host extension once; DeepJIT compiles device kernels on demand."""
 
 import os
-from functools import cache, lru_cache
+import shlex
+from functools import cache
 from pathlib import Path
-
-import torch
 
 
 def native_source_dir() -> Path:
     package = Path(__file__).resolve().parents[1]
-    bundled = package / "_csrc"
-    return bundled if bundled.is_dir() else package.parent / "csrc"
+    for source in (package / "_csrc", package / "nano_csrc", package.parent / "nano_csrc", package.parent / "csrc"):
+        if source.is_dir():
+            return source
+    raise RuntimeError("NanoEP native sources are missing")
 
 
-@lru_cache(maxsize=1)
+def deepjit_source_dir(source: Path) -> Path:
+    for dependency in (source / "deep_jit", source.parent / "third-party" / "deep_jit"):
+        if (dependency / "include/deep_jit/backend/cuda/backend.hpp").is_file():
+            return dependency
+    raise RuntimeError("DeepJIT headers are missing. Run git submodule update --init third-party/deep_jit")
+
+
+@cache
 def load_extension():
     from torch.utils.cpp_extension import CUDA_HOME, load
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("NanoEP requires an NVIDIA CUDA GPU")
     if CUDA_HOME is None:
         raise RuntimeError("CUDA_HOME/nvcc is required to compile NanoEP")
+    source = native_source_dir()
+    deepjit = deepjit_source_dir(source)
+    # This flag targets the extension's IPC barrier. DeepJIT selects the device
+    # architecture for the four communication kernels separately.
     os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0")
-    source = native_source_dir()
-    return load(
+    module = load(
         name="nano_ep_native",
-        sources=[str(source / name) for name in ("bindings.cpp", "peer.cu", "pipeline.cu")],
-        extra_include_paths=[str(source / "include")],
-        extra_cflags=["-O2", "-std=c++20"],
+        sources=[
+            str(source / name)
+            for name in ("bindings.cpp", "jit.cpp", "peer.cu", "pipeline.cu", "dispatch_epilogue.cpp", "combine_epilogue.cpp")
+        ],
+        extra_include_paths=[str(source / "include"), str(deepjit / "include")],
+        extra_cflags=["-O2", "-std=c++20", "-DUSE_CUDA"],
         extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo"],
+        extra_ldflags=["-ldl", *shlex.split(os.environ.get("LDFLAGS", ""))],
         verbose=os.environ.get("NANO_EP_BUILD_VERBOSE") == "1",
     )
-
-
-@cache
-def prepare_combine_epilogue(hidden: int, topk: int, world_size: int, experts_per_rank: int, max_tokens: int):
-    """Compile one geometry; CudaBuffer prewarms it before IPC collectives."""
-    from torch.utils.cpp_extension import load
-
-    if (
-        hidden <= 0
-        or hidden > 2**31 - 1
-        or hidden % 256
-        or not 1 <= topk <= 32
-        or not 1 <= world_size <= 32
-        or experts_per_rank <= 0
-        or max_tokens <= 0
-    ):
-        raise RuntimeError("invalid combine epilogue geometry: H must be a positive multiple of 256, K/R in [1,32], L/Tmax positive")
-    source = native_source_dir()
-    geometry = (hidden, topk, world_size, experts_per_rank, max_tokens)
-    names = ("HIDDEN", "TOPK", "WORLD_SIZE", "EXPERTS_PER_RANK", "MAX_TOKENS")
-    defines = [f"-DNANO_EP_{name}={value}" for name, value in zip(names, geometry, strict=True)]
-    return load(
-        name="nano_ep_combine_" + "_".join(map(str, geometry)),
-        sources=[str(source / "combine_epilogue.cu")],
-        extra_cflags=["-O2", "-std=c++20"],
-        extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo", *defines],
-        verbose=os.environ.get("NANO_EP_BUILD_VERBOSE") == "1",
-    )
-
-
-@cache
-def prepare_combine_main(hidden: int, topk: int, world_size: int, experts_per_rank: int, max_tokens: int):
-    """Compile one geometry; CudaBuffer prewarms it before IPC collectives."""
-    from torch.utils.cpp_extension import load
-
-    if (
-        hidden <= 0
-        or hidden > 2**31 - 1
-        or hidden % 256
-        or not 1 <= topk <= 32
-        or not 1 <= world_size <= 32
-        or experts_per_rank <= 0
-        or max_tokens <= 0
-    ):
-        raise RuntimeError("invalid combine main geometry: H must be a positive multiple of 256, K/R in [1,32], L/Tmax positive")
-    source = native_source_dir()
-    geometry = (hidden, topk, world_size, experts_per_rank, max_tokens)
-    names = ("HIDDEN", "TOPK", "WORLD_SIZE", "EXPERTS_PER_RANK", "MAX_TOKENS")
-    defines = [f"-DNANO_EP_{name}={value}" for name, value in zip(names, geometry, strict=True)]
-    return load(
-        name="nano_ep_combine_main_" + "_".join(map(str, geometry)),
-        sources=[str(source / "combine_main.cu")],
-        extra_include_paths=[str(source / "include")],
-        extra_cflags=["-O2", "-std=c++20"],
-        extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo", *defines],
-        verbose=os.environ.get("NANO_EP_BUILD_VERBOSE") == "1",
-    )
-
-
-@cache
-def prepare_dispatch_main(hidden: int, topk: int, world_size: int, experts_per_rank: int, max_tokens: int, expert_alignment: int):
-    """Compile one geometry; CudaBuffer prewarms it before IPC collectives."""
-    from torch.utils.cpp_extension import load
-
-    if (
-        hidden <= 0
-        or hidden > 2**31 - 1
-        or hidden % 256
-        or not 1 <= topk <= 32
-        or not 1 <= world_size <= 32
-        or world_size & (world_size - 1)
-        or topk > world_size * experts_per_rank
-        or world_size * (experts_per_rank + 1) > 2**31 - 1
-        or experts_per_rank <= 0
-        or max_tokens <= 0
-        or isinstance(expert_alignment, bool)
-        or not isinstance(expert_alignment, int)
-        or not 0 < expert_alignment <= 2**63 - 1
-    ):
-        raise RuntimeError("invalid dispatch main geometry: H must be a positive multiple of 256, K/R in [1,32], L/Tmax and integer alignment positive")
-    source = native_source_dir()
-    geometry = (hidden, topk, world_size, experts_per_rank, max_tokens, expert_alignment)
-    names = ("HIDDEN", "TOPK", "WORLD_SIZE", "EXPERTS_PER_RANK", "MAX_TOKENS", "EXPERT_ALIGNMENT")
-    defines = [f"-DNANO_EP_{name}={value}" for name, value in zip(names, geometry, strict=True)]
-    return load(
-        name="nano_ep_dispatch_main_" + "_".join(map(str, geometry)),
-        sources=[str(source / "dispatch_main.cu")],
-        extra_include_paths=[str(source / "include")],
-        extra_cflags=["-O2", "-std=c++20"],
-        extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo", *defines],
-        verbose=os.environ.get("NANO_EP_BUILD_VERBOSE") == "1",
-    )
-
-
-@cache
-def prepare_dispatch_epilogue(hidden: int, topk: int, experts_per_rank: int, *, cached_mode: bool):
-    """Compile one geometry and cache mode before entering IPC collectives."""
-    from torch.utils.cpp_extension import load
-
-    if hidden <= 0 or hidden > 2**31 - 1 or hidden % 256 or not 1 <= topk <= 32 or experts_per_rank <= 0:
-        raise RuntimeError("invalid dispatch epilogue geometry: H must be a positive multiple of 256, K in [1,32], L positive")
-    source = native_source_dir()
-    geometry = (hidden, topk, experts_per_rank)
-    names = ("HIDDEN", "TOPK", "EXPERTS_PER_RANK")
-    defines = [f"-DNANO_EP_{name}={value}" for name, value in zip(names, geometry, strict=True)]
-    defines.append(f"-DNANO_EP_CACHED_MODE={int(cached_mode)}")
-    return load(
-        name="nano_ep_dispatch_epilogue_" + "_".join(map(str, geometry)) + f"_cached{int(cached_mode)}",
-        sources=[str(source / "dispatch_epilogue.cu")],
-        extra_include_paths=[str(source / "include")],
-        extra_cflags=["-O2", "-std=c++20"],
-        extra_cuda_cflags=["-O2", "-std=c++20", "-lineinfo", *defines],
-        verbose=os.environ.get("NANO_EP_BUILD_VERBOSE") == "1",
-    )
+    module.init_jit(str(source))
+    return module
