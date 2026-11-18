@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 import sys
+import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
@@ -23,12 +24,23 @@ def main():
             check=True,
         )
         (wheel,) = artifacts.glob("*.whl")
+        (sdist,) = artifacts.glob("*.tar.gz")
+        with tarfile.open(sdist) as archive:
+            names = archive.getnames()
+            assert any(name.endswith("/third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp") for name in names)
+            assert any(name.endswith("/csrc/deep_jit/LICENSE") for name in names)
         with zipfile.ZipFile(wheel) as archive:
             for source in (project / "csrc").rglob("*"):
                 if source.is_file():
                     relative = source.relative_to(project / "csrc")
                     assert archive.read("nano_ep/_csrc/" + relative.as_posix()) == source.read_bytes(), relative
             assert not any(name.startswith("nano_ep/sim") for name in archive.namelist())
+            deepjit_include = project / "third-party/deep_jit/include"
+            for source in deepjit_include.rglob("*"):
+                if source.is_file():
+                    relative = source.relative_to(deepjit_include)
+                    assert archive.read("nano_ep/_csrc/deep_jit/include/" + relative.as_posix()) == source.read_bytes(), relative
+            assert "nano_ep/_csrc/deep_jit/LICENSE" in archive.namelist()
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--no-deps", "--no-index", "--target", str(installed), str(wheel)],
             cwd=scratch,
@@ -37,10 +49,11 @@ def main():
         probe = (
             "import sys; from pathlib import Path; "
             f"sys.path.insert(0, {str(installed)!r}); "
-            "import nano_ep; from nano_ep.backends._build import native_source_dir, load_extension; "
+            "import nano_ep; from nano_ep.backends._build import native_source_dir, deepjit_source_dir, load_extension; "
             f"assert Path(nano_ep.__file__).is_relative_to({str(installed)!r}); "
             "assert native_source_dir().name == '_csrc'; "
             "assert (native_source_dir() / 'include/nano_ep/peer.hpp').is_file(); "
+            "assert (deepjit_source_dir(native_source_dir()) / 'include/deep_jit/backend/cuda/backend.hpp').is_file(); "
             "assert load_extension.cache_info().currsize == 0; "
             "assert not hasattr(nano_ep, 'SimWorld'); "
             "print('INSTALLED_NANO_EP=' + nano_ep.__file__)"

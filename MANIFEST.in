@@ -1,5 +1,6 @@
 include README.md LICENSE pytest.ini .clang-format
 recursive-include csrc *.cpp *.cu *.cuh *.hpp *.h LICENSE
+recursive-include third-party/deep_jit/include *.hpp *.h *.cuh
 recursive-include docs *.md
 recursive-include tests *.py *.cu
 recursive-include tools *.py
