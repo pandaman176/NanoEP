@@ -9,7 +9,7 @@ Single-node expert-parallel dispatch and combine for PyTorch, using CUDA IPC and
 
 ## Install and build
 
-Requires Linux, Python 3.11+, CUDA-enabled PyTorch 2.10+, Ninja, a C++20 compiler, and a CUDA toolkit compatible with PyTorch. Target: Hopper/SM90 GPUs with pairwise CUDA peer access. Multi-node communication and automatic autograd are currently not supported.
+Requires Linux, Python 3.11+, CUDA-enabled PyTorch 2.10+, Ninja, a C++20 toolchain with `std::format` (for example GCC 13+), the elfutils development headers (`libdw-dev` on Ubuntu), and NVCC 12.9+ compatible with PyTorch. Target: Hopper/SM90 GPUs with pairwise CUDA peer access. Multi-node communication and automatic autograd are currently not supported.
 
 Install a CUDA build of PyTorch appropriate for your system, then run from this checkout:
 
@@ -18,7 +18,8 @@ python -m pip install .
 TORCH_CUDA_ARCH_LIST=9.0 python -m nano_ep.build
 ```
 
-Installation packages the CUDA sources. The extension compiles on the first GPU operation, or explicitly with the command above; compiled output is cached by PyTorch. DeepEP, NVSHMEM and NCCL Gin are not required.
+Installation packages the CUDA sources. The host extension builds once through PyTorch. DeepJIT compiles the requested CUDA kernel variants on first use.
+Set `NANO_EP_JIT_CACHE_DIR` to reuse their CUBINs across runs. For cold measurements, point it at a fresh directory. DeepEP, NVSHMEM and NCCL Gin are not required.
 
 To build distributable source and wheel packages:
 

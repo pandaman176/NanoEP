@@ -8,7 +8,7 @@ python -m pytest tests/native --run-cuda
 python -m pytest tests/distributed --run-distributed --nproc 2
 ```
 
-Unit tests cover independent CPU references, configuration, C++ window arithmetic, buffer initialization/rollback, dispatch/combine orchestration and stream ownership using test doubles. CUDA tests compile the actual extension and check payloads, metadata, main/epilogue numerical output, padding and window lifetime. Device-assert negative cases use separate processes.
+Unit tests cover independent CPU references, configuration, C++ window arithmetic, buffer initialization/rollback, dispatch/combine orchestration and stream ownership using test doubles. CUDA tests compile the actual extension and check payloads, metadata, main/epilogue numerical output, padding and window lifetime.
 
 Distributed tests launch bounded torchrun process groups. They cover real IPC, delayed peers, barriers, resource cleanup, cached routing, shared-arena reuse and public dispatch/combine. Run the independent peer-runtime test with two GPUs; use the public API launcher for other process counts:
 

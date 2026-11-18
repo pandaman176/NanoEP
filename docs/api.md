@@ -14,7 +14,7 @@
 received = buffer.dispatch(
     x, topk_idx=indices, weights=weights,
     do_expand=False, alignment=1, zero_padding=False,
-    previous_event=None, async_op=False,
+    previous_event=None, async_op=False, num_sms=None,
 )
 ```
 
@@ -29,6 +29,8 @@ Inputs are contiguous tensors on the local GPU: BF16 `x[T,H]`, int64 `indices[T,
 | `topk_weights` | FP32 `[N,K]`, complete source rows | FP32 `[C]` |
 
 Without weights, `topk_weights` is `None`. In expanded layout, only `zero_padding=True` initializes expert gaps; otherwise do not read them. Compact ignores zero padding. Outputs own storage independently of the communication arena.
+
+`num_sms` sets the dispatch main grid size. Omit it to use all SMs for fresh dispatch or inherit the handle's budget for cached dispatch. Pass `0` for the NVLink bandwidth estimate or a positive integer up to the device SM count to set the budget directly. The automatic model uses all SMs when NVLink bandwidth or full-group connectivity cannot be verified. The epilogue uses the full device SM count.
 
 ## Handles and cached routing
 
@@ -56,11 +58,13 @@ Omit `topk_idx`; preserve source token count, dtype, routing, buffer and receive
 ```python
 result = buffer.combine(
     expert_x, received.handle, weights=None, bias=None,
-    previous_event=None, async_op=False,
+    previous_event=None, async_op=False, num_sms=None,
 )
 ```
 
 The caller computes experts and applies gate weights. Compact BF16 `expert_x[N,H]` contains the sum of weighted local expert outputs; expanded BF16 `expert_x[C,H]` contains one output per assignment. Padding is ignored. Inputs are contiguous on the local GPU with 16-byte-aligned data pointers.
+
+Combine inherits the fresh dispatch budget in `handle.num_sms` unless `num_sms` is supplied. A cached dispatch override applies to that call. Combine's epilogue uses the full device SM count.
 
 `result.x[T,H]` accumulates FP32, adds optional source-local BF16 `bias[T,H]` once, then casts to BF16. Optional FP32 weights use the receive layout and return independently as `result.topk_weights[T,K]`, with masked slots zero. They never multiply `expert_x`; without weights the result field is `None`.
 
@@ -83,14 +87,17 @@ Use `with CudaBuffer(...)` or close collectively after consumers finish. Close d
 
 ## Native execution
 
-PyTorch caches compiled CUDA modules. `CudaBuffer` prepares core and geometry modules before IPC setup; additional dispatch alignments compile on first use. Reuse a fixed configuration for steady-state calls.
+Each Python operation calls one native entry point. The native entry schedules the main and epilogue kernels on the communication stream. The host extension builds during buffer setup. DeepJIT compiles the requested kernel modes before communication and caches their CUBINs across runs. Reuse a fixed configuration for steady-state calls.
 
-| Module | Specialization |
+Fresh expanded notify initializes a private expert cursor alongside immutable offsets. The epilogue consumes this scratch storage; cached and compact calls allocate no cursor. Handle metadata stays read-only.
+
+| Kernel | Specialization |
 | --- | --- |
-| Dispatch main | H, K, R, L, Tmax, expert alignment |
-| Dispatch epilogue | H, K, L, cached mode |
-| Combine main / epilogue | H, K, R, L, Tmax |
+| Dispatch main | H, K, R, L, Tmax, cached mode, fresh expert alignment |
+| Dispatch epilogue | H, K, L, cached mode, layout, weights, expanded padding |
+| Combine main | H, K, R, Tmax, layout, reduction mode, weights |
+| Combine epilogue | H, K, R, L, Tmax, layout, reduction mode, weights |
 
-Main kernels use cooperative SM-sized grids and entry/completion peer barriers. Fresh dispatch counts routes, publishes receive counts and reserves local per-destination slots; cached dispatch reads saved mappings. Receive storage is source-partitioned `[R,Tmax,row_bytes]`, and epilogue maps its valid rows through the source prefix. Expanded epilogue builds expert slots and copies payloads in one kernel.
+Main kernels use cooperative SM-sized grids and entry/completion peer barriers. Fresh dispatch counts routes, publishes receive counts, writes routing snapshots and complete rank mappings, and reserves local per-destination slots; cached dispatch reads saved mappings. Receive storage is source-partitioned `[R,Tmax,row_bytes]`, and epilogue maps its valid rows through the source prefix. Expanded epilogue builds expert slots and copies payloads in one kernel.
 
-Communication fields and row strides are 32-byte aligned. BF16 payloads use int4 bit copies and bounded register tiles for source reuse across destinations; reductions accumulate FP32. Dispatch and combine share one communication arena. TMA and PDL are not implemented.
+Communication fields and row strides are 32-byte aligned. TMA stages BF16 payloads, and reductions accumulate FP32. Dispatch and combine share one communication arena. The dependent epilogues use PDL on supported devices unless disabled with `NANO_EP_DISABLE_PDL=1`.
