@@ -7,7 +7,7 @@
     ".gitmodules": "228f71e6352e714ed3f9271548b1700dd337fdb66ee4056ec39ecee07bd29311",
     "LICENSE": "95555832ac6659d538d3550263b61e185c9cf410ca13b7c3be5fb07c659ace2b",
     "MANIFEST.in": "54cdef4f0847ef55ff4853c9e316f05f534734407332627f0d6d27d462fae50a",
-    "README.md": "e6ea2ea8058e1cd3d7d401fdfb8618d07efb0c86d41b81661337b230628d7e03",
+    "README.md": "3b507c66c48950ec10f190e7ceb3b0f2d3316ea7f0317d6a27c45272c4995ab7",
     "csrc/bindings.cpp": "4ce4ca7ff7037d80f1a862aafc550850e6015e390af5d73c237d9bc2de4fdcd9",
     "csrc/combine_epilogue.cpp": "8ec6121f848f6b9e35316ded53ab19f2beab01756cadda021072d65a665c7365",
     "csrc/combine_epilogue.cuh": "40d3cdaf9a349ddeb04c09a695473e58c7b4813eb1b79e9af798b46f2b975760",

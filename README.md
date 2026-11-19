@@ -7,6 +7,10 @@ Single-node expert-parallel dispatch and combine for PyTorch, using CUDA IPC and
 - Geometry-specialized CUDA kernels with cooperative communication barriers.
 - Minimal by design: readable CUDA kernels without NVSHMEM or NCCL Gin.
 
+## Performance
+
+![NanoEP vs DeepEP performance](figures/performance.svg)
+
 ## Install and build
 
 Requires Linux, Python 3.11+, CUDA-enabled PyTorch 2.10+, Ninja, a C++20 toolchain with `std::format` (for example GCC 13+), the elfutils development headers (`libdw-dev` on Ubuntu), and NVCC 12.9+ compatible with PyTorch. Target: Hopper/SM90 GPUs with pairwise CUDA peer access. Multi-node communication and automatic autograd are currently not supported.
@@ -83,8 +87,9 @@ See [testing](docs/testing.md) for more details.
 
 ## Future Plans
 
-- **Deeper Kernel Fusion** — Fuse more dispatch/combine stages to reduce kernel launches and intermediate memory traffic.
-- **More CUDA Magic** — Explore TMA, PDL, and communication/computation overlap.
+- **Multi-Node Communication** — Extend dispatch/combine across nodes.
+- **Other Interesting Feature** - FP8, ETP, autograd...
+- **More CUDA Magic** — Explore more PTX magic.
 
 ## Acknowledgements
 
