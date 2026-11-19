@@ -128,10 +128,12 @@ def run(args):
                     )
                     if handle is not None and received.handle is not handle:
                         raise AssertionError("cached dispatch must preserve handle identity")
-                    received.event.current_stream_wait()
+                    if received.event is not None:
+                        received.event.current_stream_wait()
                     y = expert_forward(received)
                     result = buffer.combine(y, received.handle, weights=received.topk_weights, async_op=args.async_op)
-                    result.event.current_stream_wait()
+                    if result.event is not None:
+                        result.event.current_stream_wait()
                     # Keep the original outputs: later rounds must not overwrite them.
                     checks.append((result.x, expected, result.topk_weights, expected_weights))
                     if args.cached:

@@ -177,11 +177,13 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
             zero_padding=expand,
             async_op=True,
         )
+        ready = torch.cuda.Event()
+        ready.record(buffer._comm_stream)
         combined = buffer.combine(
             first.x,
             first.handle,
             weights=first.topk_weights,
-            previous_event=first.event.event,
+            previous_event=ready,
             async_op=True,
         )
         second = buffer.dispatch(
