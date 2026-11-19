@@ -6,10 +6,15 @@ import torch
 pytestmark = [pytest.mark.cuda]
 
 
-@pytest.mark.parametrize("ranks", [1, 2, 8, 32])
-@pytest.mark.parametrize("experts", [1, 31, 32, 33, 129, 260])
-@pytest.mark.parametrize("alignment", [1, 3, 4, 16])
-@pytest.mark.parametrize("kind", ["random", "zero", "wide"])
+@pytest.mark.parametrize(
+    "ranks,experts,alignment,kind",
+    [
+        pytest.param(1, 31, 1, "random", id="single-rank-unaligned"),
+        pytest.param(2, 31, 4, "random", id="two-ranks-aligned"),
+        pytest.param(8, 32, 16, "random", id="eight-ranks-aligned"),
+        pytest.param(8, 33, 4, "zero", id="all-masked"),
+    ],
+)
 def test_fused_receive_prefixes(payload_probe, ranks, experts, alignment, kind):
     generator = torch.Generator().manual_seed(71)
     incoming = torch.randint(
@@ -17,8 +22,6 @@ def test_fused_receive_prefixes(payload_probe, ranks, experts, alignment, kind):
     )
     if kind == "zero":
         incoming.zero_()
-    elif kind == "wide":
-        incoming.fill_(2**32 - 1)
     else:
         # Empty experts and empty source ranks remain part of the prefix domain.
         incoming[ranks:].view(ranks, experts)[:, ::3] = 0

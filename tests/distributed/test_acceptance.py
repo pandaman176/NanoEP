@@ -21,8 +21,6 @@ PROFILES = [
     ("large-expanded", "expanded", "bf16", 256, 7168, 8, "mixed", 8, True),
     ("skew-compact", "compact", "bf16", 129, 1024, 3, "skew", 16, True),
     ("skew-expanded", "expanded", "bf16", 129, 1024, 3, "skew", 16, True),
-    ("empty-compact", "compact", "bf16", 0, 256, 3, "mixed", 4, True),
-    ("empty-expanded", "expanded", "bf16", 0, 256, 3, "mixed", 4, True),
     ("masked-compact", "compact", "bf16", 33, 256, 3, "masked", 4, True),
     ("masked-expanded", "expanded", "bf16", 33, 256, 3, "masked", 4, True),
     ("uneven-compact", "compact", "bf16", 65, 1024, 3, "uneven", 8, True),

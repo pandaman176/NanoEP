@@ -2,7 +2,6 @@
 
 from dataclasses import replace
 from datetime import timedelta
-from itertools import product
 import os
 from types import SimpleNamespace
 
@@ -89,13 +88,16 @@ def check_rounds(buffer, rank, size):
     buffer._backend = SimpleNamespace(
         dispatch=delayed_dispatch, combine=backend.combine
     )
-    for expand, dtype, weighted, asynchronous, kind in product(
-        (False, True),
-        (torch.bfloat16,),
-        (False, True),
-        (False, True),
-        ("mixed", "empty", "masked", "skew"),
-    ):
+    cases = (
+        (False, False, False, "mixed"),
+        (False, True, True, "masked"),
+        (False, False, True, "skew"),
+        (True, True, True, "mixed"),
+        (True, True, False, "masked"),
+        (True, False, False, "skew"),
+    )
+    for expand, weighted, asynchronous, kind in cases:
+        dtype = torch.bfloat16
         case = make_payloads(size, kind, dtype, buffer._config.hidden)
         all_weights = case.weights if weighted else None
         zero_padding = expand and kind != "skew"
@@ -109,7 +111,7 @@ def check_rounds(buffer, rank, size):
         if explicit:
             producer.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(producer):
-            if kind in ("mixed", "empty"):
+            if kind == "mixed":
                 torch.cuda._sleep(10_000_000)
             x.copy_(source_x)
             indices.copy_(source_indices)

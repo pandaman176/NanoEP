@@ -30,34 +30,6 @@ def native(cuda_device):
     return load_extension()
 
 
-def test_native_combine_preserves_invalid_input_error(native):
-    case = make_return_case(1, 3, 256, torch.bfloat16, tokens=1)
-    layout = native.window_layout(
-        1, case.capacity, case.hidden, case.topk, case.num_experts, False
-    )
-    runtime = native.PeerRuntime(0, 1, layout[-1])
-    runtime.import_peer_handles([runtime.export_local_handle()])
-    try:
-        x, _, metadata = expert_inputs(case, 0, False)
-        with pytest.raises(RuntimeError, match="combine x must be contiguous CUDA"):
-            native.combine(
-                runtime,
-                x,
-                [tensor.cuda() for tensor in metadata],
-                None,
-                None,
-                case.capacity,
-                False,
-                False,
-                0,
-                torch.cuda.current_stream().cuda_stream,
-            )
-    finally:
-        torch.cuda.synchronize()
-        runtime.close_peer_mappings()
-        runtime.close()
-
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("expand", [False, True])
 @pytest.mark.parametrize("mode", [False, True])

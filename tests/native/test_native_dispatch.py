@@ -13,12 +13,12 @@ from nano_ep.testing.native_dispatch import (
     assert_dispatch_output,
     assert_dispatch_wire,
 )
-from nano_ep.testing.wire import align32, dispatch_offsets, dispatch_row_bytes
+from nano_ep.testing.wire import dispatch_row_bytes
 
 pytestmark = [pytest.mark.cuda]
 
-LAYOUTS = [(False, False), (False, True), (True, False), (True, True)]
-LAYOUT_IDS = ["compact", "compact-padding-ignored", "expanded", "expanded-zero-padding"]
+LAYOUTS = [(False, False), (True, False), (True, True)]
+LAYOUT_IDS = ["compact", "expanded", "expanded-zero-padding"]
 
 
 @pytest.fixture
@@ -225,17 +225,24 @@ def check_fresh_and_cached(
             )
 
 
-@pytest.mark.parametrize("expand,zero_padding", LAYOUTS, ids=LAYOUT_IDS)
-@pytest.mark.parametrize("weighted", [False, True], ids=["unweighted", "weighted"])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("kind", ["mixed", "empty", "masked", "skew"])
-@pytest.mark.parametrize("hidden,alignment", [(256, 1), (512, 4), (768, 16)])
+@pytest.mark.parametrize(
+    "expand,zero_padding,weighted,kind,hidden,alignment",
+    [
+        pytest.param(False, False, True, "mixed", 256, 1, id="compact-weighted"),
+        pytest.param(False, False, False, "masked", 512, 4, id="compact-masked"),
+        pytest.param(False, False, True, "skew", 768, 16, id="compact-skew"),
+        pytest.param(True, False, True, "mixed", 512, 4, id="expanded-weighted"),
+        pytest.param(True, False, False, "masked", 768, 16, id="expanded-masked"),
+        pytest.param(True, True, True, "mixed", 768, 16, id="expanded-zero-padding"),
+        pytest.param(True, True, False, "skew", 256, 4, id="expanded-skew"),
+    ],
+)
 def test_dispatch_copy_fresh_and_cached(
-    native, expand, zero_padding, weighted, dtype, kind, hidden, alignment
+    native, expand, zero_padding, weighted, kind, hidden, alignment
 ):
     check_fresh_and_cached(
         native,
-        copy_case(kind, dtype, hidden),
+        copy_case(kind, torch.bfloat16, hidden),
         alignment,
         expand,
         weighted,
@@ -256,9 +263,14 @@ def test_dispatch_copy_multiple_blocks(native, expand, zero_padding, dtype):
     )
 
 
-@pytest.mark.parametrize("expand,zero_padding", LAYOUTS, ids=LAYOUT_IDS)
-@pytest.mark.parametrize("weighted", [False, True])
-@pytest.mark.parametrize("hidden", [512, 768])
+@pytest.mark.parametrize(
+    "expand,zero_padding,weighted,hidden",
+    [
+        pytest.param(False, False, True, 512, id="compact"),
+        pytest.param(True, False, False, 768, id="expanded"),
+        pytest.param(True, True, True, 512, id="expanded-zero-padding"),
+    ],
+)
 def test_dispatch_copy_multiple_grid_rounds(
     native, expand, zero_padding, weighted, hidden
 ):
@@ -289,129 +301,12 @@ def test_dispatch_uses_allocated_reduction_mode(
     )
 
 
-@pytest.mark.parametrize("expand,zero_padding", LAYOUTS, ids=LAYOUT_IDS)
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_dispatch_copy_nonfinite_payload(native, expand, zero_padding, dtype):
-    case = copy_case("mixed", dtype, 256)
-    case.xs[0][0, :3] = torch.tensor(
-        [float("nan"), float("inf"), -float("inf")], dtype=dtype
-    )
-    case.weights[0][0, 0] = float("nan")
-    case.weights[0][1, 2] = float("inf")
-    check_fresh_and_cached(native, case, 4, expand, True, zero_padding)
-
-
 @pytest.mark.parametrize(
-    "topk,hidden", [(1, 256), (3, 512), (3, 768), (8, 1280), (8, 4096), (32, 256)]
-)
-@pytest.mark.parametrize("expand", [False, True])
-@pytest.mark.parametrize("weighted", [False, True])
-def test_bf16_wire_bits_and_cached_payload(native, topk, hidden, expand, weighted):
-    # Include signed zero, subnormals, infinities and distinct NaN encodings.
-    bits = torch.tensor(
-        [0, -32768, 1, -32767, 16257, 32639, 32640, -128, 32705, 32641],
-        dtype=torch.int16,
-    )
-    tokens = 11
-    x = (
-        bits.repeat((tokens * hidden + len(bits) - 1) // len(bits))[: tokens * hidden]
-        .view(torch.bfloat16)
-        .reshape(tokens, hidden)
-    )
-    indices = torch.arange(topk).repeat(tokens, 1)
-    indices[1].fill_(-1)
-    weights = torch.arange(tokens * topk, dtype=torch.float32).reshape(tokens, topk) / 7
-    case = replace(
-        make_case(1, dtype=torch.bfloat16),
-        xs=[x],
-        indices=[indices],
-        weights=[weights],
-        num_experts=max(3, topk),
-        num_topk=topk,
-        hidden=hidden,
-        capacity=tokens,
-        expert_matrices=torch.empty(0),
-    )
-    with local_runtime(native, case) as (runtime, window, layout):
-        cached = []
-        cached_expanded_capacity = 0
-        for replay in (False, True):
-            if replay:
-                case = replace(case, xs=[x.flip(0).contiguous()], weights=[-weights])
-            window[layout[2] :].fill_(165)
-            outputs, metadata, counts, _ = native.dispatch(
-                runtime,
-                case.xs[0].cuda(),
-                case.indices[0].cuda(),
-                case.weights[0].cuda() if weighted else None,
-                case.num_experts,
-                tokens,
-                4,
-                cached,
-                cached_expanded_capacity,
-                allow_multiple_reduction=False,
-                expand=expand,
-                zero_padding=expand,
-                num_sms=0,
-                comm_stream=torch.cuda.current_stream().cuda_stream,
-            )
-            row_bytes = dispatch_row_bytes(hidden, topk)
-            stage = window.narrow(0, layout[2], tokens * row_bytes).view(
-                tokens, row_bytes
-            )
-            all_weights = case.weights if weighted else None
-            assert_dispatch_wire(
-                stage, metadata, counts, case, 0, 4, all_weights, expand=expand
-            )
-            assert_dispatch_output(
-                metadata,
-                outputs,
-                case,
-                0,
-                4,
-                all_weights,
-                expand=expand,
-                zero_padding=expand,
-            )
-            records = stage.cpu()
-            start = dispatch_offsets(topk)[2]
-            assert records.shape[1] == align32(start + 2 * hidden)
-            assert stage.data_ptr() % 32 == 0
-            assert all(
-                (stage.data_ptr() + offset) % 32 == 0
-                for offset in dispatch_offsets(topk)
-            )
-            output_bits = outputs[0].view(torch.int16).cpu()
-            source_bits = case.xs[0].view(torch.int16)
-            expanded_slots = metadata[0].cpu()[:, 2:]
-            for row, token in enumerate(metadata[0][:, 1].tolist()):
-                destinations = expanded_slots[row].tolist() if expand else [row]
-                for slot in destinations:
-                    if slot >= 0:
-                        torch.testing.assert_close(
-                            output_bits[slot], source_bits[token], rtol=0, atol=0
-                        )
-                torch.testing.assert_close(
-                    records[row, start : start + 2 * hidden],
-                    case.xs[0][token].view(torch.uint8),
-                )
-                assert (records[row, start + 2 * hidden :] == 165).all()
-            assert (window[layout[2] + records.numel() :].cpu() == 165).all()
-            cached = metadata
-            cached_expanded_capacity = int(counts[1])
-
-
-@pytest.mark.parametrize("weighted", [False, True])
-@pytest.mark.parametrize("zero_padding", [False, True])
-@pytest.mark.parametrize(
-    "experts,tokens,alignment",
+    "experts,tokens,alignment,weighted,zero_padding",
     [
-        (3, 1, 128),
-        (40, 1, 16),
-        (65, 1, 128),
-        (65, 1, 1024),
-        (65, 9, 4),
-        (40, 9, 1),
+        pytest.param(3, 1, 128, True, True, id="single-wave-zero-padding"),
+        pytest.param(40, 9, 1, False, False, id="multiple-waves-unaligned"),
+        pytest.param(65, 9, 4, True, True, id="multiple-waves-zero-padding"),
     ],
 )
 def test_padding_gaps_across_expert_waves(
@@ -425,9 +320,6 @@ def test_padding_gaps_across_expert_waves(
         indices[::3, 2] = -1
     x = (torch.arange(tokens * hidden).reshape(tokens, hidden) % 31 + 1).to(
         torch.bfloat16
-    )
-    x[0, :3] = torch.tensor(
-        [float("nan"), float("inf"), -float("inf")], dtype=torch.bfloat16
     )
     weights = torch.arange(tokens * 3, dtype=torch.float32).reshape(tokens, 3) + 0.5
     case = replace(

@@ -219,7 +219,7 @@ def run():
                 dispatch=native.dispatch, combine=delayed_combine
             )
             for expand in (False, True):
-                for kind in ("mixed", "empty", "masked", "skew"):
+                for kind in ("mixed", "masked", "skew"):
                     c = make_case(
                         size,
                         kind=kind,

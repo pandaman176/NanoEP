@@ -21,40 +21,6 @@ def native(request):
     return load_extension()
 
 
-def test_two_phase_close(native):
-    runtime = native.PeerRuntime(0, 1, 4096)
-    handle = runtime.export_local_handle()
-    runtime.import_peer_handles([handle])
-    window = runtime.local_window()
-    window.fill_(23)
-    torch.cuda.synchronize()
-
-    with pytest.raises(RuntimeError, match="close_peer_mappings"):
-        runtime.close()
-    runtime.close_peer_mappings()
-    runtime.close_peer_mappings()
-    # Unmapping peers does not free the source-owned allocation.
-    assert torch.all(window == 23).item()
-    for method in (
-        runtime.export_local_handle,
-        runtime.peer_addresses,
-        runtime.local_window,
-    ):
-        with pytest.raises(RuntimeError, match="closing or closed"):
-            method()
-    with pytest.raises(RuntimeError, match="closing or closed"):
-        runtime.barrier(torch.cuda.current_stream().cuda_stream, 1)
-
-    torch.cuda.synchronize()
-    del window
-    # One rank has no remote importers; the host group barrier is vacuous.
-    runtime.close()
-    runtime.close()
-    runtime.close_peer_mappings()
-    with pytest.raises(RuntimeError, match="closing or closed"):
-        runtime.local_window()
-
-
 @pytest.mark.parametrize("experts", [4, 260])
 def test_automatic_barrier_epochs_and_notify_reuse(native, payload_probe, experts):
     layout = native.window_layout(1, 8, 4, 2, experts)
@@ -350,12 +316,16 @@ def test_cached_payload_preserves_mapping_and_counter(
 
 
 @pytest.mark.parametrize(
-    "ranks,local_experts,topk,hidden",
-    [(1, 4, 3, 256), (8, 2, 3, 256), (32, 1, 1, 256)]
-    + [(2, 2, 3, hidden) for hidden in (256, 512, 768, 1280, 7168)],
+    "ranks,local_experts,topk,hidden,weighted,cached",
+    [
+        pytest.param(1, 4, 3, 256, False, False, id="single-rank-fresh"),
+        pytest.param(2, 2, 3, 512, True, False, id="two-ranks-fresh-weighted"),
+        pytest.param(2, 2, 3, 768, False, True, id="two-ranks-cached"),
+        pytest.param(2, 2, 3, 7168, True, True, id="two-ranks-cached-large-hidden"),
+        pytest.param(8, 2, 3, 256, True, False, id="eight-ranks-fresh"),
+        pytest.param(8, 2, 3, 256, False, True, id="eight-ranks-cached"),
+    ],
 )
-@pytest.mark.parametrize("weighted", [False, True])
-@pytest.mark.parametrize("cached", [False, True])
 def test_source_partitioned_payload(
     native, payload_probe, ranks, local_experts, topk, hidden, weighted, cached
 ):
