@@ -22,15 +22,12 @@ __device__ __forceinline__ void compute_partition_slots(int (&partition_slot_idx
     // once. Compact valid partitions to the front and fill remaining entries
     // with -1. fetch_partition may contain a full-warp shuffle.
 #pragma unroll
-    for (int i = 0; i < kNumPartitionsInLayout; ++i)
-        if (representatives != 0) {
-            const int representative = __ffs(representatives) - 1;
-            partition_slot_idx[i] = fetch_partition(representative);
-            representatives &= representatives - 1;  // clear the first representative
-
-        } else {
-            partition_slot_idx[i] = -1;
-        }
+    for (int i = 0; i < kNumPartitionsInLayout; ++i) {
+        const int representative = __ffs(representatives) - 1;
+        const int partition = fetch_partition(representative);
+        representatives &= representatives - 1;
+        partition_slot_idx[i] = representative >= 0 ? partition : -1;
+    }
 }
 
 __device__ __forceinline__ void restore_weights(const uint8_t* stage_buffer,  // [P,Tmax,row_bytes]
@@ -96,7 +93,7 @@ __global__ void __launch_bounds__(kCombineOutputPlan<kHidden>.max_warps() * 32, 
 
     // Each warp processes one source token per iteration; lanes stride over hidden coordinates in int4 vectors.
     const int lane = threadIdx.x % kWarpSize;
-    const int warp_idx = threadIdx.x / kWarpSize;
+    const int warp_idx = __shfl_sync(0xffffffffu, threadIdx.x / kWarpSize, 0);
     // One reduced row per warp is assembled in shared memory, so a single bulk
     // store publishes it while the warp starts the next row.
     extern __shared__ __align__(16) uint8_t stage_smem[];
@@ -141,6 +138,7 @@ __global__ void __launch_bounds__(kCombineOutputPlan<kHidden>.max_warps() * 32, 
 
         // Each int4 covers eight BF16 coordinates; H % 256 == 0 leaves no hidden tail.
         auto* output_vectors = reinterpret_cast<int4*>(stage);
+        const auto* row_record = stage_buffer + row * kReturnRowBytes;
         for (int step = 0; step < kVectorsPerLane / kUnrollFactor; ++step) {
             float2 accum[kUnrollFactor][kElemsPerVector / 2] = {};
 #pragma unroll
@@ -148,8 +146,8 @@ __global__ void __launch_bounds__(kCombineOutputPlan<kHidden>.max_warps() * 32, 
                 const int partition = partitions[p];
                 if (partition < 0)
                     break;
-                const auto* record = stage_buffer + (partition * kMaxTokens + row) * kReturnRowBytes;
-                const auto* input_vectors = reinterpret_cast<const int4*>(record);
+                const int64_t record_offset = static_cast<int64_t>(partition) * kMaxTokens * kReturnRowBytes;
+                const auto* input_vectors = reinterpret_cast<const int4*>(row_record + record_offset);
 #pragma unroll
                 for (int u = 0; u < kUnrollFactor; ++u) {
                     const int index = (step * kUnrollFactor + u) * kWarpSize + lane;
