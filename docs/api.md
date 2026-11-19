@@ -2,6 +2,8 @@
 
 `CudaBuffer(group, config, *, allow_multiple_reduction=False)` collectively creates a single-node CUDA IPC buffer. Use a Gloo group, one GPU per process, and the same collective order on every rank. Keep each process on its assigned GPU.
 
+Dispatch and combine reject enabling both PyTorch deterministic algorithms and `torch.utils.deterministic.fill_uninitialized_memory`. Disable either setting before calling them.
+
 `EPConfig(num_experts=E, num_topk=K, hidden=H, num_max_tokens_per_rank=Tmax)` uses contiguous expert placement: rank `r` owns `[r * E/R, (r+1) * E/R)`, where `R` is the group size.
 
 - `R` is a power of two in `[1,32]`; `E > 0` and `E % R == 0`.

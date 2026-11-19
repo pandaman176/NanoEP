@@ -211,7 +211,7 @@ def run():
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("gloo", timeout=timedelta(seconds=90))
     torch.use_deterministic_algorithms(True)
-    deterministic.fill_uninitialized_memory = True
+    deterministic.fill_uninitialized_memory = False
     try:
         for mode in (False, True):
             config = EPConfig(size * 3, 3, 512 if mode else 256, 5)

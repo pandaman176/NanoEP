@@ -11,6 +11,37 @@ from nano_ep import EPConfig
 
 
 
+@pytest.mark.parametrize(
+    "enabled,fill", [(False, False), (False, True), (True, False), (True, True)]
+)
+def test_deterministic_mode_guard(monkeypatch, enabled, fill):
+    monkeypatch.setattr(
+        cuda.torch, "are_deterministic_algorithms_enabled", lambda: enabled
+    )
+    monkeypatch.setattr(cuda.deterministic, "fill_uninitialized_memory", fill)
+    if enabled and fill:
+        with pytest.raises(RuntimeError, match="fill_uninitialized_memory"):
+            cuda.check_torch_deterministic()
+    else:
+        cuda.check_torch_deterministic()
+
+
+@pytest.mark.parametrize("operation", ["dispatch", "combine"])
+def test_public_operations_reject_deterministic_fill_before_native_work(
+    monkeypatch, operation
+):
+    monkeypatch.setattr(
+        cuda.torch, "are_deterministic_algorithms_enabled", lambda: True
+    )
+    monkeypatch.setattr(cuda.deterministic, "fill_uninitialized_memory", True)
+    buffer = cuda.CudaBuffer.__new__(cuda.CudaBuffer)
+    with pytest.raises(RuntimeError, match="fill_uninitialized_memory"):
+        if operation == "dispatch":
+            buffer.dispatch(None)
+        else:
+            buffer.combine(None, None)
+
+
 @pytest.fixture
 def dispatch_runtime(monkeypatch):
     events, calls = [], []

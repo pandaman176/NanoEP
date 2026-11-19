@@ -200,7 +200,7 @@ def run():
     torch.cuda.set_device(local)
     dist.init_process_group("gloo", timeout=timedelta(seconds=90))
     torch.use_deterministic_algorithms(True)
-    deterministic.fill_uninitialized_memory = True
+    deterministic.fill_uninitialized_memory = False
     try:
         check_peer_runtime(rank, size)
         cfg = EPConfig(size * 3, 3, 256, 5)

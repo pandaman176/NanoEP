@@ -6,10 +6,18 @@ from dataclasses import asdict, dataclass
 
 import torch
 import torch.distributed as dist
+from torch.utils import deterministic
 
 from nano_ep.backends._build import load_extension
 from nano_ep.backends._sms import nvlink_gbs, theoretical_num_sms
 from nano_ep.config import EPConfig
+
+
+def check_torch_deterministic():
+    if torch.are_deterministic_algorithms_enabled() and deterministic.fill_uninitialized_memory:
+        raise RuntimeError(
+            "NanoEP does not support deterministic algorithms with fill_uninitialized_memory enabled; disable one of these PyTorch settings"
+        )
 
 
 @dataclass
@@ -250,6 +258,7 @@ class CudaBuffer:
         num_sms: int | None = None,
     ) -> NativeDispatchResult:
         'Dispatch payloads using fresh or cached routing; return exact receive layouts.'
+        check_torch_deterministic()
         if self._closed:
             raise RuntimeError("CudaBuffer is closed")
         if handle is not None:
@@ -361,6 +370,7 @@ class CudaBuffer:
         num_sms: int | None = None,
     ) -> NativeCombineResult:
         'Return expert outputs to their source and reduce in FP32, without gate weighting.'
+        check_torch_deterministic()
         if self._closed:
             raise RuntimeError("CudaBuffer is closed")
         if handle.owner is not self:
