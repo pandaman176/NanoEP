@@ -25,9 +25,7 @@ def run():
 
         for failure in ("allocate", "export", "import"):
 
-            def create_runtime(
-                actual_rank, actual_size, num_bytes, failure_mode=failure
-            ):
+            def create_runtime(actual_rank, actual_size, num_bytes, failure_mode=failure):
                 if rank == 0 and failure_mode == "allocate":
                     raise RuntimeError("injected allocate")
                 runtime = native.PeerRuntime(actual_rank, actual_size, num_bytes)
@@ -50,9 +48,7 @@ def run():
                     close=runtime.close,
                 )
 
-            backend = SimpleNamespace(
-                window_layout=native.window_layout, PeerRuntime=create_runtime
-            )
+            backend = SimpleNamespace(window_layout=native.window_layout, PeerRuntime=create_runtime)
             error = None
             with patch.object(cuda, "load_extension", return_value=backend):
                 try:
@@ -61,38 +57,24 @@ def run():
                     error = str(exc)
             errors = [None] * size
             dist.all_gather_object(errors, error)
-            assert all(item == errors[0] and item is not None for item in errors), (
-                errors
-            )
+            assert all(item == errors[0] and item is not None for item in errors), errors
             assert f"rank 0: RuntimeError: injected {failure}" in errors[0], errors
             print(f"NANO_EP_BOOTSTRAP_ROLLBACK_OK={rank}:{failure}", flush=True)
 
         for lifetime in range(2):
             mode = bool(lifetime)
-            with cuda.CudaBuffer(
-                dist.group.WORLD, config, allow_multiple_reduction=mode
-            ) as buffer:
+            with cuda.CudaBuffer(dist.group.WORLD, config, allow_multiple_reduction=mode) as buffer:
                 assert buffer._rank == rank and buffer._world_size == size
                 assert buffer._allow_multiple_reduction is mode
-                assert (
-                    buffer._num_bytes
-                    == native.window_layout(size, 8, 256, 2, config.num_experts, mode)[
-                        -1
-                    ]
-                )
+                assert buffer._num_bytes == native.window_layout(size, 8, 256, 2, config.num_experts, mode)[-1]
                 addresses = buffer._runtime.peer_addresses()
                 window = buffer._runtime.local_window()
                 assert addresses[rank].item() == window.data_ptr()
-                counts = window[
-                    buffer._count_offset : buffer._count_offset
-                    + (size + config.num_experts) * 8
-                ].view(torch.int64)
+                counts = window[buffer._count_offset : buffer._count_offset + (size + config.num_experts) * 8].view(torch.int64)
                 assert counts.tolist() == [-1] * (size + config.num_experts)
                 assert (
                     window[
-                        buffer._count_offset
-                        + (size + config.num_experts) * 8 : buffer._count_offset
-                        + (2 * size + config.num_experts) * 8
+                        buffer._count_offset + (size + config.num_experts) * 8 : buffer._count_offset + (2 * size + config.num_experts) * 8
                     ]
                     .view(torch.int64)
                     .tolist()

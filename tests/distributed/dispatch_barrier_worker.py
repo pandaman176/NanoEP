@@ -16,15 +16,9 @@ from nano_ep.testing.native_dispatch import assert_dispatch_output
 def make_case(size, tokens, kind):
     xs, indices, weights = [], [], []
     for source in range(size):
-        count = (
-            0
-            if kind == "all_empty" or kind == "one_empty" and source == size - 1
-            else tokens
-        )
+        count = 0 if kind == "all_empty" or kind == "one_empty" and source == size - 1 else tokens
         row = torch.arange(count)
-        x = (row[:, None] % 127 + torch.arange(256)[None, :] % 7 + source * 11).to(
-            torch.bfloat16
-        )
+        x = (row[:, None] % 127 + torch.arange(256)[None, :] % 7 + source * 11).to(torch.bfloat16)
         routing = torch.stack(
             (
                 source * 3 + row % 3,
@@ -44,9 +38,7 @@ def make_case(size, tokens, kind):
 
 
 def run():
-    rank, size, local = (
-        int(os.environ[key]) for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK")
-    )
+    rank, size, local = (int(os.environ[key]) for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK"))
     torch.cuda.set_device(local)
     torch.set_num_threads(1)
     dist.init_process_group("gloo", timeout=timedelta(seconds=180))

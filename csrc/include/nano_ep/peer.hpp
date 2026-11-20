@@ -12,10 +12,9 @@ namespace nano_ep {
 
 using IpcHandleBytes = std::array<std::byte, sizeof(cudaIpcMemHandle_t)>;
 
-// Owns a fixed-capacity CUDA IPC allocation and imported peer mappings.
-// No CPU operation in this interface transports token or routing payloads.
-// Window offsets have identical meanings on each rank; virtual addresses
-// need not match. A later NCCL window backend can preserve this contract.
+// Manages a fixed-size GPU window and access to other ranks' windows via CUDA IPC.
+// GPUs transfer token and routing data directly; the CPU does not copy payloads.
+// All windows share the same layout, but their addresses can differ.
 class PeerRuntime {
 public:
     PeerRuntime(int rank, int world_size, int64_t num_bytes);

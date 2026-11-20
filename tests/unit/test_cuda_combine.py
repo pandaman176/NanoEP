@@ -11,7 +11,6 @@ from test_cuda_dispatch import (
 from nano_ep.backends import cuda
 
 
-
 @pytest.fixture
 def combine_runtime(dispatch_runtime):
     context = dispatch_runtime
@@ -70,14 +69,10 @@ def combine_runtime(dispatch_runtime):
         source_tokens = metadata[5].shape[0]
         hidden = x.shape[1]
         calls.outputs = (
-            context.tensor(
-                "combined_x", torch.zeros((source_tokens, hidden), dtype=x.dtype)
-            ),
+            context.tensor("combined_x", torch.zeros((source_tokens, hidden), dtype=x.dtype)),
             context.tensor(
                 "combined_weights",
-                torch.zeros((source_tokens, 3))
-                if weights is not None
-                else torch.empty(0),
+                torch.zeros((source_tokens, 3)) if weights is not None else torch.empty(0),
             ),
         )
 
@@ -117,33 +112,21 @@ def handle_metadata(handle):
     [
         pytest.param(False, False, False, False, False, False, id="compact-sync"),
         pytest.param(False, True, True, True, True, True, id="compact-async-weighted"),
-        pytest.param(
-            True, False, True, False, True, False, id="expanded-async-weighted"
-        ),
+        pytest.param(True, False, True, False, True, False, id="expanded-async-weighted"),
         pytest.param(True, True, False, True, False, True, id="expanded-sync-biased"),
     ],
 )
-def test_combine_metadata_and_streams(
-    combine_runtime, expand, mode, weighted, biased, asynchronous, explicit_event
-):
+def test_combine_metadata_and_streams(combine_runtime, expand, mode, weighted, biased, asynchronous, explicit_event):
     context = combine_runtime
     dtype = torch.bfloat16
     context.handle.do_expand = expand
     if expand:
-        context.handle.layout.recv_metadata.payload[:, 2:] = torch.tensor(
-            [[0, 4, -1], [-1, -1, 8]]
-        )
+        context.handle.layout.recv_metadata.payload[:, 2:] = torch.tensor([[0, 4, -1], [-1, -1, 8]])
     context.buffer._allow_multiple_reduction = mode
     rows = 12 if expand else 2
     x = context.tensor("expert_output", torch.zeros((rows, 256), dtype=dtype))
-    weights = (
-        context.tensor("weights", torch.ones((rows,) if expand else (rows, 3)))
-        if weighted
-        else None
-    )
-    bias = (
-        context.tensor("bias", torch.zeros((3, 256), dtype=dtype)) if biased else None
-    )
+    weights = context.tensor("weights", torch.ones((rows,) if expand else (rows, 3))) if weighted else None
+    bias = context.tensor("bias", torch.zeros((3, 256), dtype=dtype)) if biased else None
     ready = context.event() if explicit_event else None
     result = context.buffer.combine(
         x,
@@ -183,9 +166,7 @@ def test_combine_metadata_and_streams(
             *([weights] if weighted else []),
             *([bias] if biased else []),
         ]:
-            assert context.events.index(
-                ("record_tensor", tensor.name, "comm")
-            ) > context.events.index(("combine",))
+            assert context.events.index(("record_tensor", tensor.name, "comm")) > context.events.index(("combine",))
         assert result.event is not None
         assert any(item is context.handle for item in result.event.keepalive)
         with context.use_stream(context.consumer):

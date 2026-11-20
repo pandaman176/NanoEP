@@ -19,9 +19,7 @@ from nano_ep.testing.wire import return_row_bytes
 
 
 def run():
-    rank, size, local = (
-        int(os.environ[key]) for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK")
-    )
+    rank, size, local = (int(os.environ[key]) for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK"))
     torch.cuda.set_device(local)
     torch.set_num_threads(1)
     dist.init_process_group("gloo", timeout=timedelta(seconds=180))
@@ -38,9 +36,7 @@ def run():
         runtime.import_peer_handles(handles)
         window = runtime.local_window()
         partitions = min(size, topk) if mode else topk
-        returned = window.narrow(0, layout[3], partitions * capacity * row_bytes).view(
-            partitions, capacity, row_bytes
-        )
+        returned = window.narrow(0, layout[3], partitions * capacity * row_bytes).view(partitions, capacity, row_bytes)
         stream.wait_stream(torch.cuda.current_stream())
         epoch = 0
         for expand, weighted in product((False, True), repeat=2):
@@ -66,17 +62,13 @@ def run():
             epoch += 2
             dist.barrier()
             for kind in ("mixed", "one_receiver", "masked"):
-                case = make_return_case(
-                    size, topk, hidden, torch.bfloat16, tokens=capacity, kind=kind
-                )
+                case = make_return_case(size, topk, hidden, torch.bfloat16, tokens=capacity, kind=kind)
                 if kind == "one_receiver":
                     for routing in case.indices:
                         routing[:] = torch.arange(topk) + (size - 1) * 3
                 x, w, metadata = expert_inputs(case, rank, expand)
                 if kind == "one_receiver":
-                    assert metadata[0].size(0) == (
-                        size * capacity if rank == size - 1 else 0
-                    )
+                    assert metadata[0].size(0) == (size * capacity if rank == size - 1 else 0)
                 elif kind == "masked":
                     assert metadata[0].size(0) == 0
                 with torch.cuda.stream(stream):
@@ -108,9 +100,7 @@ def run():
                     if rank == 0:
                         torch.testing.assert_close(after, before, rtol=0, atol=0)
                     epoch += 2
-                    assert (
-                        window[: size * 8].view(torch.int64).tolist() == [epoch] * size
-                    )
+                    assert window[: size * 8].view(torch.int64).tolist() == [epoch] * size
                 dist.barrier()
                 # Standalone dispatch-style phases share the same epoch sequence.
                 runtime.barrier(stream.cuda_stream, epoch + 3)

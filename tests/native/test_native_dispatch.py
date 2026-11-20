@@ -23,10 +23,7 @@ LAYOUT_IDS = ["compact", "expanded", "expanded-zero-padding"]
 
 @pytest.fixture
 def native(request):
-    if not (
-        request.config.getoption("--run-cuda")
-        or request.config.getoption("--run-distributed")
-    ):
+    if not (request.config.getoption("--run-cuda") or request.config.getoption("--run-distributed")):
         pytest.skip("opt in with --run-cuda or --run-distributed")
     if not torch.cuda.is_available():
         pytest.fail("CUDA tests requested but NVIDIA CUDA is unavailable")
@@ -57,9 +54,7 @@ def copy_case(kind, dtype, hidden, tokens=None):
             indices.repeat(repeats, 1)[:tokens],
             weights.repeat(repeats, 1)[:tokens],
         )
-    x = torch.randn(
-        len(indices), hidden, generator=torch.Generator().manual_seed(123), dtype=dtype
-    )
+    x = torch.randn(len(indices), hidden, generator=torch.Generator().manual_seed(123), dtype=dtype)
     return replace(
         case,
         xs=[x],
@@ -83,9 +78,7 @@ def local_runtime(native, case, allow_multiple_reduction=False):
     )
     runtime = native.PeerRuntime(0, 1, layout[-1])
     window = runtime.local_window()
-    window[layout[1] : layout[1] + (1 + case.num_experts) * 8].view(torch.int64).fill_(
-        -1
-    )
+    window[layout[1] : layout[1] + (1 + case.num_experts) * 8].view(torch.int64).fill_(-1)
     torch.cuda.synchronize()
     runtime.import_peer_handles([runtime.export_local_handle()])
     try:
@@ -138,9 +131,7 @@ def check_fresh_and_cached(
             num_sms=0,
             comm_stream=stream.cuda_stream,
         )
-        stage = window.narrow(
-            0, layout[2], case.capacity * dispatch_row_bytes(case.hidden, case.num_topk)
-        ).view(case.capacity, -1)
+        stage = window.narrow(0, layout[2], case.capacity * dispatch_row_bytes(case.hidden, case.num_topk)).view(case.capacity, -1)
         assert_dispatch_wire(
             stage,
             metadata,
@@ -166,15 +157,11 @@ def check_fresh_and_cached(
         pointers = [tensor.data_ptr() for tensor in metadata]
         torch.testing.assert_close(x.cpu(), case.xs[0], rtol=0, atol=0, equal_nan=True)
         torch.testing.assert_close(indices.cpu(), case.indices[0])
-        torch.testing.assert_close(
-            weights.cpu(), case.weights[0], rtol=0, atol=0, equal_nan=True
-        )
+        torch.testing.assert_close(weights.cpu(), case.weights[0], rtol=0, atol=0, equal_nan=True)
         indices.fill_(99)
 
         for step, replay_weighted in enumerate((not weighted, weighted), start=1):
-            replay_case = replace(
-                case, xs=[case.xs[0] + 2 * step], weights=[-case.weights[0] + step]
-            )
+            replay_case = replace(case, xs=[case.xs[0] + 2 * step], weights=[-case.weights[0] + step])
             replay_x, replay_weights = (
                 replay_case.xs[0].cuda(),
                 replay_case.weights[0].cuda(),
@@ -210,12 +197,8 @@ def check_fresh_and_cached(
             for actual, expected in zip(replay_metadata, saved_metadata, strict=True):
                 torch.testing.assert_close(actual.cpu(), expected)
             for actual, expected in zip(outputs, saved_outputs, strict=True):
-                torch.testing.assert_close(
-                    actual.cpu(), expected, rtol=0, atol=0, equal_nan=True
-                )
-            torch.testing.assert_close(
-                replay_x.cpu(), replay_case.xs[0], rtol=0, atol=0, equal_nan=True
-            )
+                torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0, equal_nan=True)
+            torch.testing.assert_close(replay_x.cpu(), replay_case.xs[0], rtol=0, atol=0, equal_nan=True)
             torch.testing.assert_close(
                 replay_weights.cpu(),
                 replay_case.weights[0],
@@ -237,9 +220,7 @@ def check_fresh_and_cached(
         pytest.param(True, True, False, "skew", 256, 4, id="expanded-skew"),
     ],
 )
-def test_dispatch_copy_fresh_and_cached(
-    native, expand, zero_padding, weighted, kind, hidden, alignment
-):
+def test_dispatch_copy_fresh_and_cached(native, expand, zero_padding, weighted, kind, hidden, alignment):
     check_fresh_and_cached(
         native,
         copy_case(kind, torch.bfloat16, hidden),
@@ -271,9 +252,7 @@ def test_dispatch_copy_multiple_blocks(native, expand, zero_padding, dtype):
         pytest.param(True, True, True, 512, id="expanded-zero-padding"),
     ],
 )
-def test_dispatch_copy_multiple_grid_rounds(
-    native, expand, zero_padding, weighted, hidden
-):
+def test_dispatch_copy_multiple_grid_rounds(native, expand, zero_padding, weighted, hidden):
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     # Exceed even a full grid of 32-warp blocks to exercise stage reuse.
     tokens = properties.multi_processor_count * 32 + 3
@@ -287,9 +266,7 @@ def test_dispatch_copy_multiple_grid_rounds(
 @pytest.mark.parametrize("expand,zero_padding", LAYOUTS, ids=LAYOUT_IDS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("allow_multiple_reduction", [False, True])
-def test_dispatch_uses_allocated_reduction_mode(
-    native, expand, zero_padding, dtype, allow_multiple_reduction
-):
+def test_dispatch_uses_allocated_reduction_mode(native, expand, zero_padding, dtype, allow_multiple_reduction):
     check_fresh_and_cached(
         native,
         copy_case("mixed", dtype, 256, tokens=19),
@@ -309,18 +286,14 @@ def test_dispatch_uses_allocated_reduction_mode(
         pytest.param(65, 9, 4, True, True, id="multiple-waves-zero-padding"),
     ],
 )
-def test_padding_gaps_across_expert_waves(
-    native, experts, tokens, alignment, weighted, zero_padding
-):
+def test_padding_gaps_across_expert_waves(native, experts, tokens, alignment, weighted, zero_padding):
     hidden = 256
     selected = [2, 33, experts - 1] if experts > 32 else [0, 1, 2]
     indices = torch.tensor([selected] * tokens, dtype=torch.int64)
     if tokens > 1:
         indices[::2, 1] = -1
         indices[::3, 2] = -1
-    x = (torch.arange(tokens * hidden).reshape(tokens, hidden) % 31 + 1).to(
-        torch.bfloat16
-    )
+    x = (torch.arange(tokens * hidden).reshape(tokens, hidden) % 31 + 1).to(torch.bfloat16)
     weights = torch.arange(tokens * 3, dtype=torch.float32).reshape(tokens, 3) + 0.5
     case = replace(
         make_case(1, dtype=torch.bfloat16),

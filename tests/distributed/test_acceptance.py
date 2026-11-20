@@ -40,9 +40,7 @@ def test_delivery_profile(request, profile, tmp_path):
     from nano_ep.backends._build import load_extension
 
     native = load_extension()
-    name, layout, dtype, tokens, hidden, topk, pattern, iterations, asynchronous = (
-        profile
-    )
+    name, layout, dtype, tokens, hidden, topk, pattern, iterations, asynchronous = profile
     geometry = (hidden, topk, nproc, 8, max(1, tokens))
     expand = layout == "expanded"
     native.prepare_dispatch(*geometry, 16, False, expand, True, expand)
@@ -86,11 +84,5 @@ def test_delivery_profile(request, profile, tmp_path):
         pytest.fail(f"torchrun exceeded 300s: {log}\n{log.read_text()[-12000:]}")
     contents = log.read_text()
     assert returncode == 0, f"{log}\n{contents[-12000:]}"
-    reports = [
-        json.loads(line.split("=", 1)[1])
-        for line in contents.splitlines()
-        if line.startswith("NANO_EP_MOE_OK=")
-    ]
-    assert len(reports) == nproc and {r["rank"] for r in reports} == set(
-        range(nproc)
-    ), contents
+    reports = [json.loads(line.split("=", 1)[1]) for line in contents.splitlines() if line.startswith("NANO_EP_MOE_OK=")]
+    assert len(reports) == nproc and {r["rank"] for r in reports} == set(range(nproc)), contents

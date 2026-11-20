@@ -15,10 +15,7 @@ pytestmark = [pytest.mark.cuda]
 
 @pytest.fixture
 def cuda_device(request):
-    if not (
-        request.config.getoption("--run-cuda")
-        or request.config.getoption("--run-distributed")
-    ):
+    if not (request.config.getoption("--run-cuda") or request.config.getoption("--run-distributed")):
         pytest.skip("opt in with --run-cuda or --run-distributed")
     if not torch.cuda.is_available():
         pytest.fail("CUDA tests requested but NVIDIA CUDA is unavailable")
@@ -37,9 +34,7 @@ def native(cuda_device):
 def test_native_combine_reuses_window(native, dtype, expand, mode, weighted):
     case = make_return_case(1, 3, 256, dtype, tokens=11)
     case.capacity += 7
-    layout = native.window_layout(
-        1, case.capacity, case.hidden, case.topk, case.num_experts, mode
-    )
+    layout = native.window_layout(1, case.capacity, case.hidden, case.topk, case.num_experts, mode)
     runtime = native.PeerRuntime(0, 1, layout[-1])
     runtime.import_peer_handles([runtime.export_local_handle()])
     stream = torch.cuda.Stream()
@@ -71,9 +66,7 @@ def test_native_combine_reuses_window(native, dtype, expand, mode, weighted):
                 assert_combined_output(outputs, case, 0, expand, mode, weighted, bias)
                 if previous is not None:
                     for actual, expected in zip(previous, saved, strict=True):
-                        torch.testing.assert_close(
-                            actual.cpu(), expected, rtol=0, atol=0
-                        )
+                        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
                 previous, saved = outputs, [output.cpu().clone() for output in outputs]
                 for actual, expected in zip(device_metadata, metadata, strict=True):
                     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)

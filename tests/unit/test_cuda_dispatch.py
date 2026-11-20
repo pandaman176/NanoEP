@@ -10,7 +10,6 @@ from nano_ep import EPConfig
 from nano_ep.backends import cuda
 
 
-
 @pytest.fixture
 def dispatch_runtime(monkeypatch):
     events, calls = [], []
@@ -26,9 +25,7 @@ def dispatch_runtime(monkeypatch):
         def wait_event(self, event):
             events.append(("wait_event", self.name, event))
 
-    compute, comm, consumer = (
-        FakeStream(name) for name in ("compute", "comm", "consumer")
-    )
+    compute, comm, consumer = (FakeStream(name) for name in ("compute", "comm", "consumer"))
     current = [compute]
 
     @contextmanager
@@ -121,9 +118,7 @@ def dispatch_runtime(monkeypatch):
                 torch.tensor([[0, 0, 0, 1, -1], [1, 0, -1, -1, 2]], dtype=torch.int32),
             ),
             make_int64_tensor("expert_counts", [1, 1, 1]),
-            make_int64_tensor(
-                "expert_offsets", [0, alignment, 2 * alignment, 3 * alignment]
-            ),
+            make_int64_tensor("expert_offsets", [0, alignment, 2 * alignment, 3 * alignment]),
             make_int64_tensor("dst_slots", [[0, 1], [-1, -1]]),
             make_int64_tensor("send_counts", [1, 1]),
             FakeTensor("snapshot", routing.payload.clone()),
@@ -135,15 +130,11 @@ def dispatch_runtime(monkeypatch):
             FakeTensor("recv_x", torch.zeros((rows, 256), dtype=x.dtype)),
             FakeTensor(
                 "recv_idx",
-                torch.empty(0, dtype=torch.int64)
-                if expand
-                else metadata[0].payload[:, 2:].to(torch.int64).clone(),
+                torch.empty(0, dtype=torch.int64) if expand else metadata[0].payload[:, 2:].to(torch.int64).clone(),
             ),
             FakeTensor(
                 "recv_weights",
-                torch.zeros((rows,) if expand else (rows, 3))
-                if weights is not None
-                else torch.empty(0),
+                torch.zeros((rows,) if expand else (rows, 3)) if weights is not None else torch.empty(0),
             ),
         )
         calls.append(
@@ -178,9 +169,7 @@ def dispatch_runtime(monkeypatch):
         return outputs, metadata, (n, expanded_capacity), completed
 
     monkeypatch.setattr(cuda.torch.cuda, "device", lambda device: nullcontext())
-    monkeypatch.setattr(
-        cuda.torch.cuda, "current_stream", lambda device=None: current[0]
-    )
+    monkeypatch.setattr(cuda.torch.cuda, "current_stream", lambda device=None: current[0])
     monkeypatch.setattr(cuda.torch.cuda, "stream", use_stream)
     monkeypatch.setattr(cuda.torch.cuda, "Event", FakeEvent)
     buffer = cuda.CudaBuffer.__new__(cuda.CudaBuffer)
@@ -218,9 +207,7 @@ def dispatch_runtime(monkeypatch):
         pytest.param(True, False, True, False, True, id="expanded-sync-unweighted"),
     ],
 )
-def test_dispatch_fresh_metadata_and_streams(
-    dispatch_runtime, layout, weighted, mode, asynchronous, explicit_event
-):
+def test_dispatch_fresh_metadata_and_streams(dispatch_runtime, layout, weighted, mode, asynchronous, explicit_event):
     context = dispatch_runtime
     dtype = torch.bfloat16
     context.buffer._allow_multiple_reduction = mode
@@ -284,9 +271,7 @@ def test_dispatch_fresh_metadata_and_streams(
     else:
         assert ("wait_stream", "comm", "compute") in context.events
     if asynchronous:
-        assert context.events.index(
-            ("record_tensor", "x", "comm")
-        ) > context.events.index(("dispatch",))
+        assert context.events.index(("record_tensor", "x", "comm")) > context.events.index(("dispatch",))
         assert result.event is not None
         assert any(item is handle for item in result.event.keepalive)
         with context.use_stream(context.consumer):
@@ -309,9 +294,7 @@ def test_dispatch_fresh_metadata_and_streams(
         pytest.param(True, False, True, id="expanded-async-unweighted"),
     ],
 )
-def test_dispatch_cached_reuses_handle_with_new_payload(
-    dispatch_runtime, expand, weighted, asynchronous
-):
+def test_dispatch_cached_reuses_handle_with_new_payload(dispatch_runtime, expand, weighted, asynchronous):
     context = dispatch_runtime
     x = context.tensor("x", torch.zeros((2, 256), dtype=torch.bfloat16))
     weights = context.tensor("weights", torch.ones((2, 3)))
@@ -327,23 +310,13 @@ def test_dispatch_cached_reuses_handle_with_new_payload(
     context.events.clear()
     new_x = context.tensor("new_x", torch.full((2, 256), 7.0, dtype=torch.bfloat16))
     new_weights = None if weighted else weights
-    result = context.buffer.dispatch(
-        new_x, weights=new_weights, handle=first.handle, async_op=asynchronous
-    )
+    result = context.buffer.dispatch(new_x, weights=new_weights, handle=first.handle, async_op=asynchronous)
     call = context.calls[-1]
     assert result.handle is first.handle
-    assert (
-        call.routing is first.handle.topk_idx
-        and call.x is new_x
-        and call.weights is new_weights
-    )
+    assert call.routing is first.handle.topk_idx and call.x is new_x and call.weights is new_weights
     assert call.cached == old_metadata and call.metadata == old_metadata
     assert call.cached_expanded_capacity == first.handle.layout.expanded_capacity
     assert call.alignment == 4 and call.expand is expand and not call.zero_padding
     for tensor in old_metadata:
-        assert (
-            ("record_tensor", tensor.name, "comm") in context.events
-        ) is asynchronous
-    assert context.events.count(
-        ("record_tensor", first.handle.topk_idx.name, "comm")
-    ) == int(asynchronous)
+        assert (("record_tensor", tensor.name, "comm") in context.events) is asynchronous
+    assert context.events.count(("record_tensor", first.handle.topk_idx.name, "comm")) == int(asynchronous)

@@ -3,10 +3,10 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
-#include <nano_ep/pipeline.hpp>
 
 #include <cstdio>
 #include <cuda/atomic>
+#include <nano_ep/pipeline.hpp>
 
 #include "dispatch_main.cuh"
 
@@ -78,7 +78,8 @@ __global__ void probe_finalize_receive_counts_kernel(const int64_t* incoming,
     for (int i = threadIdx.x; i < num_counts; i += threads)
         counts[i] = static_cast<uint32_t>(incoming[i]);
     nano_ep::notify_group_barrier<threads>();
-    nano_ep::finalize_receive_counts<kWorldSize, kExpertsPerRank, kExpertAlignment>(counts, rank_prefix, expert_counts, expert_offsets, expert_cursor, totals);
+    nano_ep::finalize_receive_counts<kWorldSize, kExpertsPerRank, kExpertAlignment>(
+        counts, rank_prefix, expert_counts, expert_offsets, expert_cursor, totals);
 }
 
 template <int kWorldSize, typename Launch>
@@ -165,18 +166,18 @@ std::vector<torch::Tensor> run_finalize_receive_counts(const torch::Tensor& inco
 
 template <int kHidden, int kTopk, int kWorldSize, int kExpertsPerRank, bool kReuseSlots>
 __global__ void __launch_bounds__(nano_ep::kDispatchPayloadPlan<kHidden, kTopk, kWorldSize, kExpertsPerRank, 0>.total_warps * 32, 1)
-probe_payload_kernel(const int64_t* addresses,
-                                     const nv_bfloat16* x,
-                                     const int64_t* indices,
-                                     int64_t* topk_snapshot,
-                                     const float* weights,
-                                     int64_t* slots,
-                                     int rank,
-                                     int64_t tokens,
-                                     int64_t capacity,
-                                     int64_t send_next_offset,
-                                     int64_t payload_offset,
-                                     int64_t row_bytes) {
+    probe_payload_kernel(const int64_t* addresses,
+                         const nv_bfloat16* x,
+                         const int64_t* indices,
+                         int64_t* topk_snapshot,
+                         const float* weights,
+                         int64_t* slots,
+                         int rank,
+                         int64_t tokens,
+                         int64_t capacity,
+                         int64_t send_next_offset,
+                         int64_t payload_offset,
+                         int64_t row_bytes) {
     nano_ep::dispatch_payload_rows<kHidden, kTopk, kWorldSize, kExpertsPerRank, kReuseSlots, 0>(
         addresses, x, indices, topk_snapshot, weights, slots, rank, tokens, capacity, send_next_offset, payload_offset, row_bytes);
 }
@@ -205,18 +206,19 @@ void run_dispatch_payload(const torch::Tensor& addresses,
             constexpr auto plan = nano_ep::kDispatchPayloadPlan<kHidden, kTopk, kWorldSize, kExpertsPerRank, 0>;
             const auto kernel = probe_payload_kernel<kHidden, kTopk, kWorldSize, kExpertsPerRank, kReuseSlots>;
             C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(plan.num_bytes)));
-            kernel<<<blocks, plan.total_warps * 32, plan.num_bytes, stream>>>(addresses.data_ptr<int64_t>(),
-                                                                            reinterpret_cast<const nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
-                                                                            indices.data_ptr<int64_t>(),
-                                                                            kReuseSlots ? nullptr : topk_snapshot.data_ptr<int64_t>(),
-                                                                            weights.has_value() ? weights->data_ptr<float>() : nullptr,
-                                                                            slots.data_ptr<int64_t>(),
-                                                                            rank,
-                                                                            x.size(0),
-                                                                            max_tokens,
-                                                                            layout.send_next_offset,
-                                                                            layout.payload_offset,
-                                                                            nano_ep::WindowLayout::payload_row_bytes(x.size(1), indices.size(1)));
+            kernel<<<blocks, plan.total_warps * 32, plan.num_bytes, stream>>>(
+                addresses.data_ptr<int64_t>(),
+                reinterpret_cast<const nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                indices.data_ptr<int64_t>(),
+                kReuseSlots ? nullptr : topk_snapshot.data_ptr<int64_t>(),
+                weights.has_value() ? weights->data_ptr<float>() : nullptr,
+                slots.data_ptr<int64_t>(),
+                rank,
+                x.size(0),
+                max_tokens,
+                layout.send_next_offset,
+                layout.payload_offset,
+                nano_ep::WindowLayout::payload_row_bytes(x.size(1), indices.size(1)));
         };
         if (reuse_slots)
             launch.template operator()<true>();
@@ -225,12 +227,23 @@ void run_dispatch_payload(const torch::Tensor& addresses,
     };
     if (world_size == 2 && num_experts == 4 && indices.size(1) == 3) {
         switch (x.size(1)) {
-            case 256: geometry.template operator()<256, 3, 2, 2>(); break;
-            case 512: geometry.template operator()<512, 3, 2, 2>(); break;
-            case 768: geometry.template operator()<768, 3, 2, 2>(); break;
-            case 1280: geometry.template operator()<1280, 3, 2, 2>(); break;
-            case 7168: geometry.template operator()<7168, 3, 2, 2>(); break;
-            default: TORCH_CHECK(false, "unsupported payload probe hidden");
+            case 256:
+                geometry.template operator()<256, 3, 2, 2>();
+                break;
+            case 512:
+                geometry.template operator()<512, 3, 2, 2>();
+                break;
+            case 768:
+                geometry.template operator()<768, 3, 2, 2>();
+                break;
+            case 1280:
+                geometry.template operator()<1280, 3, 2, 2>();
+                break;
+            case 7168:
+                geometry.template operator()<7168, 3, 2, 2>();
+                break;
+            default:
+                TORCH_CHECK(false, "unsupported payload probe hidden");
         }
     } else if (world_size == 32 && num_experts == 32 && x.size(1) == 256 && indices.size(1) == 1)
         geometry.template operator()<256, 1, 32, 1>();

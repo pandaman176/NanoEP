@@ -9,13 +9,8 @@ pytestmark = [pytest.mark.cuda]
 
 @pytest.fixture
 def native(request):
-    if not (
-        request.config.getoption("--run-cuda")
-        or request.config.getoption("--run-distributed")
-    ):
-        pytest.skip(
-            "opt in with --run-cuda or --run-distributed; IPC lifecycle is unverified on CPU"
-        )
+    if not (request.config.getoption("--run-cuda") or request.config.getoption("--run-distributed")):
+        pytest.skip("opt in with --run-cuda or --run-distributed; IPC lifecycle is unverified on CPU")
     if not torch.cuda.is_available():
         pytest.fail("--run-cuda requested but NVIDIA CUDA is unavailable")
     return load_extension()
@@ -42,9 +37,7 @@ def test_automatic_barrier_epochs_and_notify_reuse(native, payload_probe, expert
             send_experts[0] = value
             send_experts[-1] = (value + 1) // 2
             runtime.barrier(stream.cuda_stream)
-            received_raw = payload_probe.run_notify_peer_counts(
-                runtime.peer_addresses(), window, send, send_experts, 0, count_offset
-            )
+            received_raw = payload_probe.run_notify_peer_counts(runtime.peer_addresses(), window, send, send_experts, 0, count_offset)
             received, received_experts = received_raw[:1], received_raw[1:]
             assert received.tolist() == [value]
             torch.testing.assert_close(received_experts, send_experts)
@@ -52,12 +45,7 @@ def test_automatic_barrier_epochs_and_notify_reuse(native, payload_probe, expert
             runtime.barrier(stream.cuda_stream)
         # Four entry/exit pairs advance only the barrier signal.
         assert window.view(torch.int64)[0].item() == 14
-        assert (
-            window[count_offset + (1 + experts) * 8 : count_offset + (2 + experts) * 8]
-            .view(torch.int64)
-            .item()
-            == 0
-        )
+        assert window[count_offset + (1 + experts) * 8 : count_offset + (2 + experts) * 8].view(torch.int64).item() == 0
     finally:
         torch.cuda.synchronize()
         del counts, window
@@ -67,19 +55,10 @@ def test_automatic_barrier_epochs_and_notify_reuse(native, payload_probe, expert
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("weighted", [False, True])
-@pytest.mark.parametrize(
-    "tokens", [0, 1, 11, pytest.param(None, id="multiple-grid-rounds")]
-)
+@pytest.mark.parametrize("tokens", [0, 1, 11, pytest.param(None, id="multiple-grid-rounds")])
 def test_dispatch_payload(native, payload_probe, dtype, weighted, tokens):
     if tokens is None:
-        tokens = (
-            2
-            * torch.cuda.get_device_properties(
-                torch.cuda.current_device()
-            ).multi_processor_count
-            * 8
-            + 3
-        )
+        tokens = 2 * torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count * 8 + 3
     hidden, topk, capacity = 256, 3, max(11, tokens)
     layout = native.window_layout(1, capacity, hidden, topk, 4)
     runtime = native.PeerRuntime(0, 1, layout[-1])
@@ -89,21 +68,10 @@ def test_dispatch_payload(native, payload_probe, dtype, weighted, tokens):
     stream.wait_stream(torch.cuda.current_stream())
     try:
         with torch.cuda.stream(stream):
-            x = (
-                torch.arange(tokens * hidden, device="cuda").reshape(tokens, hidden) / 8
-            ).to(dtype)
-            pattern = torch.tensor(
-                [[0, 1, 2], [-1, -1, -1], [3, -1, 0], [-1, 2, -1]], device="cuda"
-            )
+            x = (torch.arange(tokens * hidden, device="cuda").reshape(tokens, hidden) / 8).to(dtype)
+            pattern = torch.tensor([[0, 1, 2], [-1, -1, -1], [3, -1, 0], [-1, 2, -1]], device="cuda")
             indices = pattern.repeat(((tokens + 3) // 4, 1))[:tokens].contiguous()
-            weights = (
-                torch.arange(tokens * topk, device="cuda", dtype=torch.float32).reshape(
-                    tokens, topk
-                )
-                / 7
-                if weighted
-                else None
-            )
+            weights = torch.arange(tokens * topk, device="cuda", dtype=torch.float32).reshape(tokens, topk) / 7 if weighted else None
             runtime.barrier(stream.cuda_stream)
             slots = torch.full((tokens, 1), 0x5A5A, device="cuda", dtype=torch.int64)
             snapshot = torch.full_like(indices, 0x5A5A)
@@ -128,15 +96,9 @@ def test_dispatch_payload(native, payload_probe, dtype, weighted, tokens):
 
         assert slots_cpu.shape == (tokens, 1)
         assert slots_cpu.dtype == torch.int64
-        valid_tokens = [
-            token for token in range(tokens) if (indices_cpu[token] >= 0).any()
-        ]
-        assert received[layout[1] + 40 : layout[1] + 48].view(
-            torch.int64
-        ).item() == len(valid_tokens)
-        assert sorted(slots_cpu[valid_tokens, 0].tolist()) == list(
-            range(len(valid_tokens))
-        )
+        valid_tokens = [token for token in range(tokens) if (indices_cpu[token] >= 0).any()]
+        assert received[layout[1] + 40 : layout[1] + 48].view(torch.int64).item() == len(valid_tokens)
+        assert sorted(slots_cpu[valid_tokens, 0].tolist()) == list(range(len(valid_tokens)))
         x_bytes = x.element_size() * hidden
         row_bytes = dispatch_row_bytes(hidden, topk)
         for token in range(tokens):
@@ -144,29 +106,21 @@ def test_dispatch_payload(native, payload_probe, dtype, weighted, tokens):
             if token not in valid_tokens:
                 assert slot == -1
                 continue
-            row = received[
-                layout[2] + slot * row_bytes : layout[2] + (slot + 1) * row_bytes
-            ]
+            row = received[layout[2] + slot * row_bytes : layout[2] + (slot + 1) * row_bytes]
             assert row[:16].view(torch.int64).tolist() == [0, token]
             torch.testing.assert_close(
-                row[
-                    dispatch_offsets(topk)[0] : dispatch_offsets(topk)[0] + 8 * topk
-                ].view(torch.int64),
+                row[dispatch_offsets(topk)[0] : dispatch_offsets(topk)[0] + 8 * topk].view(torch.int64),
                 indices_cpu[token],
             )
             if weighted:
                 torch.testing.assert_close(
-                    row[
-                        dispatch_offsets(topk)[1] : dispatch_offsets(topk)[1] + 4 * topk
-                    ].view(torch.float32),
+                    row[dispatch_offsets(topk)[1] : dispatch_offsets(topk)[1] + 4 * topk].view(torch.float32),
                     weights_cpu[token],
                     rtol=0,
                     atol=0,
                 )
             torch.testing.assert_close(
-                row[
-                    dispatch_offsets(topk)[2] : dispatch_offsets(topk)[2] + x_bytes
-                ].view(dtype),
+                row[dispatch_offsets(topk)[2] : dispatch_offsets(topk)[2] + x_bytes].view(dtype),
                 x_cpu[token],
                 rtol=0,
                 atol=0,
@@ -179,21 +133,10 @@ def test_dispatch_payload(native, payload_probe, dtype, weighted, tokens):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize(
-    "tokens", [0, 11, pytest.param(None, id="multiple-grid-rounds")]
-)
-def test_cached_payload_preserves_mapping_and_counter(
-    native, payload_probe, dtype, tokens
-):
+@pytest.mark.parametrize("tokens", [0, 11, pytest.param(None, id="multiple-grid-rounds")])
+def test_cached_payload_preserves_mapping_and_counter(native, payload_probe, dtype, tokens):
     if tokens is None:
-        tokens = (
-            2
-            * torch.cuda.get_device_properties(
-                torch.cuda.current_device()
-            ).multi_processor_count
-            * 8
-            + 3
-        )
+        tokens = 2 * torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count * 8 + 3
     hidden, topk, capacity = 256, 3, max(11, tokens)
     layout = native.window_layout(1, capacity, hidden, topk, 4)
     runtime = native.PeerRuntime(0, 1, layout[-1])
@@ -206,13 +149,9 @@ def test_cached_payload_preserves_mapping_and_counter(
     row_bytes = dispatch_row_bytes(hidden, topk)
     try:
         with torch.cuda.stream(stream):
-            pattern = torch.tensor(
-                [[0, 1, 2], [-1, -1, -1], [3, -1, 0], [-1, 2, -1]], device="cuda"
-            )
+            pattern = torch.tensor([[0, 1, 2], [-1, -1, -1], [3, -1, 0], [-1, 2, -1]], device="cuda")
             indices = pattern.repeat(((tokens + 3) // 4, 1))[:tokens].contiguous()
-            base_x = (
-                torch.arange(tokens * hidden, device="cuda").reshape(tokens, hidden) / 8
-            ).to(dtype)
+            base_x = (torch.arange(tokens * hidden, device="cuda").reshape(tokens, hidden) / 8).to(dtype)
             slots = None
             previous_slots = None
             for phase in range(4):
@@ -221,21 +160,13 @@ def test_cached_payload_preserves_mapping_and_counter(
                     indices = torch.full_like(indices, -1)
                     indices[::2, 0] = 3
                 x = base_x + phase * 64
-                weights = (
-                    torch.full(
-                        (tokens, topk), phase + 0.25, device="cuda", dtype=torch.float32
-                    )
-                    if phase != 2
-                    else None
-                )
+                weights = torch.full((tokens, topk), phase + 0.25, device="cuda", dtype=torch.float32) if phase != 2 else None
                 if not cached:
                     send_next.zero_()
                 runtime.barrier(stream.cuda_stream)
                 old_slots, old_counter = slots, send_next.item()
                 if not cached:
-                    slots = torch.full(
-                        (tokens, 1), 0x5A5A, device="cuda", dtype=torch.int64
-                    )
+                    slots = torch.full((tokens, 1), 0x5A5A, device="cuda", dtype=torch.int64)
                 snapshot = torch.full_like(indices, 0x5A5A)
                 payload_probe.run_dispatch_payload(
                     runtime.peer_addresses(),
@@ -269,41 +200,27 @@ def test_cached_payload_preserves_mapping_and_counter(
                     torch.testing.assert_close(slots_cpu, previous_slots)
                     assert send_next.item() == old_counter
                 previous_slots = slots_cpu.clone()
-                assert sorted(slots_cpu[slots_cpu >= 0].tolist()) == list(
-                    range(expected_count)
-                )
+                assert sorted(slots_cpu[slots_cpu >= 0].tolist()) == list(range(expected_count))
                 for token in range(tokens):
                     slot = slots_cpu[token, 0].item()
                     if not (indices_cpu[token] >= 0).any():
                         assert slot == -1
                         continue
-                    row = received[
-                        layout[2] + slot * row_bytes : layout[2]
-                        + (slot + 1) * row_bytes
-                    ]
+                    row = received[layout[2] + slot * row_bytes : layout[2] + (slot + 1) * row_bytes]
                     assert row[:16].view(torch.int64).tolist() == [0, token]
                     torch.testing.assert_close(
-                        row[
-                            dispatch_offsets(topk)[0] : dispatch_offsets(topk)[0]
-                            + 8 * topk
-                        ].view(torch.int64),
+                        row[dispatch_offsets(topk)[0] : dispatch_offsets(topk)[0] + 8 * topk].view(torch.int64),
                         indices_cpu[token],
                     )
                     torch.testing.assert_close(
-                        row[
-                            dispatch_offsets(topk)[2] : dispatch_offsets(topk)[2]
-                            + x_bytes
-                        ].view(dtype),
+                        row[dispatch_offsets(topk)[2] : dispatch_offsets(topk)[2] + x_bytes].view(dtype),
                         x_cpu[token],
                         rtol=0,
                         atol=0,
                     )
                     if weights is not None:
                         torch.testing.assert_close(
-                            row[
-                                dispatch_offsets(topk)[1] : dispatch_offsets(topk)[1]
-                                + 4 * topk
-                            ].view(torch.float32),
+                            row[dispatch_offsets(topk)[1] : dispatch_offsets(topk)[1] + 4 * topk].view(torch.float32),
                             weights[token].cpu(),
                             rtol=0,
                             atol=0,
@@ -326,9 +243,7 @@ def test_cached_payload_preserves_mapping_and_counter(
         pytest.param(8, 2, 3, 256, False, True, id="eight-ranks-cached"),
     ],
 )
-def test_source_partitioned_payload(
-    native, payload_probe, ranks, local_experts, topk, hidden, weighted, cached
-):
+def test_source_partitioned_payload(native, payload_probe, ranks, local_experts, topk, hidden, weighted, cached):
     """Run rank-lane selection with logical peer allocations on one GPU."""
     tokens, capacity = 5, 5
     experts = ranks * local_experts
@@ -353,34 +268,21 @@ def test_source_partitioned_payload(
             used[destination] += 1
 
     # Each pointer names separate storage; no cross-GPU IPC is exercised here.
-    windows = [
-        torch.full((layout[-1],), 0xA5, dtype=torch.uint8, device="cuda")
-        for _ in range(ranks)
-    ]
-    addresses = torch.tensor(
-        [window.data_ptr() for window in windows], device="cuda", dtype=torch.int64
-    )
+    windows = [torch.full((layout[-1],), 0xA5, dtype=torch.uint8, device="cuda") for _ in range(ranks)]
+    addresses = torch.tensor([window.data_ptr() for window in windows], device="cuda", dtype=torch.int64)
     indices_gpu, slots_gpu = indices.cuda(), slots.cuda()
     rank = ranks - 1
     for phase in range(2):
-        x = (torch.arange(tokens * hidden).reshape(tokens, hidden) / 8 + phase * 64).to(
-            torch.bfloat16
-        )
-        x.view(torch.int16)[[0, 3], :4] = torch.tensor(
-            [0x7FC1, -32768, 0x7F80, -128], dtype=torch.int16
-        )
+        x = (torch.arange(tokens * hidden).reshape(tokens, hidden) / 8 + phase * 64).to(torch.bfloat16)
+        x.view(torch.int16)[[0, 3], :4] = torch.tensor([0x7FC1, -32768, 0x7F80, -128], dtype=torch.int16)
         weights = torch.arange(tokens * topk).reshape(tokens, topk).float() / 7 + phase
         weights.view(torch.int32)[0, 0] = 0x7FC01234
         weights.view(torch.int32)[3, 0] = -2147483648
         for window in windows:
             window.fill_(0xA5)
-            window[send_next_offset : send_next_offset + ranks * 8].view(
-                torch.int64
-            ).fill_(1)
+            window[send_next_offset : send_next_offset + ranks * 8].view(torch.int64).fill_(1)
         if not cached:
-            windows[rank][send_next_offset : send_next_offset + ranks * 8].view(
-                torch.int64
-            ).zero_()
+            windows[rank][send_next_offset : send_next_offset + ranks * 8].view(torch.int64).zero_()
             slots_gpu.fill_(0x5A5A)
         snapshot = torch.full_like(indices_gpu, 0x5A5A)
         payload_probe.run_dispatch_payload(
@@ -416,13 +318,9 @@ def test_source_partitioned_payload(
         for destination, window in enumerate(windows):
             packet = torch.full((layout[-1],), 0xA5, dtype=torch.uint8)
             mask = torch.ones(layout[-1], dtype=torch.bool)
-            packet[send_next_offset : send_next_offset + ranks * 8].view(
-                torch.int64
-            ).fill_(1)
+            packet[send_next_offset : send_next_offset + ranks * 8].view(torch.int64).fill_(1)
             if not cached and destination == rank:
-                packet[send_next_offset : send_next_offset + ranks * 8].view(
-                    torch.int64
-                ).copy_(torch.tensor(used))
+                packet[send_next_offset : send_next_offset + ranks * 8].view(torch.int64).copy_(torch.tensor(used))
             for token in range(tokens):
                 slot = int(actual_slots[token, destination])
                 if slot < 0:
@@ -437,21 +335,13 @@ def test_source_partitioned_payload(
                 ):
                     mask[start + gap_start : start + gap_end] = False
                 if not weighted:
-                    mask[start + weight_offset : start + weight_offset + topk * 4] = (
-                        False
-                    )
+                    mask[start + weight_offset : start + weight_offset + topk * 4] = False
                 row = packet[start : start + row_bytes]
                 row[:16].view(torch.int64).copy_(torch.tensor([rank, token]))
-                row[topk_offset : topk_offset + topk * 8].view(torch.int64).copy_(
-                    indices[token]
-                )
-                row[x_offset : x_offset + hidden * 2].view(torch.bfloat16).copy_(
-                    x[token]
-                )
+                row[topk_offset : topk_offset + topk * 8].view(torch.int64).copy_(indices[token])
+                row[x_offset : x_offset + hidden * 2].view(torch.bfloat16).copy_(x[token])
                 if weighted:
-                    row[weight_offset : weight_offset + topk * 4].view(
-                        torch.float32
-                    ).copy_(weights[token])
+                    row[weight_offset : weight_offset + topk * 4].view(torch.float32).copy_(weights[token])
             expected.append(packet)
             comparable.append(mask)
         for window, packet, mask in zip(windows, expected, comparable, strict=True):

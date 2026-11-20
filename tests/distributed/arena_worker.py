@@ -27,12 +27,7 @@ def make_case(size, topk, dtype, step):
             tokens = 0
         xs.append(torch.full((tokens, hidden), rank + 1 + step * 8, dtype=dtype))
         idx = (
-            torch.stack(
-                [
-                    torch.randperm(experts, generator=generator)[:topk]
-                    for _ in range(tokens)
-                ]
-            )
+            torch.stack([torch.randperm(experts, generator=generator)[:topk] for _ in range(tokens)])
             if tokens
             else torch.empty((0, topk), dtype=torch.int64)
         )
@@ -40,9 +35,7 @@ def make_case(size, topk, dtype, step):
             idx[0] = -1
             idx[1::2, -1] = -1
         indices.append(idx)
-        weights.append(
-            (torch.arange(tokens * topk).view(tokens, topk).float() % 9 - 4) / 8
-        )
+        weights.append((torch.arange(tokens * topk).view(tokens, topk).float() % 9 - 4) / 8)
     return Case(xs, indices, weights, torch.empty(0), experts, topk, hidden, capacity)
 
 
@@ -73,9 +66,7 @@ def check_dispatch(got, case, rank, expand, weighted):
         mask = ref.expanded_slots >= 0
         assert torch.equal(actual_slots >= 0, mask)
         actual, target = actual_slots[mask].cuda(), ref.expanded_slots[mask]
-        torch.testing.assert_close(
-            got.x[actual].cpu(), expected.x[target], rtol=0, atol=0
-        )
+        torch.testing.assert_close(got.x[actual].cpu(), expected.x[target], rtol=0, atol=0)
         padding = torch.ones(layout.expanded_capacity, dtype=torch.bool, device="cuda")
         padding[actual] = False
         assert torch.count_nonzero(got.x[padding]).item() == 0
@@ -91,21 +82,14 @@ def check_dispatch(got, case, rank, expand, weighted):
         torch.testing.assert_close(got.x[order].cpu(), expected.x, rtol=0, atol=0)
         torch.testing.assert_close(got.topk_idx[order].cpu(), expected.topk_idx)
         if weighted:
-            torch.testing.assert_close(
-                got.topk_weights[order].cpu(), expected.topk_weights, rtol=0, atol=0
-            )
+            torch.testing.assert_close(got.topk_weights[order].cpu(), expected.topk_weights, rtol=0, atol=0)
     if not weighted:
         assert got.topk_weights is None
 
 
 def check_combine(got, case, rank, expand, weighted):
-    multiplicity = [
-        sum(e >= 0 for e in row) if expand else len({e // 8 for e in row if e >= 0})
-        for row in case.indices[rank].tolist()
-    ]
-    expected = case.xs[rank] * torch.tensor(
-        multiplicity, dtype=case.xs[rank].dtype
-    ).unsqueeze(1)
+    multiplicity = [sum(e >= 0 for e in row) if expand else len({e // 8 for e in row if e >= 0}) for row in case.indices[rank].tolist()]
+    expected = case.xs[rank] * torch.tensor(multiplicity, dtype=case.xs[rank].dtype).unsqueeze(1)
     torch.testing.assert_close(got.x.cpu(), expected, rtol=0, atol=0)
     if weighted:
         torch.testing.assert_close(
@@ -125,17 +109,9 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
     with CudaBuffer(dist.group.WORLD, config, allow_multiple_reduction=mode) as buffer:
         backend = buffer._backend
         assert buffer._payload_offset == buffer._return_offset
-        payload_bytes = (
-            size * original.capacity * dispatch_row_bytes(original.hidden, topk)
-        )
-        return_bytes = (
-            (min(size, topk) if mode else topk)
-            * original.capacity
-            * return_row_bytes(original.hidden, topk)
-        )
-        assert buffer._num_bytes == align32(
-            buffer._payload_offset + max(payload_bytes, return_bytes)
-        )
+        payload_bytes = size * original.capacity * dispatch_row_bytes(original.hidden, topk)
+        return_bytes = (min(size, topk) if mode else topk) * original.capacity * return_row_bytes(original.hidden, topk)
+        assert buffer._num_bytes == align32(buffer._payload_offset + max(payload_bytes, return_bytes))
         window = buffer._runtime.local_window()
         dispatch_gates, combine_gates = [], []
         snapshots = []
@@ -162,9 +138,7 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
                 combine_gates.append(5)
             return outputs
 
-        buffer._backend = SimpleNamespace(
-            dispatch=delayed_dispatch, combine=delayed_combine
-        )
+        buffer._backend = SimpleNamespace(dispatch=delayed_dispatch, combine=delayed_combine)
         with torch.cuda.stream(buffer._comm_stream):
             # All-one FP32 bytes are NaN. Unwritten records must never contribute.
             window[buffer._payload_offset :].fill_(255)
@@ -227,9 +201,7 @@ def run_case(rank, size, probe, *, expand, mode, weighted, dtype, topk):
         replay.event.current_stream_wait()
         check_dispatch(replay, replay_case, rank, expand, weighted)
         assert replay.handle is first.handle
-        returned = buffer.combine(
-            replay.x, replay.handle, weights=replay.topk_weights, async_op=True
-        )
+        returned = buffer.combine(replay.x, replay.handle, weights=replay.topk_weights, async_op=True)
         returned.event.current_stream_wait()
         check_combine(returned, replay_case, rank, expand, weighted)
         check_dispatch(first, original, rank, expand, weighted)

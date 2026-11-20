@@ -9,10 +9,7 @@ import torch
 
 @pytest.fixture(scope="session")
 def payload_probe(request):
-    if not (
-        request.config.getoption("--run-cuda")
-        or request.config.getoption("--run-distributed")
-    ):
+    if not (request.config.getoption("--run-cuda") or request.config.getoption("--run-distributed")):
         pytest.skip("opt in with --run-cuda or --run-distributed")
     if not torch.cuda.is_available():
         pytest.fail("CUDA payload probe requires an NVIDIA GPU")

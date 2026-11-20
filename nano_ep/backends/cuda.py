@@ -88,7 +88,7 @@ def close_peer_runtime(runtime, group, device):
 
 class CudaBuffer:
     def __init__(self, group, config: EPConfig, *, allow_multiple_reduction: bool = False):
-        'Collectively create a single-node CUDA IPC buffer and communication stream.'
+        "Collectively create a single-node CUDA IPC buffer and communication stream."
         self._group = group
         self._config = config
         self._allow_multiple_reduction = allow_multiple_reduction
@@ -257,7 +257,7 @@ class CudaBuffer:
         async_op: bool = False,
         num_sms: int | None = None,
     ) -> NativeDispatchResult:
-        'Dispatch payloads using fresh or cached routing; return exact receive layouts.'
+        "Dispatch payloads using fresh or cached routing; return exact receive layouts."
         check_torch_deterministic()
         if self._closed:
             raise RuntimeError("CudaBuffer is closed")
@@ -369,7 +369,7 @@ class CudaBuffer:
         async_op: bool = False,
         num_sms: int | None = None,
     ) -> NativeCombineResult:
-        'Return expert outputs to their source and reduce in FP32, without gate weighting.'
+        "Return expert outputs to their source and reduce in FP32, without gate weighting."
         check_torch_deterministic()
         if self._closed:
             raise RuntimeError("CudaBuffer is closed")

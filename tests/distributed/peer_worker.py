@@ -53,9 +53,7 @@ def delayed_barrier(runtime, window, stream, epoch, rank, waiter):
         dist.send(message, peer)
         dist.recv(message, peer)
         assert message.item() == epoch
-        assert not completed.query(), (
-            "barrier completed before the delayed peer arrived"
-        )
+        assert not completed.query(), "barrier completed before the delayed peer arrived"
         dist.send(message, peer)
     else:
         dist.recv(message, peer)
@@ -94,13 +92,7 @@ def check_lifetime(native, probe, rank, lifetime):
     for round_id in range(6):
         epoch = 2 * round_id + 1
         expected = torch.tensor(
-            [
-                [
-                    lifetime * 10000 + round_id * 100 + peer * 10 + i
-                    for i in range(words)
-                ]
-                for peer in range(size)
-            ],
+            [[lifetime * 10000 + round_id * 100 + peer * 10 + i for i in range(words)] for peer in range(size)],
             dtype=torch.int64,
         )
         with torch.cuda.stream(stream):
@@ -145,9 +137,7 @@ def check_lifetime(native, probe, rank, lifetime):
     runtime.close_peer_mappings()
     runtime.close_peer_mappings()
     # Allocation remains locally readable after imported mappings are closed.
-    torch.testing.assert_close(
-        window.view(torch.int64)[offset : offset + words].cpu(), expected[rank]
-    )
+    torch.testing.assert_close(window.view(torch.int64)[offset : offset + words].cpu(), expected[rank])
     for method in (
         runtime.local_window,
         runtime.peer_addresses,
@@ -200,17 +190,13 @@ def check_notify(native, probe, rank):
             send = torch.tensor(matrix[rank], dtype=torch.int64, device="cuda")
             all_expert_counts = [
                 [
-                    matrix[source][destination]
-                    if expert in (0, local_experts - 1)
-                    else 0
+                    matrix[source][destination] if expert in (0, local_experts - 1) else 0
                     for destination in range(2)
                     for expert in range(local_experts)
                 ]
                 for source in range(2)
             ]
-            send_experts = torch.tensor(
-                all_expert_counts[rank], dtype=torch.int64, device="cuda"
-            )
+            send_experts = torch.tensor(all_expert_counts[rank], dtype=torch.int64, device="cuda")
             peer = 1 - rank
             waiter = round_id % 2
             message = torch.tensor([round_id], dtype=torch.int64)
@@ -229,9 +215,7 @@ def check_notify(native, probe, rank):
                 done.record(stream)
                 dist.send(message, peer)
                 dist.recv(message, peer)
-                assert not done.query(), (
-                    "notify accepted a pending slot before the peer published its count"
-                )
+                assert not done.query(), "notify accepted a pending slot before the peer published its count"
                 dist.send(message, peer)
             else:
                 dist.recv(message, peer)
@@ -258,11 +242,7 @@ def check_notify(native, probe, rank):
             expected = [matrix[source][rank] for source in range(2)]
             assert received.tolist() == expected
             expected_experts = [
-                sum(
-                    all_expert_counts[source][rank * local_experts + expert]
-                    for source in range(2)
-                )
-                for expert in range(local_experts)
+                sum(all_expert_counts[source][rank * local_experts + expert] for source in range(2)) for expert in range(local_experts)
             ]
             assert received_experts.tolist() == expected_experts
             assert counts.tolist() == [-1] * (2 + num_experts)
@@ -297,22 +277,13 @@ def check_payload(native, probe, rank):
 
     def inputs(source, round_id, dtype, weighted):
         tokens = ((11, 7), (0, 11), (11, 11), (3, 0))[round_id][source]
-        x = (
-            torch.arange(tokens * hidden).reshape(tokens, hidden) / 8
-            + source * 100
-            + round_id * 1000
-        ).to(dtype)
+        x = (torch.arange(tokens * hidden).reshape(tokens, hidden) / 8 + source * 100 + round_id * 1000).to(dtype)
         if round_id == 2:
             indices = torch.tensor([[0, 1, -1]]).repeat(tokens, 1)
         else:
             pattern = torch.tensor([[0, 1, 2], [2, 3, 0], [-1, -1, -1], [1, -1, -1]])
             indices = pattern.repeat(((tokens + 3) // 4, 1))[:tokens].contiguous()
-        weights = (
-            torch.arange(tokens * topk, dtype=torch.float32).reshape(tokens, topk) / 7
-            + source
-            if weighted
-            else None
-        )
+        weights = torch.arange(tokens * topk, dtype=torch.float32).reshape(tokens, topk) / 7 + source if weighted else None
         return x, indices, weights
 
     def validate_payload(received, slots_cpu, sources, weighted):
@@ -327,68 +298,42 @@ def check_payload(native, probe, rank):
             )
             for source, (x, indices, weights) in enumerate(sources)
             for token in range(x.shape[0])
-            if any(
-                expert >= 0 and expert // 2 == rank
-                for expert in indices[token].tolist()
-            )
+            if any(expert >= 0 and expert // 2 == rank for expert in indices[token].tolist())
         }
         expected_sends = [
-            sum(
-                any(e >= 0 and e // 2 == destination for e in choices)
-                for choices in sources[rank][1].tolist()
-            )
-            for destination in range(2)
+            sum(any(e >= 0 and e // 2 == destination for e in choices) for choices in sources[rank][1].tolist()) for destination in range(2)
         ]
-        assert (
-            received[layout[1] + 48 : layout[1] + 64].view(torch.int64).tolist()
-            == expected_sends
-        )
-        assert (
-            received[layout[1] : layout[1] + 48].view(torch.int64).tolist() == [-1] * 6
-        )
+        assert received[layout[1] + 48 : layout[1] + 64].view(torch.int64).tolist() == expected_sends
+        assert received[layout[1] : layout[1] + 48].view(torch.int64).tolist() == [-1] * 6
         for token, experts in enumerate(sources[rank][1].tolist()):
             destinations = {expert // 2 for expert in experts if expert >= 0}
             for destination in range(2):
                 slot = slots_cpu[token, destination].item()
-                assert (
-                    rank * capacity <= slot < (rank + 1) * capacity
-                    if destination in destinations
-                    else slot == -1
-                )
+                assert rank * capacity <= slot < (rank + 1) * capacity if destination in destinations else slot == -1
         seen = set()
         published = [
-            source * capacity + local_slot
-            for source in range(2)
-            for local_slot in range(sum(key[0] == source for key in expected))
+            source * capacity + local_slot for source in range(2) for local_slot in range(sum(key[0] == source for key in expected))
         ]
         for slot in published:
-            row = received[
-                layout[2] + slot * row_bytes : layout[2] + (slot + 1) * row_bytes
-            ]
+            row = received[layout[2] + slot * row_bytes : layout[2] + (slot + 1) * row_bytes]
             key = tuple(row[:16].view(torch.int64).tolist())
             assert key in expected and key not in seen
             assert key[0] == slot // capacity
             seen.add(key)
             wanted_x, wanted_indices, wanted_weights = expected[key]
             torch.testing.assert_close(
-                row[
-                    dispatch_offsets(topk)[0] : dispatch_offsets(topk)[0] + 8 * topk
-                ].view(torch.int64),
+                row[dispatch_offsets(topk)[0] : dispatch_offsets(topk)[0] + 8 * topk].view(torch.int64),
                 wanted_indices,
             )
             if weighted:
                 torch.testing.assert_close(
-                    row[
-                        dispatch_offsets(topk)[1] : dispatch_offsets(topk)[1] + 4 * topk
-                    ].view(torch.float32),
+                    row[dispatch_offsets(topk)[1] : dispatch_offsets(topk)[1] + 4 * topk].view(torch.float32),
                     wanted_weights,
                     rtol=0,
                     atol=0,
                 )
             torch.testing.assert_close(
-                row[
-                    dispatch_offsets(topk)[2] : dispatch_offsets(topk)[2] + x_bytes
-                ].view(dtype),
+                row[dispatch_offsets(topk)[2] : dispatch_offsets(topk)[2] + x_bytes].view(dtype),
                 wanted_x,
                 rtol=0,
                 atol=0,
@@ -428,9 +373,7 @@ def check_payload(native, probe, rank):
             )
             received_counts = received_raw[:2]
             received_experts = received_raw[2:].view(2, 2).sum(0)
-            slots = torch.full(
-                (x.shape[0], 2), 0x5A5A, dtype=torch.int64, device="cuda"
-            )
+            slots = torch.full((x.shape[0], 2), 0x5A5A, dtype=torch.int64, device="cuda")
             snapshot = torch.full_like(indices, 0x5A5A)
             probe.run_dispatch_payload(
                 runtime.peer_addresses(),
@@ -448,26 +391,16 @@ def check_payload(native, probe, rank):
             received, slots_cpu = window.cpu(), slots.cpu()
             torch.testing.assert_close(snapshot.cpu(), source_indices, rtol=0, atol=0)
             expected_count = received_counts.sum().item()
-            expected_experts = [
-                sum(
-                    int((source_idx == rank * 2 + expert).sum())
-                    for _, source_idx, _ in sources
-                )
-                for expert in range(2)
-            ]
+            expected_experts = [sum(int((source_idx == rank * 2 + expert).sum()) for _, source_idx, _ in sources) for expert in range(2)]
             assert received_experts.tolist() == expected_experts
-        assert (
-            validate_payload(received, slots_cpu, sources, weighted) == expected_count
-        )
+        assert validate_payload(received, slots_cpu, sources, weighted) == expected_count
 
         # Keep the old routing/slots and replace payloads, toggling weights.
         cached_sources = [
             (
                 x + 64,
                 idx,
-                None
-                if weighted
-                else torch.full(idx.shape, source + 0.375, dtype=torch.float32),
+                None if weighted else torch.full(idx.shape, source + 0.375, dtype=torch.float32),
             )
             for source, (x, idx, _) in enumerate(sources)
         ]
@@ -491,12 +424,7 @@ def check_payload(native, probe, rank):
             runtime.barrier(stream.cuda_stream)
             cached_received, cached_slots = window.cpu(), slots.cpu()
         torch.testing.assert_close(cached_slots, slots_cpu)
-        assert (
-            validate_payload(
-                cached_received, cached_slots, cached_sources, not weighted
-            )
-            == expected_count
-        )
+        assert validate_payload(cached_received, cached_slots, cached_sources, not weighted) == expected_count
 
     torch.cuda.synchronize()
     dist.barrier()
@@ -508,9 +436,7 @@ def check_payload(native, probe, rank):
 
 
 def run():
-    rank, size, local = (
-        int(os.environ[key]) for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK")
-    )
+    rank, size, local = (int(os.environ[key]) for key in ("RANK", "WORLD_SIZE", "LOCAL_RANK"))
     assert size == int(os.environ["LOCAL_WORLD_SIZE"]) == 2
     torch.cuda.set_device(local)
     native, probe = load_extension(), load_probe()

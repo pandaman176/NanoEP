@@ -42,9 +42,7 @@ def test_peer_runtime_two_ranks(request):
     try:
         status = run_logged(command, cwd=repo, env=env, log=log, timeout=120)
     except subprocess.TimeoutExpired:
-        pytest.fail(
-            f"PeerRuntime torchrun timed out: {log}\n{log.read_text()[-12000:]}"
-        )
+        pytest.fail(f"PeerRuntime torchrun timed out: {log}\n{log.read_text()[-12000:]}")
     contents = log.read_text()
     assert status == 0, contents
     assert contents.count("NANO_EP_PEER_LIFETIME_OK=") == 4, contents

@@ -48,9 +48,7 @@ def test_cooperative_combine_barriers(request):
     try:
         status = run_logged(command, cwd=repo, env=env, log=log, timeout=600)
     except subprocess.TimeoutExpired:
-        pytest.fail(
-            f"cooperative combine torchrun timed out: {log}\n{log.read_text()[-12000:]}"
-        )
+        pytest.fail(f"cooperative combine torchrun timed out: {log}\n{log.read_text()[-12000:]}")
     contents = log.read_text()
     assert status == 0, contents
     for rank in range(nproc):

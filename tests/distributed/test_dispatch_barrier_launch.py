@@ -29,9 +29,7 @@ def test_cooperative_dispatch_barriers(request):
     for cached in (False, True):
         native.prepare_dispatch(256, 3, nproc, 3, 2153, 4, cached, False, False, False)
         for expand in (False, True):
-            native.prepare_dispatch(
-                256, 3, nproc, 3, 2153, 4, cached, expand, True, expand
-            )
+            native.prepare_dispatch(256, 3, nproc, 3, 2153, 4, cached, expand, True, expand)
     repo = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env["NANO_EP_PEER_PROBE_PATH"] = probe.__file__
@@ -51,9 +49,7 @@ def test_cooperative_dispatch_barriers(request):
     try:
         status = run_logged(command, cwd=repo, env=env, log=log, timeout=600)
     except subprocess.TimeoutExpired:
-        pytest.fail(
-            f"cooperative dispatch torchrun timed out: {log}\n{log.read_text()[-12000:]}"
-        )
+        pytest.fail(f"cooperative dispatch torchrun timed out: {log}\n{log.read_text()[-12000:]}")
     contents = log.read_text()
     assert status == 0, contents
     for rank in range(nproc):

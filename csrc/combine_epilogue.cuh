@@ -93,6 +93,7 @@ __global__ void __launch_bounds__(kCombineOutputPlan<kHidden>.max_warps() * 32, 
 
     // Each warp processes one source token per iteration; lanes stride over hidden coordinates in int4 vectors.
     const int lane = threadIdx.x % kWarpSize;
+    // Broadcast from lane 0 to encourage the compiler to use a uniform register.
     const int warp_idx = __shfl_sync(0xffffffffu, threadIdx.x / kWarpSize, 0);
     // One reduced row per warp is assembled in shared memory, so a single bulk
     // store publishes it while the warp starts the next row.

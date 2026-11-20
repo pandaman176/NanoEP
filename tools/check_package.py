@@ -46,7 +46,8 @@ def main():
                     assert archive.read("nano_ep/_csrc/deep_jit/include/" + relative.as_posix()) == source.read_bytes(), relative
             expected_headers = {
                 "nano_ep/_csrc/deep_jit/include/" + source.relative_to(deepjit_include).as_posix()
-                for source in deepjit_include.rglob("*") if source.is_file()
+                for source in deepjit_include.rglob("*")
+                if source.is_file()
             }
             assert {name for name in archive.namelist() if name.startswith("nano_ep/_csrc/deep_jit/include/")} == expected_headers
             assert archive.read("nano_ep/_csrc/deep_jit/LICENSE") == (project / "third-party/deep_jit/LICENSE").read_bytes()

@@ -12,7 +12,6 @@ from nano_ep import EPConfig
 from nano_ep.backends import cuda
 
 
-
 @pytest.fixture
 def bootstrap(monkeypatch):
     local = threading.local()
@@ -34,9 +33,7 @@ def bootstrap(monkeypatch):
             bucket = rounds.setdefault(index, {})
             bucket[local.rank] = pickle.loads(pickle.dumps(value))
             condition.notify_all()
-            assert condition.wait_for(lambda: len(bucket) == 2, timeout=5), (
-                f"missing rank in collective {index}"
-            )
+            assert condition.wait_for(lambda: len(bucket) == 2, timeout=5), f"missing rank in collective {index}"
             output[:] = [pickle.loads(pickle.dumps(bucket[rank])) for rank in range(2)]
 
     def barrier(*, group):
@@ -102,9 +99,7 @@ def bootstrap(monkeypatch):
             assert not self.freed
             self.freed = True
 
-    def window_layout(
-        ranks, tokens, hidden, topk, experts, allow_multiple_reduction, /
-    ):
+    def window_layout(ranks, tokens, hidden, topk, experts, allow_multiple_reduction, /):
         record_operation("layout")
         assert (ranks, tokens, hidden, topk, experts) == (2, 8, 256, 2, 4)
         assert allow_multiple_reduction is settings["allow_multiple_reduction"]
@@ -130,13 +125,9 @@ def bootstrap(monkeypatch):
     monkeypatch.setattr(
         cuda.torch.cuda,
         "current_stream",
-        lambda device: SimpleNamespace(
-            synchronize=lambda: record_operation("window_ready")
-        ),
+        lambda device: SimpleNamespace(synchronize=lambda: record_operation("window_ready")),
     )
-    monkeypatch.setattr(
-        cuda.torch.cuda, "synchronize", lambda device: record_operation("drain")
-    )
+    monkeypatch.setattr(cuda.torch.cuda, "synchronize", lambda device: record_operation("drain"))
 
     def run(*, close=False):
         def participant(rank):
@@ -156,9 +147,7 @@ def bootstrap(monkeypatch):
             futures = [executor.submit(participant, rank) for rank in range(2)]
             return [future.result(timeout=15) for future in futures]
 
-    return SimpleNamespace(
-        run=run, settings=settings, events=events, runtimes=runtimes, rounds=rounds
-    )
+    return SimpleNamespace(run=run, settings=settings, events=events, runtimes=runtimes, rounds=rounds)
 
 
 @pytest.mark.parametrize(
@@ -169,9 +158,7 @@ def bootstrap(monkeypatch):
 def test_bootstrap_collective_close(bootstrap, allow_multiple_reduction):
     bootstrap.settings["allow_multiple_reduction"] = allow_multiple_reduction
     buffers = bootstrap.run(close=True)
-    assert all(
-        isinstance(buffer, cuda.CudaBuffer) and buffer._closed for buffer in buffers
-    )
+    assert all(isinstance(buffer, cuda.CudaBuffer) and buffer._closed for buffer in buffers)
     assert all(runtime.freed for runtime in bootstrap.runtimes.values())
     for rank, buffer in enumerate(buffers):
         assert buffer._device == buffer._rank == rank
@@ -189,11 +176,5 @@ def test_bootstrap_collective_close(bootstrap, allow_multiple_reduction):
         assert window.view(torch.int64)[12:18].tolist() == [-1] * 6
         assert torch.count_nonzero(window[:96]).item() == 0
         assert torch.count_nonzero(window[144:]).item() == 0
-        operations = [
-            name for name, actual_rank in bootstrap.events if actual_rank == rank
-        ]
-        assert (
-            operations.index("initialize")
-            < operations.index("window_ready")
-            < operations.index("export")
-        )
+        operations = [name for name, actual_rank in bootstrap.events if actual_rank == rank]
+        assert operations.index("initialize") < operations.index("window_ready") < operations.index("export")

@@ -12,14 +12,14 @@
 
 template <bool kExpand, bool kMode, bool kWithWeights>
 __global__ void __launch_bounds__(nano_ep::kCombineReturnPlan<NANO_EP_HIDDEN>.max_warps() * 32, 1)
-return_payload_kernel(const int64_t* addresses,
-                      const nv_bfloat16* x,
-                      const float* weights,
-                      const int32_t* recv_metadata,
-                      int rank,
-                      int64_t rows,
-                      int64_t input_rows,
-                      int64_t return_offset) {
+    return_payload_kernel(const int64_t* addresses,
+                          const nv_bfloat16* x,
+                          const float* weights,
+                          const int32_t* recv_metadata,
+                          int rank,
+                          int64_t rows,
+                          int64_t input_rows,
+                          int64_t return_offset) {
     nano_ep::combine_return_rows<NANO_EP_HIDDEN,
                                  NANO_EP_TOPK,
                                  NANO_EP_WORLD_SIZE,
@@ -27,8 +27,7 @@ return_payload_kernel(const int64_t* addresses,
                                  nv_bfloat16,
                                  kExpand,
                                  kMode,
-                                 kWithWeights>(
-        addresses, x, weights, recv_metadata, rank, rows, input_rows, return_offset);
+                                 kWithWeights>(addresses, x, weights, recv_metadata, rank, rows, input_rows, return_offset);
 }
 
 // Logical peers use distinct allocations on one physical GPU. They execute the
@@ -63,15 +62,14 @@ void run_return_kernel(const std::vector<torch::Tensor>& windows,
     const auto launch = [&]<bool kExpand, bool kMode, bool kWithWeights>() {
         const auto kernel = return_payload_kernel<kExpand, kMode, kWithWeights>;
         C10_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
-        kernel<<<blocks, warps * 32, smem_bytes, stream>>>(
-            addresses.data_ptr<int64_t>(),
-            reinterpret_cast<const nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
-            weights.has_value() ? weights->data_ptr<float>() : nullptr,
-            metadata[0].data_ptr<int32_t>(),
-            rank,
-            metadata[0].size(0),
-            x.size(0),
-            layout.return_offset);
+        kernel<<<blocks, warps * 32, smem_bytes, stream>>>(addresses.data_ptr<int64_t>(),
+                                                           reinterpret_cast<const nv_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                                                           weights.has_value() ? weights->data_ptr<float>() : nullptr,
+                                                           metadata[0].data_ptr<int32_t>(),
+                                                           rank,
+                                                           metadata[0].size(0),
+                                                           x.size(0),
+                                                           layout.return_offset);
     };
     const auto launch_with_weights = [&]<bool kExpand, bool kMode>() {
         if (weights.has_value())

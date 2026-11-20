@@ -17,9 +17,7 @@ def test_single_node_torchrun(request):
         pytest.skip("opt in with --run-distributed --nproc N on an allocated GPU node")
     nproc = request.config.getoption("--nproc")
     if nproc not in (1, 2, 4, 8) or torch.cuda.device_count() < nproc:
-        pytest.fail(
-            f"requested {nproc} ranks; need nproc 1/2/4/8 and that many visible CUDA GPUs"
-        )
+        pytest.fail(f"requested {nproc} ranks; need nproc 1/2/4/8 and that many visible CUDA GPUs")
     from nano_ep.backends._build import load_extension
 
     native = load_extension()  # Populate the disk cache before starting ranks.
@@ -47,9 +45,7 @@ def test_single_node_torchrun(request):
     try:
         returncode = run_logged(command, cwd=repo, env=env, log=log, timeout=240)
     except subprocess.TimeoutExpired:
-        pytest.fail(
-            f"torchrun timed out (possible protocol deadlock): {log}\n{log.read_text()[-12000:]}"
-        )
+        pytest.fail(f"torchrun timed out (possible protocol deadlock): {log}\n{log.read_text()[-12000:]}")
     contents = log.read_text()
     assert returncode == 0, contents
     assert contents.count("NANO_EP_RANK_OK=") == nproc, contents

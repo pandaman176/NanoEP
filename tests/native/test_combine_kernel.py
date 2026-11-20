@@ -21,10 +21,7 @@ pytestmark = [pytest.mark.cuda]
 
 @pytest.fixture(scope="module")
 def probe(request, tmp_path_factory):
-    if not (
-        request.config.getoption("--run-cuda")
-        or request.config.getoption("--run-distributed")
-    ):
+    if not (request.config.getoption("--run-cuda") or request.config.getoption("--run-distributed")):
         pytest.skip("opt in with --run-cuda or --run-distributed")
     if not torch.cuda.is_available():
         pytest.fail("CUDA tests requested but NVIDIA CUDA is unavailable")
@@ -35,10 +32,7 @@ def probe(request, tmp_path_factory):
     def prepare(hidden, topk, ranks, capacity):
         geometry = (hidden, topk, ranks, capacity)
         defines = [
-            f"-DNANO_EP_{name}={value}"
-            for name, value in zip(
-                ("HIDDEN", "TOPK", "WORLD_SIZE", "MAX_TOKENS"), geometry, strict=True
-            )
+            f"-DNANO_EP_{name}={value}" for name, value in zip(("HIDDEN", "TOPK", "WORLD_SIZE", "MAX_TOKENS"), geometry, strict=True)
         ]
         return load(
             name="nano_ep_combine_probe_" + "_".join(map(str, geometry)),
@@ -68,10 +62,7 @@ def check_kernel(
     stride = return_row_bytes(case.hidden, case.topk)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        windows = [
-            torch.full((total,), 165, dtype=torch.uint8, device="cuda")
-            for _ in range(ranks)
-        ]
+        windows = [torch.full((total,), 165, dtype=torch.uint8, device="cuda") for _ in range(ranks)]
         for owner in range(ranks):
             x, weights, metadata = expert_inputs(case, owner, expand)
             if owner == 0 and expected_first_recv_count is not None:
@@ -89,18 +80,12 @@ def check_kernel(
                 mode,
                 num_sms,
             )
-            torch.testing.assert_close(
-                device_x.cpu(), x, rtol=0, atol=0, equal_nan=True
-            )
-            torch.testing.assert_close(
-                device_weights.cpu(), weights, rtol=0, atol=0, equal_nan=True
-            )
+            torch.testing.assert_close(device_x.cpu(), x, rtol=0, atol=0, equal_nan=True)
+            torch.testing.assert_close(device_weights.cpu(), weights, rtol=0, atol=0, equal_nan=True)
             for actual, expected in zip(device_metadata, metadata, strict=True):
                 torch.testing.assert_close(actual.cpu(), expected)
         for source, window in enumerate(windows):
-            returned = window[
-                offset : offset + partitions * case.capacity * stride
-            ].view(partitions, case.capacity, stride)
+            returned = window[offset : offset + partitions * case.capacity * stride].view(partitions, case.capacity, stride)
             assert_return_packets(returned, case, source, expand, mode, weighted)
             assert (window[:offset] == 165).all().item()
             assert (window[offset + returned.numel() :] == 165).all().item()
@@ -151,14 +136,10 @@ def test_return_kernel_rounds_local_sum_to_bf16(probe, expand, mode):
         pytest.param(2, 3, False, False, True, "sm", id="compact-small-grid"),
         pytest.param(4, 2, False, True, False, "wave", id="compact-one-wave"),
         pytest.param(2, 3, True, False, True, "wave_plus_one", id="expanded-next-wave"),
-        pytest.param(
-            4, 2, True, True, False, "multiple_waves", id="expanded-multiple-waves"
-        ),
+        pytest.param(4, 2, True, True, False, "multiple_waves", id="expanded-multiple-waves"),
     ],
 )
-def test_return_kernel_across_sm_grid_iterations(
-    probe, ranks, topk, expand, mode, weighted, boundary
-):
+def test_return_kernel_across_sm_grid_iterations(probe, ranks, topk, expand, mode, weighted, boundary):
     sms = 2
     # At H=256 the TMA staging plan fits 32 warps per CTA.
     wave = sms * 32
@@ -180,18 +161,14 @@ def test_return_kernel_across_sm_grid_iterations(
     case.capacity = 2 * wave + 23
     last_rank_expert = (ranks - 1) * (case.num_experts // ranks)
     patterns = (
-        [[0, last_rank_expert, -1], [-1, 1, last_rank_expert + 1], [2, -1, 0]]
-        if topk == 3
-        else [[0, last_rank_expert], [-1, 1], [2, 0]]
+        [[0, last_rank_expert, -1], [-1, 1, last_rank_expert + 1], [2, -1, 0]] if topk == 3 else [[0, last_rank_expert], [-1, 1], [2, 0]]
     )
     position = 0
     for source, count in enumerate(source_counts):
         routing = torch.empty((count, topk), dtype=torch.int64)
         for token in range(count):
             # Shift routing between waves so reused warps see different masks.
-            routing[token] = torch.tensor(
-                patterns[(position % wave + position // wave) % len(patterns)]
-            )
+            routing[token] = torch.tensor(patterns[(position % wave + position // wave) % len(patterns)])
             position += 1
         case.indices[source] = routing
         case.values[source] = case.values[source][:count].clone()

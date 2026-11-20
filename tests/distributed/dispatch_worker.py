@@ -34,12 +34,8 @@ def check_output(got, case, rank, alignment, weights, zero_padding):
     ]
     outputs = (
         got.x,
-        got.topk_idx
-        if got.topk_idx is not None
-        else got.x.new_empty((0,), dtype=torch.int64),
-        got.topk_weights
-        if got.topk_weights is not None
-        else got.x.new_empty((0,), dtype=torch.float32),
+        got.topk_idx if got.topk_idx is not None else got.x.new_empty((0,), dtype=torch.int64),
+        got.topk_weights if got.topk_weights is not None else got.x.new_empty((0,), dtype=torch.float32),
     )
     assert_dispatch_output(
         metadata,
@@ -67,12 +63,7 @@ def check_output(got, case, rank, alignment, weights, zero_padding):
 
 def make_payloads(size, kind, dtype, hidden):
     case = make_case(size, kind=kind, dtype=dtype, seed=23)
-    xs = [
-        (torch.arange(len(x) * hidden).reshape(len(x), hidden) / 8 + source * 10).to(
-            dtype
-        )
-        for source, x in enumerate(case.xs)
-    ]
+    xs = [(torch.arange(len(x) * hidden).reshape(len(x), hidden) / 8 + source * 10).to(dtype) for source, x in enumerate(case.xs)]
     return replace(case, xs=xs, hidden=hidden)
 
 
@@ -85,9 +76,7 @@ def check_rounds(buffer, rank, size):
             torch.cuda._sleep(20_000_000)
         return backend.dispatch(*args)
 
-    buffer._backend = SimpleNamespace(
-        dispatch=delayed_dispatch, combine=backend.combine
-    )
+    buffer._backend = SimpleNamespace(dispatch=delayed_dispatch, combine=backend.combine)
     cases = (
         (False, False, False, "mixed"),
         (False, True, True, "masked"),
@@ -165,9 +154,7 @@ def check_rounds(buffer, rank, size):
         with torch.cuda.stream(consumer):
             if asynchronous:
                 replay.event.current_stream_wait()
-            check_output(
-                replay, replay_case, rank, alignment, replay_weights, zero_padding
-            )
+            check_output(replay, replay_case, rank, alignment, replay_weights, zero_padding)
             check_output(got, case, rank, alignment, all_weights, zero_padding)
 
 
@@ -217,9 +204,7 @@ def run():
     try:
         for mode in (False, True):
             config = EPConfig(size * 3, 3, 512 if mode else 256, 5)
-            with CudaBuffer(
-                dist.group.WORLD, config, allow_multiple_reduction=mode
-            ) as buffer:
+            with CudaBuffer(dist.group.WORLD, config, allow_multiple_reduction=mode) as buffer:
                 check_rounds(buffer, rank, size)
                 check_consumer_lifetime(buffer, rank, size)
             try:

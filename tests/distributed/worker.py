@@ -55,19 +55,12 @@ def assert_dispatch(got, expected, config, rank):
     perm = keys.argsort()
     torch.testing.assert_close(
         keys[perm].cpu(),
-        expected.layout.src_ranks * config.num_max_tokens_per_rank
-        + expected.layout.src_tokens,
+        expected.layout.src_ranks * config.num_max_tokens_per_rank + expected.layout.src_tokens,
     )
     if not got.handle.do_expand:
-        torch.testing.assert_close(
-            meta[perm, 2:].cpu().long(), expected.layout.local_topk_idx
-        )
-    torch.testing.assert_close(
-        layout.expert_counts.cpu(), expected.layout.expert_counts
-    )
-    torch.testing.assert_close(
-        layout.expert_offsets.cpu(), expected.layout.expert_offsets
-    )
+        torch.testing.assert_close(meta[perm, 2:].cpu().long(), expected.layout.local_topk_idx)
+    torch.testing.assert_close(layout.expert_counts.cpu(), expected.layout.expert_counts)
+    torch.testing.assert_close(layout.expert_offsets.cpu(), expected.layout.expert_offsets)
     if not got.handle.do_expand:
         torch.testing.assert_close(got.x[perm].cpu(), expected.x, rtol=0, atol=0)
         torch.testing.assert_close(got.topk_idx[perm].cpu(), expected.topk_idx)
@@ -86,38 +79,21 @@ def assert_dispatch(got, expected, config, rank):
         src = slots[valid].to(got.x.device)
         dst = expected.layout.expanded_slots[valid]
         torch.testing.assert_close(got.x[src].cpu(), expected.x[dst], rtol=0, atol=0)
-        torch.testing.assert_close(
-            got.topk_weights[src].cpu(), expected.topk_weights[dst]
-        )
+        torch.testing.assert_close(got.topk_weights[src].cpu(), expected.topk_weights[dst])
 
 
 def expert_output(received):
     handle, layout = received.handle, received.handle.layout
     local_experts = handle.config.num_experts // handle.world_size
-    y = (
-        torch.full_like(received.x, float("nan"))
-        if handle.do_expand
-        else torch.zeros_like(received.x, dtype=torch.float32)
-    )
+    y = torch.full_like(received.x, float("nan")) if handle.do_expand else torch.zeros_like(received.x, dtype=torch.float32)
     for row in range(layout.recv_count):
         for k, value in enumerate(layout.recv_metadata[row, 2:].tolist()):
             if value < 0:
                 continue
             slot = value if handle.do_expand else row
-            expert = (
-                int(torch.searchsorted(layout.expert_offsets[1:], value, right=True))
-                if handle.do_expand
-                else value
-            )
-            weight = (
-                received.topk_weights[slot]
-                if handle.do_expand
-                else received.topk_weights[row, k]
-            )
-            contribution = (
-                received.x[slot].float() * (handle.rank * local_experts + expert + 1)
-                + 0.5
-            ) * weight
+            expert = int(torch.searchsorted(layout.expert_offsets[1:], value, right=True)) if handle.do_expand else value
+            weight = received.topk_weights[slot] if handle.do_expand else received.topk_weights[row, k]
+            contribution = (received.x[slot].float() * (handle.rank * local_experts + expert + 1) + 0.5) * weight
             contribution = contribution.to(received.x.dtype)
             if handle.do_expand:
                 y[slot] = contribution
@@ -140,9 +116,7 @@ def source_reference(case, rank, expand, multiple, bias):
         for ks in groups.values():
             partial = torch.zeros(x.shape[1], dtype=torch.float32)
             for k in ks:
-                value = (x[token].float() * (choices[k] + 1) + 0.5) * case.weights[
-                    rank
-                ][token, k]
+                value = (x[token].float() * (choices[k] + 1) + 0.5) * case.weights[rank][token, k]
                 partial += value.bfloat16().float()
             result[token] += partial.bfloat16().float()
     if bias is not None:
@@ -206,18 +180,14 @@ def run():
         cfg = EPConfig(size * 3, 3, 256, 5)
         # A second lifetime catches stale IPC handles and counters after close.
         for lifetime in range(2):
-            buffer = CudaBuffer(
-                dist.group.WORLD, cfg, allow_multiple_reduction=bool(lifetime)
-            )
+            buffer = CudaBuffer(dist.group.WORLD, cfg, allow_multiple_reduction=bool(lifetime))
             native = buffer._backend
 
             def delayed_combine(*args):
                 torch.cuda._sleep(20_000_000)
                 return native.combine(*args)
 
-            buffer._backend = SimpleNamespace(
-                dispatch=native.dispatch, combine=delayed_combine
-            )
+            buffer._backend = SimpleNamespace(dispatch=native.dispatch, combine=delayed_combine)
             for expand in (False, True):
                 for kind in ("mixed", "masked", "skew"):
                     c = make_case(
@@ -259,12 +229,8 @@ def run():
                     for row in c.indices[rank].tolist():
                         for dest in {e // 3 for e in row if e >= 0}:
                             expected_sends[dest] += 1
-                    torch.testing.assert_close(
-                        got.handle.send_counts.cpu(), expected_sends
-                    )
-                    bias = (
-                        torch.full_like(c.xs[rank], 0.25) if kind == "mixed" else None
-                    )
+                    torch.testing.assert_close(got.handle.send_counts.cpu(), expected_sends)
+                    bias = torch.full_like(c.xs[rank], 0.25) if kind == "mixed" else None
                     result, consumer = combine_experts(
                         buffer,
                         got,
@@ -300,9 +266,7 @@ def run():
                         alignment=4,
                     )[rank]
                     assert_dispatch(replay, expected_replay, cfg, rank)
-                    replay_case = replace(
-                        c, xs=[a * 2 for a in c.xs], weights=[w * 3 for w in c.weights]
-                    )
+                    replay_case = replace(c, xs=[a * 2 for a in c.xs], weights=[w * 3 for w in c.weights])
                     combined_replay, consumer = combine_experts(
                         buffer,
                         replay,
@@ -321,12 +285,8 @@ def run():
                             expand,
                             bool(lifetime),
                         )
-                        torch.testing.assert_close(
-                            result.x.cpu(), saved_result[0], rtol=0, atol=0
-                        )
-                        torch.testing.assert_close(
-                            result.topk_weights.cpu(), saved_result[1], rtol=0, atol=0
-                        )
+                        torch.testing.assert_close(result.x.cpu(), saved_result[0], rtol=0, atol=0)
+                        torch.testing.assert_close(result.topk_weights.cpu(), saved_result[1], rtol=0, atol=0)
             # Exact BF16 roundtrips distinguish rank duplication from expert
             # duplication, with no weights, plus a source bias added once.
             c = make_case(size, kind="mixed", seed=31)
@@ -357,16 +317,8 @@ def run():
                     combined.event.current_stream_wait()
                 multiplicity = []
                 for row in c.indices[rank].tolist():
-                    multiplicity.append(
-                        sum(e >= 0 for e in row)
-                        if expand
-                        else len({e // 3 for e in row if e >= 0})
-                    )
-                expected = (
-                    x_cpu
-                    * torch.tensor(multiplicity, dtype=torch.bfloat16).unsqueeze(1)
-                    + 1
-                )
+                    multiplicity.append(sum(e >= 0 for e in row) if expand else len({e // 3 for e in row if e >= 0}))
+                expected = x_cpu * torch.tensor(multiplicity, dtype=torch.bfloat16).unsqueeze(1) + 1
                 torch.testing.assert_close(combined.x.cpu(), expected, rtol=0, atol=0)
                 assert combined.topk_weights is None
                 try:

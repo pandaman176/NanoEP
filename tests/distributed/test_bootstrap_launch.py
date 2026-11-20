@@ -43,11 +43,7 @@ def test_cuda_buffer_bootstrap(request):
     assert status == 0, contents
     for rank in range(nproc):
         for failure in ("allocate", "export", "import"):
-            assert f"NANO_EP_BOOTSTRAP_ROLLBACK_OK={rank}:{failure}" in contents, (
-                contents
-            )
+            assert f"NANO_EP_BOOTSTRAP_ROLLBACK_OK={rank}:{failure}" in contents, contents
         for lifetime in range(2):
-            assert f"NANO_EP_BOOTSTRAP_LIFETIME_OK={rank}:{lifetime}" in contents, (
-                contents
-            )
+            assert f"NANO_EP_BOOTSTRAP_LIFETIME_OK={rank}:{lifetime}" in contents, contents
         assert f"NANO_EP_BOOTSTRAP_RANK_OK={rank}" in contents, contents
