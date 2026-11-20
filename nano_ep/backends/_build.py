@@ -15,7 +15,7 @@ def native_source_dir() -> Path:
 
 
 def deepjit_source_dir(source: Path) -> Path:
-    for dependency in (source / "deep_jit", source.parent / "third-party" / "deep_jit"):
+    for dependency in (source.parent / "third-party" / "deep_jit", source / "deep_jit"):
         if (dependency / "include/deep_jit/backend/cuda/backend.hpp").is_file():
             return dependency
     raise RuntimeError("DeepJIT headers are missing. Run git submodule update --init third-party/deep_jit")

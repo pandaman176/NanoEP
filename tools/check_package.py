@@ -28,11 +28,15 @@ def main():
         with tarfile.open(sdist) as archive:
             names = archive.getnames()
             assert any(name.endswith("/third-party/deep_jit/include/deep_jit/backend/cuda/backend.hpp") for name in names)
-            assert any(name.endswith("/csrc/deep_jit/LICENSE") for name in names)
+            license_path = next(name for name in names if name.endswith("/third-party/deep_jit/LICENSE"))
+            assert archive.extractfile(license_path).read() == (project / "third-party/deep_jit/LICENSE").read_bytes()
+            assert not any("/csrc/deep_jit/" in name for name in names)
         with zipfile.ZipFile(wheel) as archive:
             for source in (project / "csrc").rglob("*"):
                 if source.is_file():
                     relative = source.relative_to(project / "csrc")
+                    if relative.parts[0] == "deep_jit":
+                        continue
                     assert archive.read("nano_ep/_csrc/" + relative.as_posix()) == source.read_bytes(), relative
             assert not any(name.startswith("nano_ep/sim") for name in archive.namelist())
             deepjit_include = project / "third-party/deep_jit/include"
@@ -40,7 +44,12 @@ def main():
                 if source.is_file():
                     relative = source.relative_to(deepjit_include)
                     assert archive.read("nano_ep/_csrc/deep_jit/include/" + relative.as_posix()) == source.read_bytes(), relative
-            assert "nano_ep/_csrc/deep_jit/LICENSE" in archive.namelist()
+            expected_headers = {
+                "nano_ep/_csrc/deep_jit/include/" + source.relative_to(deepjit_include).as_posix()
+                for source in deepjit_include.rglob("*") if source.is_file()
+            }
+            assert {name for name in archive.namelist() if name.startswith("nano_ep/_csrc/deep_jit/include/")} == expected_headers
+            assert archive.read("nano_ep/_csrc/deep_jit/LICENSE") == (project / "third-party/deep_jit/LICENSE").read_bytes()
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--no-deps", "--no-index", "--target", str(installed), str(wheel)],
             cwd=scratch,
