@@ -6,8 +6,8 @@
     ".gitignore": "35b18a7b4d57bff629264feb8c5c845c599f9a3781e665e9ebb73ca2d41ef865",
     ".gitmodules": "228f71e6352e714ed3f9271548b1700dd337fdb66ee4056ec39ecee07bd29311",
     "LICENSE": "95555832ac6659d538d3550263b61e185c9cf410ca13b7c3be5fb07c659ace2b",
-    "MANIFEST.in": "54cdef4f0847ef55ff4853c9e316f05f534734407332627f0d6d27d462fae50a",
-    "README.md": "3b507c66c48950ec10f190e7ceb3b0f2d3316ea7f0317d6a27c45272c4995ab7",
+    "MANIFEST.in": "c4aa98c77d7b2d8bfa9b032786cd96ec372d64cfbe7d8aa76a93bfa5d73faef3",
+    "README.md": "06cec7bf34a5fda2115b05eb4b98635ef14acd9227061a688662d5696e8608ce",
     "csrc/bindings.cpp": "4ce4ca7ff7037d80f1a862aafc550850e6015e390af5d73c237d9bc2de4fdcd9",
     "csrc/combine_epilogue.cpp": "8ec6121f848f6b9e35316ded53ab19f2beab01756cadda021072d65a665c7365",
     "csrc/combine_epilogue.cuh": "40d3cdaf9a349ddeb04c09a695473e58c7b4813eb1b79e9af798b46f2b975760",
@@ -30,7 +30,7 @@
     "docs/testing.md": "db7513cdf8eb6f32688a9fac688b661cecc754078b6a49b6bbd2a0aa30643f90",
     "nano_ep/__init__.py": "a448565016006b714e7aa7d37b0205869af1c66be1217271895deb81d485efc2",
     "nano_ep/backends/__init__.py": "8ee2161c82c826dd222b148e2a46b68d217a21f62e082b0d2e02e3b47350f9aa",
-    "nano_ep/backends/_build.py": "4bd8a259a3211e070cafeefc2f1b0aebd2e26ae9a7dcef53cae5bcf5d56c00c3",
+    "nano_ep/backends/_build.py": "db6fd7dcaf10cd560bb17478d548576776180a29362db0e7cedece8427f98d06",
     "nano_ep/backends/_sms.py": "e3f02e228a196388f21564b5e86a1966191b61001e3673b677253d9f41845358",
     "nano_ep/backends/cuda.py": "99adc5051af418eea2948393e1f761cac95cddd855a419481847a84a3f066c82",
     "nano_ep/build.py": "1792fa0f307864b96cf7016c4494417325feeb7cb9386a2e4b3aaf0eaf8d9615",
@@ -47,7 +47,7 @@
     "nano_ep/testing/wire.py": "02c4c448ba91e8f37c09b8a15547163fc37ccd26b4f74e9b5e2ef470be72ba99",
     "pyproject.toml": "1bf78bd5b7e80cc079999900b186a0fdb5a8b8a92ca4b9b9ae50fc5a2b885043",
     "pytest.ini": "9f4706add6ed6077879a6dfdc0639f1aa99118543f9fcfd513983d18e80abbe4",
-    "setup.py": "e331b52a28cfd88286ec1775fdb5a15862e2310e2d897898f24ffb02dedeeda9",
+    "setup.py": "f48893a336782c7443a9a2b73d55df397e44ef22a63a1d6562d23e19514c2d48",
     "tests/conftest.py": "8a6fe520667db42942212af7230aa98064f9076bb72117d2f8ca5ca88ed7e601",
     "tests/distributed/arena_worker.py": "5040c0bd5095bf83bdaa801bd518b4291a1ff28729ec7bd776125b068fb55769",
     "tests/distributed/bootstrap_worker.py": "45da2c95990208a99c4cdd201da36dd2276838e61e099034dddebb2c956ee33b",
@@ -75,6 +75,6 @@
     "tests/unit/test_cuda_bootstrap.py": "02ed85cb2125e04375ddd1984afaf44546d0053691b85050355d778c361b1169",
     "tests/unit/test_cuda_combine.py": "1c5021e0edfb2fbaf01d9aba77bf4bf7c9c850fda3f90775281d04019a242986",
     "tests/unit/test_cuda_dispatch.py": "7463790d9d005a0aa00cd893a6b6ab0b32d46c3e96cfd4bfd16797f2b2745c41",
-    "tools/check_package.py": "bef1991adf9a48f4057077dbe6ad49390919f451f856081c98ed3d05947dfbc8"
+    "tools/check_package.py": "9f375a63a680e97d5a5b55968342c218d2a9905ace2f9749156d9140150b9891"
   }
 }
